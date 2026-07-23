@@ -1,0 +1,54 @@
+/**/controller_manager:
+  ros__parameters:
+    legged_robot_controller:
+      type: legged_robot_controller/LeggedRobotController
+
+/**/legged_robot_controller:
+  ros__parameters:
+    use_sim_time: true
+    update_rate: 250
+
+    joint_names:
+      - LF_HAA
+      - LF_HFE
+      - LF_KFE
+      - LH_HAA
+      - LH_HFE
+      - LH_KFE
+      - RF_HAA
+      - RF_HFE
+      - RF_KFE
+      - RH_HAA
+      - RH_HFE
+      - RH_KFE
+    imu_sensor_name: imu_sensor
+    imu_orientationCovariance: [0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01]
+    imu_angularVelCovariance: [0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01]
+    imu_linearAccelCovariance: [0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01]
+    debug_imu_accel: false
+
+    foot_force_sensors:
+      - LF_FOOT
+      - RF_FOOT
+      - LH_FOOT
+      - RH_FOOT
+    feet_force_threshold: 10.0
+
+    odom_sensor_name: odometer
+
+    leg_kp: 25.0
+    leg_kd: 2.5
+
+    estimator_type: "ground_truth"
+
+    # Contact source: false = foot F/T threshold (sim), true = estimated GRF (real robot has no foot F/T)
+    use_estimated_grf: true
+
+    # Estimated-GRF module (pure computation; publishing is handled by the controller)
+    ground_reaction_force:
+      use_imu_gravity: true              # project gravity direction from the raw IMU orientation
+      singularity_damping_lambda: 0.01   # damped-LS regularization; stabilizes the solve near stretched-leg singularities
+      tau_sign: 1.0                      # measured joint-torque sign convention (calibrated against sim F/T)
+      contact_force_threshold: 20.0      # estimated-GRF contact threshold (N), used when use_estimated_grf is true
+      publish_grf: true                  # publish controller/grf/<FOOT> every update
+      publish_ft_validation: false       # publish controller/grf/validation/<FOOT> (measured F/T in world; auto-disabled without sensors)

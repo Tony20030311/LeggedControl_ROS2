@@ -1,0 +1,17 @@
+# Copied from legged_gazebo/config/vision60/initial_joint_positions.yaml (read-only submodule).
+# Present so legged_admm_fleet can act as gazebo_package (arena_run.sh points gazebo at OUR
+# worlds/<arena>.sdf via gazebo_package:=legged_admm_fleet; the launch then also resolves the
+# per-robot joint fallback from THIS package's share). Vision60 default stance — keep in sync.
+joint_positions:
+  LF_HAA: 0.0
+  LF_HFE: 0.7
+  LF_KFE: 1.55
+  LH_HAA: 0.0
+  LH_HFE: 0.7
+  LH_KFE: 1.55
+  RF_HAA: 0.0
+  RF_HFE: 0.7
+  RF_KFE: 1.55
+  RH_HAA: 0.0
+  RH_HFE: 0.7
+  RH_KFE: 1.55

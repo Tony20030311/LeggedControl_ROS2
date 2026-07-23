@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>admm_fleet_msgs</name>
+  <version>0.1.0</version>
+  <description>
+    Messages for the distributed ADMM-CBF-DMPC fleet layer (paper future work):
+    AgentState / EdgeXi / EdgeZ carry the per-cycle ADMM consensus exchange over DDS,
+    FleetPlan pushes slot goals and detours, CycleStats is the comms-measurement telemetry.
+    Kept out of legged_msgs (submodule) to avoid coupling.
+  </description>
+  <maintainer email="chenboyu0311@gmail.com">Tony Chen</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

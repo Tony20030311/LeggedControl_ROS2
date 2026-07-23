@@ -1,0 +1,6 @@
+# G2 gate: single vision60, empty world, walk to a 2 m goal.
+robot1:
+  robot_type: vision60
+  robot_name: robot1
+  spawn_poses: [0.0, 0.0, 0.2, 0.0]
+  controller_config_file: ""

@@ -1,0 +1,18 @@
+# build / install artifacts
+build/
+install/
+log/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+
+# graphify knowledge-graph output (large, regenerable)
+graphify-out/
+
+# logs / run outputs
+*.log
+g2_logs/
+
+# editor / OS
+.vscode/
+.DS_Store

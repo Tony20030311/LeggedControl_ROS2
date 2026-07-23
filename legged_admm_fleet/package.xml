@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>legged_admm_fleet</name>
+  <version>0.1.0</version>
+  <description>
+    ADMM-CBF-DMPC upper-control fleet layer (port of legged_upper_control from ROS1):
+    ROS-agnostic admm_core + pybind oracle; per-robot distributed agent and centralized
+    baseline nodes are added in later phases.
+  </description>
+  <maintainer email="chenboyu0311@gmail.com">Tony</maintainer>
+  <license>BSD</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>osqp_vendor</depend>
+  <depend>eigen</depend>
+  <build_depend>pybind11-dev</build_depend>
+  <depend>rclcpp</depend>
+  <depend>ocs2_msgs</depend>
+  <depend>ocs2_core</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>admm_fleet_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
