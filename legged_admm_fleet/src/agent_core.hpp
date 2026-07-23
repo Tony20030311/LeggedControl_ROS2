@@ -73,6 +73,8 @@ struct StepResult {
     std::vector<double> r_prim_edge;  // final ADMM primal residual per adopted edge (my_edges_ order)
     double r_prim = 0.0;              // max over adopted edges (0 if no round completed)
     int n_timeouts = 0;              // per-hop recv deadline misses observed this cycle
+    double t_node = 0.0;             // total node-QP solve time this cycle (s)
+    double t_edge_solve = 0.0;       // total owned edge-QP solve time this cycle (s)
 };
 
 // Transport: send is fire-and-forget; recv blocks until the matching message(s) arrive.

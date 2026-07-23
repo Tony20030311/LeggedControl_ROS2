@@ -97,6 +97,7 @@ say "phase 0: cleanup (arena=$ARENA goals=[$GOALS] deadline=${DEADLINE}ms)"
 pkill -9 -x ros2 2>/dev/null; pkill -9 -x admm_agent_node 2>/dev/null; pkill -9 -x fleet_coordinat 2>/dev/null
 pkill -9 -x ruby 2>/dev/null; pkill -9 -x robot_state_pub 2>/dev/null; pkill -9 -x static_transfor 2>/dev/null
 pkill -9 -x parameter_bridg 2>/dev/null; pkill -9 -f g5_logger 2>/dev/null; pkill -9 -f g3_dist_logger 2>/dev/null
+pkill -9 -f g5_video 2>/dev/null; pkill -9 -x legged_common_g 2>/dev/null; pkill -9 -x legged_common_b 2>/dev/null
 pkill -9 -x rviz2 2>/dev/null; pkill -9 -x ffmpeg 2>/dev/null; pkill -9 -f fleet_viz_markers 2>/dev/null
 # A `ros2 launch` parent has comm=python3, so `pkill -x ros2` above misses it: a FAILED run leaks its
 # gazebo/controller launch, which keeps holding domain 42 and poisons the next run's DDS discovery
@@ -163,8 +164,8 @@ G5PID=$!
 setsid python3 $WS/src/legged_fleet/legged_admm_fleet/scripts/g3_dist_logger.py \
   "$ROBOTS" "$LOGD/dist.csv" 1.0 --ros-args -p use_sim_time:=true > "$LOGD/dist_logger.log" 2>&1 &
 DLPID=$!
-RVIZPID=""; RVGRABPID=""; VIZPID=""
-trap 'kill -9 $G5PID $DLPID $RVIZPID $RVGRABPID $VIZPID 2>/dev/null' EXIT
+RVIZPID=""; RVGRABPID=""; VIZPID=""; RECPID=""; BRPID=""
+trap 'kill -9 $G5PID $DLPID $RVIZPID $RVGRABPID $VIZPID $RECPID $BRPID 2>/dev/null' EXIT
 # LATCH per-robot: once a dog is seen at z>0.42 it counts as stood for good. The odom read is a flaky
 # `ros2 echo --once` (DDS late-join drops it under load), so requiring all 3 to read tall in the SAME
 # iter gives false "did not stand" timeouts. Latching + only failing if a robot NEVER read tall fixes it.

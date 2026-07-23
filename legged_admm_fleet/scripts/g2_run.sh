@@ -8,6 +8,8 @@
 WS=/root/legged_ros2_ws
 LOGD=$WS/g2_logs/$(date +%m%d_%H%M%S)
 mkdir -p "$LOGD"
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST   # domain-0 cross-talk = WBC killer (see CLAUDE.md)
+export ROS_DOMAIN_ID=42
 source /opt/ros/jazzy/setup.bash
 source /root/gridmap_ws/install/setup.bash
 source $WS/install/setup.bash
@@ -34,6 +36,8 @@ print(*(m.groups()+q.groups()) if m and q else '')" ;
 # ---------- phase 0: clean slate ----------
 say "phase 0: cleanup"
 pkill -9 -x ruby 2>/dev/null; pkill -9 -x fleet_centraliz 2>/dev/null
+pkill -9 -x admm_agent_node 2>/dev/null; pkill -9 -x fleet_coordinat 2>/dev/null
+pkill -9 -x ros2 2>/dev/null; pkill -9 -f "launch[.]py" 2>/dev/null
 pkill -9 -x robot_state_pub 2>/dev/null; pkill -9 -x static_transfor 2>/dev/null
 pkill -9 -x legged_common_g 2>/dev/null; pkill -9 -x legged_common_b 2>/dev/null
 pkill -9 -x parameter_bridg 2>/dev/null

@@ -79,7 +79,7 @@ WIDEV_START = {1: (-3.0, 0.0), 2: (-3.7, 0.8), 3: (-3.7, -0.8)}
 # kept in sync with admm_core/fleet_config.cpp (D_MIN=1.0; V = equilateral triangle side 1.4)
 FORMATIONS = {
     "V":      [(0.808, 0.0), (-0.404, 0.7), (-0.404, -0.7)],
-    "column": [(0.0, 0.0), (-1.2, 0.0), (-2.4, 0.0)],
+    "column": [(0.0, 0.0), (-1.5, 0.0), (-3.0, 0.0)],
     "V_wide": [(0.0, 0.0), (-1.0, 1.0), (-1.0, -1.0)],
 }
 SCENARIOS = [

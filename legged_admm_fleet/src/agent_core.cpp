@@ -4,6 +4,7 @@
 #include "agent_core.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <utility>
 
@@ -22,6 +23,9 @@ int edge_owner(const EdgeKey& e) {
 namespace {
 EdgeKey canon(int a, int b) { return a < b ? EdgeKey(a, b) : EdgeKey(b, a); }
 int other(const EdgeKey& e, int self) { return e.first == self ? e.second : e.first; }
+double secs_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
 }  // namespace
 
 AgentCore::AgentCore(int self_id, std::vector<int> dogs, std::vector<EdgeKey> edges,
@@ -81,18 +85,23 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
     Eigen::VectorXd xibar_self =
         (cycle_ == 0) ? uncoupled_self_(xnow_self, xdes_self) : shift_xi(prev_xi_, N_);
 
-    // 2. broadcast AgentState, barrier on peers (keyed by the global slot)
+    // 2. broadcast AgentState, barrier on peers (keyed by the global slot).
+    // reset=true advertises "I am cold-starting this slot" — the fleet-wide NaN
+    // recovery signal (msg doc): peers that see it drop their warm start so the
+    // whole fleet cold-starts the SAME slot, mirroring the centralized all-dogs
+    // reset (coordinator.cpp finite-guard) with a one-slot announce lag.
     AgentStateMsg out;
     out.cycle_id = slot;
     out.robot_id = self_id_;
     out.xnow = xnow_self;
     out.xibar = xibar_self;
+    out.reset = (cycle_ == 0);
     transport_->send_state(out);
     std::vector<int> peers;
     for (const int i : dogs_)
         if (i != self_id_) peers.push_back(i);
     std::map<int, AgentStateMsg> states;
-    try {
+    if (!peers.empty()) try {
         states = transport_->recv_states(slot, peers);
     } catch (const TransportTimeout&) {
         // barrier miss: HOLD this cycle, do not advance warm-start state (plan §66).
@@ -112,6 +121,48 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
     }
     peer_xnow_ = xnow;      // expose to admm_agent_node (followSpeed)
     peer_xibar_ = xibar;    // expose to admm_agent_node (safe_prefix)
+
+    // 2b. fleet-reset synchronization. Rule table (stateless, no ping-pong):
+    //   warm + any peer cold  -> discard this slot, drop warm start (join the reset)
+    //   cold + any peer warm  -> announce-only slot (hold; wait for warm peers to join)
+    //   all cold together     -> proceed with the ordinary cycle_==0 cold start below
+    //     (this is also the normal first-ever cycle, so startup is unchanged)
+    // Net timing vs centralized: fail at k -> k+1 all-hold -> k+2 all-cold solve, i.e.
+    // the centralized post-NaN cycle with one extra announce slot.
+    if (!states.empty()) {
+        const bool self_cold = (cycle_ == 0);
+        bool any_cold = false, all_cold = true;
+        for (const auto& kv : states) { any_cold |= kv.second.reset; all_cold &= kv.second.reset; }
+        if ((!self_cold && any_cold) || (self_cold && !all_cold)) {
+            StepResult hr;
+            hr.xi = has_prev_ ? prev_xi_ : xibar_self;
+            hr.hold = true;
+            hr.n_timeouts = transport_->take_timeouts();
+            if (!self_cold) { has_prev_ = false; cycle_ = 0; }  // join the fleet reset
+            return hr;
+        }
+    }
+
+    // 2c. solo survivor (post-eviction, no edges left): no consensus to run — the node
+    // QP alone IS the whole problem. Track the reference, keep warm-start bookkeeping.
+    if (my_edges_.empty()) {
+        Eigen::VectorXd xi_solo =
+            node_->solve(xnow_self, xdes_self, (cycle_ == 0) ? nullptr : &xibar_self,
+                         nullptr, nullptr).xi.head(nz_);
+        StepResult sr;
+        sr.xi = xi_solo;
+        if (xi_solo.allFinite()) {
+            prev_xi_ = xi_solo;
+            has_prev_ = true;
+            cycle_ += 1;
+        } else {
+            node_->reset_solver();
+            has_prev_ = false;
+            cycle_ = 0;
+        }
+        sr.n_timeouts = transport_->take_timeouts();
+        return sr;
+    }
 
     // 3. init self's consensus copies; warm start after cycle 0
     if (cycle_ == 0) {
@@ -145,6 +196,7 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
     std::map<EdgeKey, Eigen::VectorXd> z_prev = z_self_;
     ADMMCoordinator::Hist hist;
     int achieved = 0;
+    double t_node_acc = 0.0, t_edge_acc = 0.0;  // G5 solve-time telemetry (output only)
     for (int p = 0; p < P_ITERS; ++p) {
         // node update — consensus_target over self's own copies, edges_ order preserved
         EdgeVecs zc, lc;
@@ -153,9 +205,11 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
             lc[e][self_id_] = lam_self_[e];
         }
         const Eigen::VectorXd ct = consensus_target(zc, lc, self_id_, neighbors_);
+        const auto tn0 = std::chrono::steady_clock::now();
         xi_self = node_->solve(xnow_self, xdes_self, &xibar_self, &ct,
                                use_fgrad ? &fgrad : nullptr)
                       .xi.head(nz_);
+        t_node_acc += secs_since(tn0);
         if (!xi_self.allFinite()) break;
 
         try {
@@ -182,9 +236,11 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
                     std::map<int, std::pair<Eigen::VectorXd, Eigen::VectorXd>> end;  // id->(xi,lam)
                     end[self_id_] = {xi_self, lam_self_[e]};
                     end[o] = {got.at(o).xi, got.at(o).lam};
+                    const auto te0 = std::chrono::steady_clock::now();
                     const EdgeSubproblem::Out so = owned_edge_[e]->solve(
                         end[e.first].first, end[e.second].first, end[e.first].second,
                         end[e.second].second);
+                    t_edge_acc += secs_since(te0);
                     if (so.ok)
                         owned_z_[e] = {so.z_i, so.z_j};
                     else
@@ -259,6 +315,8 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
     res.hold = false;
     res.achieved_rounds = achieved;
     res.n_timeouts = transport_->take_timeouts();
+    res.t_node = t_node_acc;
+    res.t_edge_solve = t_edge_acc;
     return res;
 }
 

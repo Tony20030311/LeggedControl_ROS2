@@ -88,11 +88,13 @@ int main() {
     const double w_form = 0.3;
     const int CYCLES = 6;
 
-    // scenario: three dogs abreast, all commanded 3 m forward
+    // scenario: three dogs abreast, all commanded 3 m forward. Spawns keep every pair
+    // beyond D_MIN=1.3 (1-2: 1.6, 1-3 = 2-3: 1.44) so the gate runs the nominal regime,
+    // not the CBF-recovery one.
     std::map<int, Eigen::Vector4d> xnow4;
-    xnow4[1] = Eigen::Vector4d(-1.0, 0.6, 0.0, 0.0);
-    xnow4[2] = Eigen::Vector4d(-1.0, -0.6, 0.0, 0.0);
-    xnow4[3] = Eigen::Vector4d(-1.7, 0.0, 0.0, 0.0);
+    xnow4[1] = Eigen::Vector4d(-1.0, 0.8, 0.0, 0.0);
+    xnow4[2] = Eigen::Vector4d(-1.0, -0.8, 0.0, 0.0);
+    xnow4[3] = Eigen::Vector4d(-2.2, 0.0, 0.0, 0.0);
     std::map<int, Eigen::VectorXd> xnow;
     std::map<int, Eigen::MatrixXd> xdes;
     for (int i : dogs) {
@@ -125,14 +127,24 @@ int main() {
         std::map<int, Eigen::VectorXd> got;
         std::mutex gm;
         std::vector<std::thread> th;
+        std::map<int, StepResult> full;
         for (int i : dogs)
             th.emplace_back([&, i] {
                 auto r = ag[i]->step(xnow4[i], xdes[i], static_cast<std::uint64_t>(c));
                 std::lock_guard<std::mutex> l(gm);
                 got[i] = r.xi;
+                full[i] = std::move(r);
             });
         for (auto& t : th) t.join();
         for (int i : dogs) {
+            // memcmp parity is vacuous on identical garbage: NaN==NaN bitwise. Require the
+            // run to be a REAL full-round finite run before comparing (review 2026-07-23).
+            if (!got[i].allFinite() || full[i].hold || full[i].achieved_rounds != P_ITERS) {
+                std::cout << "INVALID RUN cycle " << c << " dog " << i
+                          << " finite=" << got[i].allFinite() << " hold=" << full[i].hold
+                          << " rounds=" << full[i].achieved_rounds << "\n";
+                ++mismatches;
+            }
             const double d = (cen[c][i] - got[i]).cwiseAbs().maxCoeff();
             worst = std::max(worst, d);
             if (!bit_equal(cen[c][i], got[i])) {

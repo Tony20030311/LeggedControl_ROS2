@@ -38,6 +38,8 @@ print(*(m.groups()+q.groups()) if m and q else '')" ;
 say "phase 0: cleanup (robots: $ROBOTS)"
 pkill -9 -x ros2 2>/dev/null   # stale `ros2 launch` parents from a previous run
 pkill -9 -x ruby 2>/dev/null; pkill -9 -x fleet_centraliz 2>/dev/null
+pkill -9 -x admm_agent_node 2>/dev/null; pkill -9 -x fleet_coordinat 2>/dev/null
+pkill -9 -f "launch[.]py" 2>/dev/null   # leaked ros2-launch parents (comm=python3)
 pkill -9 -x robot_state_pub 2>/dev/null; pkill -9 -x static_transfor 2>/dev/null
 pkill -9 -x legged_common_g 2>/dev/null; pkill -9 -x legged_common_b 2>/dev/null
 pkill -9 -x parameter_bridg 2>/dev/null

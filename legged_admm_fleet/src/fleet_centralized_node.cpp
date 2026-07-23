@@ -253,6 +253,8 @@ class FleetCentralizedNode : public rclcpp::Node {
       if (o == has_obs_.end() || !o->second) return false;
       if (g == has_gt_.end() || !g->second) return false;
       if (obs_.at(i).time == 0.0) return false;
+      // activation-race guard: a short/empty state vector would be UB at BASE_PX/BASE_YAW
+      if (obs_.at(i).state.value.size() < 24) return false;
     }
     return true;
   }

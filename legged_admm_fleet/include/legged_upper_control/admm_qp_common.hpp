@@ -87,6 +87,13 @@ public:
 
 private:
     OSQPWorkspace* work_ = nullptr;
+    // Set when any osqp_update_* call is REJECTED (e.g. osqp_update_bounds validates
+    // l<=u and refuses NaN bounds WITHOUT applying them). A rejected update leaves the
+    // workspace holding the previous cycle's data; solving it would return a finite,
+    // plausible-looking answer anchored at a stale state with no flag. solve() checks
+    // this and returns NaN instead -> callers' finite-guard triggers the normal
+    // reset_solver()/cold-start path (loud failure instead of a silent wrong plan).
+    bool update_failed_ = false;
 };
 
 }  // namespace admm

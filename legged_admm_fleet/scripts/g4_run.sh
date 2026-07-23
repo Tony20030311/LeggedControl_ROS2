@@ -37,10 +37,12 @@ print(*(m.groups()+q.groups()) if m and q else '')" ;
 # ---------- phase 0: clean slate ----------
 say "phase 0: cleanup (robots: $ROBOTS, deadline=${DEADLINE}ms)"
 pkill -9 -x ros2 2>/dev/null; pkill -9 -x admm_agent_node 2>/dev/null
-pkill -9 -x ruby 2>/dev/null; pkill -9 -x fleet_centraliz 2>/dev/null
+pkill -9 -x ruby 2>/dev/null; pkill -9 -x fleet_centraliz 2>/dev/null; pkill -9 -x fleet_coordinat 2>/dev/null
 pkill -9 -x robot_state_pub 2>/dev/null; pkill -9 -x static_transfor 2>/dev/null
 pkill -9 -x legged_common_g 2>/dev/null; pkill -9 -x legged_common_b 2>/dev/null
 pkill -9 -x parameter_bridg 2>/dev/null
+# leaked `ros2 launch` parents have comm=python3 — pkill -x ros2 misses them (see arena_run.sh)
+pkill -9 -f "launch[.]py" 2>/dev/null
 sleep 2
 rm -rf /dev/shm/fastrtps* /dev/shm/fast_datasharing* /dev/shm/sem.fastrtps* 2>/dev/null
 
@@ -133,17 +135,21 @@ say "phase 4: trot + /formation/goal centroid+$GOAL_X"
 # Send trot 3x per dog over ~3s: a bare one-shot races discovery and a dog that misses it
 # stays in STANCE — it then chases its goal but can't step (the "random follower stuck at
 # spawn", NOT a goal-delivery problem). Plain repeated --once, no -w (which hung phase 4).
-for rep in 1 2 3; do
-  for r in $ROBOTS; do timeout 3 ros2 topic pub --once /robot$r/cmd_gait std_msgs/msg/String "{data: trot}" >/dev/null 2>&1; done
-  sleep 0.8
+# persistent 8 s / 2 Hz per dog (arena_run pattern) — 3x --once still lost the race
+# occasionally (robot2 stuck in STANCE, 2026-07-23); re-sending trot is idempotent.
+for r in $ROBOTS; do
+  timeout 8 ros2 topic pub -r 2 /robot$r/cmd_gait std_msgs/msg/String "{data: trot}" >/dev/null 2>&1 &
 done
-sleep 1
+sleep 9
 POSLINE=""; for r in $ROBOTS; do C=($(odom_field /robot$r/controller/odom)); POSLINE="$POSLINE ${C[0]:-99} ${C[1]:-99}"; done
 read GX GY <<< "$(python3 -c "
 v=[float(x) for x in '''$POSLINE'''.split()]; pts=list(zip(v[::2],v[1::2]))
 print(f'{sum(p[0] for p in pts)/len(pts)+$GOAL_X:.3f} {sum(p[1] for p in pts)/len(pts):.3f}')")"
 say "formation goal = ($GX,$GY)"
-timeout 4 ros2 topic pub --once /formation/goal geometry_msgs/msg/PoseStamped \
+# persistent burst, NOT --once: the coordinator's /formation/goal sub is volatile and a
+# one-shot pub races DDS discovery (bit us 2026-07-23: coordinator never got the goal,
+# dogs stood at spawn the whole run). Same pattern as arena_run/g5_sweep.
+timeout 8 ros2 topic pub -r 5 /formation/goal geometry_msgs/msg/PoseStamped \
   "{header: {frame_id: world}, pose: {position: {x: $GX, y: $GY, z: 0.5}}}" >/dev/null 2>&1
 
 T_WALL0=$(date +%s); T_SIM0=$(timeout 4 ros2 topic echo /clock --once 2>/dev/null | grep -m1 sec: | awk '{print $2}')
@@ -155,7 +161,7 @@ import math
 v=[float(x) for x in '''$POSLINE'''.split()]; pts=list(zip(v[::2],v[1::2]))
 cx=sum(p[0] for p in pts)/len(pts); cy=sum(p[1] for p in pts)/len(pts)
 print(f'{math.hypot(cx-$GX, cy-$GY):.3f}')")
-  MIND=$(tail -1 "$LOGD/dist.csv" 2>/dev/null | cut -d, -f8); MIND=${MIND:-99}
+  MIND=$(tail -1 "$LOGD/dist.csv" 2>/dev/null | cut -d, -f8); case "$MIND" in ''|*[!0-9.-]*) MIND=99;; esac
   say "  pos=($POSLINE ) centroid_dist=$D min_pair=$MIND"
   BAD=$(python3 -c "print(1 if $MIND<$DMIN_ABORT else 0)")
   [ "$BAD" = 1 ] && die "pairwise $MIND < $DMIN_ABORT (collision guard)"
@@ -167,6 +173,9 @@ T_WALL1=$(date +%s); T_SIM1=$(timeout 4 ros2 topic echo /clock --once 2>/dev/nul
 RTF=$(python3 -c "w=$T_WALL1-$T_WALL0;s=${T_SIM1:-0}-${T_SIM0:-0};print(f'{s/w:.2f}' if w>0 else '?')")
 [ "$R" = 1 ] || die "centroid not at goal in 600s (last dist=$D)"
 
+# collision guard only counts if the dist logger actually produced data
+[ "$(wc -l < "$LOGD/dist.csv" 2>/dev/null || echo 0)" -gt 10 ] \
+  || say "WARN: dist.csv empty — collision guard was OFF this run"
 # achieved_rounds sample (G5 telemetry sanity)
 AR=$(timeout 5 ros2 topic echo /robot1/admm/stats --once 2>/dev/null | grep achieved_rounds | awk '{print $2}')
 say "G4 PASS: centroid reached ($GX,$GY); min_pair>=$DMIN_ABORT; RTF=$RTF; achieved_rounds(r1)=${AR:-?}; logs $LOGD"
@@ -176,7 +185,7 @@ if [ "$SOAK" -gt 0 ]; then
   say "soak: holding formation for ${SOAK}s (deadlock watch)"
   END=$(( $(date +%s) + SOAK ))
   while [ "$(date +%s)" -lt "$END" ]; do
-    MIND=$(tail -1 "$LOGD/dist.csv" 2>/dev/null | cut -d, -f8); MIND=${MIND:-99}
+    MIND=$(tail -1 "$LOGD/dist.csv" 2>/dev/null | cut -d, -f8); case "$MIND" in ''|*[!0-9.-]*) MIND=99;; esac
     AR=$(timeout 5 ros2 topic echo /robot1/admm/stats --once 2>/dev/null | grep achieved_rounds | awk '{print $2}')
     say "  soak min_pair=$MIND achieved_rounds(r1)=${AR:-?}"
     gz_deactivated && die "WBC deactivated during soak"

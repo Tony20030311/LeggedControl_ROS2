@@ -83,10 +83,10 @@ int main() {
     LaplacianFormation form(formations());
     form.set_formation("V");
 
-    std::map<int, Eigen::Vector4d> xnow4;
-    xnow4[1] = Eigen::Vector4d(-1.0, 0.6, 0.0, 0.0);
-    xnow4[2] = Eigen::Vector4d(-1.0, -0.6, 0.0, 0.0);
-    xnow4[3] = Eigen::Vector4d(-1.7, 0.0, 0.0, 0.0);
+    std::map<int, Eigen::Vector4d> xnow4;  // every pair beyond D_MIN=1.3 (nominal regime)
+    xnow4[1] = Eigen::Vector4d(-1.0, 0.8, 0.0, 0.0);
+    xnow4[2] = Eigen::Vector4d(-1.0, -0.8, 0.0, 0.0);
+    xnow4[3] = Eigen::Vector4d(-2.2, 0.0, 0.0, 0.0);
     std::map<int, Eigen::MatrixXd> xdes;
     for (int i : dogs) {
         Eigen::MatrixX2d wp(2, 2);
@@ -117,6 +117,16 @@ int main() {
                 res[i] = std::move(r);
             });
         for (auto& t : th) t.join();
+        if (!dropped) {
+            // the alive phase must be REAL full-round cycles — a transport so broken that
+            // every cycle holds would otherwise still pass the drop-phase check below.
+            for (int i : dogs)
+                if (res[i].hold || res[i].achieved_rounds != P_ITERS || !res[i].xi.allFinite()) {
+                    std::cout << "FAIL: alive cycle " << c << " dog " << i << " hold=" << res[i].hold
+                              << " rounds=" << res[i].achieved_rounds << "\n";
+                    return 1;
+                }
+        }
         if (dropped)
             for (int i : {1, 2})
                 if (res[i].hold) hold_after_drop[i] = true;

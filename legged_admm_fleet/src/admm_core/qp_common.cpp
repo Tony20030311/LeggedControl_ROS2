@@ -84,6 +84,7 @@ void OsqpProblem::reset() {
         osqp_cleanup(work_);
         work_ = nullptr;  // is_setup() -> false, next solve() re-runs setup()
     }
+    update_failed_ = false;  // fresh setup() carries fresh data
 }
 
 void OsqpProblem::setup(const CscPattern& P, const std::vector<double>& Px,
@@ -139,25 +140,36 @@ void OsqpProblem::setup(const CscPattern& P, const std::vector<double>& Px,
 
 void OsqpProblem::update(const std::vector<double>* q, std::vector<double> l,
                          std::vector<double> u, const std::vector<double>* Ax) {
-    if (q) osqp_update_lin_cost(work_, q->data());
+    if (q) update_failed_ |= (osqp_update_lin_cost(work_, q->data()) != 0);
     clip_bounds(l, u);
-    osqp_update_bounds(work_, l.data(), u.data());
-    if (Ax) osqp_update_A(work_, Ax->data(), OSQP_NULL, static_cast<c_int>(Ax->size()));
+    update_failed_ |= (osqp_update_bounds(work_, l.data(), u.data()) != 0);
+    if (Ax)
+        update_failed_ |=
+            (osqp_update_A(work_, Ax->data(), OSQP_NULL, static_cast<c_int>(Ax->size())) != 0);
 }
 
 void OsqpProblem::update_q_only(const std::vector<double>& q) {
-    osqp_update_lin_cost(work_, q.data());
+    update_failed_ |= (osqp_update_lin_cost(work_, q.data()) != 0);
 }
 
 void OsqpProblem::update_Alu(const std::vector<double>& Ax, std::vector<double> l,
                              std::vector<double> u) {
     clip_bounds(l, u);
-    osqp_update_bounds(work_, l.data(), u.data());
-    osqp_update_A(work_, Ax.data(), OSQP_NULL, static_cast<c_int>(Ax.size()));
+    update_failed_ |= (osqp_update_bounds(work_, l.data(), u.data()) != 0);
+    update_failed_ |= (osqp_update_A(work_, Ax.data(), OSQP_NULL, static_cast<c_int>(Ax.size())) != 0);
 }
 
 OsqpProblem::Result OsqpProblem::solve() {
-    osqp_solve(work_);
+    // A rejected update means the workspace holds stale data — a "successful" solve
+    // of the wrong problem. Fail loudly as NaN; the caller's finite-guard cold-starts.
+    if (update_failed_ || osqp_solve(work_) != 0) {
+        update_failed_ = false;  // one-shot: the rebuild path re-setups from scratch
+        Result nan_r;
+        nan_r.status = "update rejected";
+        nan_r.x = Eigen::VectorXd::Constant(work_->data->n,
+                                            std::numeric_limits<double>::quiet_NaN());
+        return nan_r;
+    }
     Result r;
     r.status = work_->info->status;
     const c_int n = work_->data->n;

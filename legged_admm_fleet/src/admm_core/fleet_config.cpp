@@ -64,12 +64,12 @@ const std::map<std::string, Arena>& arenas() {
 
 const std::map<std::string, std::vector<Eigen::Vector2d>>& formations() {
     static const std::map<std::string, std::vector<Eigen::Vector2d>> kFormations = {
-        // Slot spacings must exceed D_MIN=1.0 (Vision60 footprint). "V" is a centroid-
-        // centred equilateral triangle (side 1.40 m, apex forward): all three dogs
+        // Slot spacings must exceed D_MIN=1.3 (Vision60 leg-reach FK, 2026-07-23). "V" is a
+        // centroid-centred equilateral triangle (side 1.40 m, apex forward): all three dogs
         // equidistant/equivalent, so a moving goal translates the shape with minimal
         // reassignment (spawn poses in fleet_robots.yaml match these offsets).
         {"V", {{0.808, 0.0}, {-0.404, 0.7}, {-0.404, -0.7}}},
-        {"column", {{0.0, 0.0}, {-1.2, 0.0}, {-2.4, 0.0}}},
+        {"column", {{0.0, 0.0}, {-1.5, 0.0}, {-3.0, 0.0}}},
         {"V_wide", {{0.0, 0.0}, {-1.0, 1.0}, {-1.0, -1.0}}},
     };
     return kFormations;

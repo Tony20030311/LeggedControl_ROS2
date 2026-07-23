@@ -1,11 +1,9 @@
 # launch — ADMM 三狗編隊（ROS2）
 
-每個 terminal 先 `source source.sh`，地圖設一次：
-
 ```bash
-export FLEET_ARENA=plum       # 梅花樁
-# export FLEET_ARENA=door     # 門
-# export FLEET_ARENA=empty    # 空世界
+export FLEET_ARENA=plum     # 梅花樁
+export FLEET_ARENA=door     # 門
+export FLEET_ARENA=empty    # 空世界
 ```
 
 **1. Gazebo**
@@ -26,7 +24,7 @@ ros2 launch legged_admm_fleet ctrl.launch.py
 ros2 launch legged_admm_fleet admm_fleet.launch.py
 ```
 
-**4. 給步態**
+**4. 步態**
 
 ```bash
 ros2 run legged_admm_fleet start_gaits.sh
