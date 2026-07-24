@@ -341,6 +341,10 @@ private:
             res = agent_->step(X0, xdes, slot);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "step failed: %s", e.what());
+            // Drain this cycle's read-and-reset telemetry so a partial (aborted) cycle's traffic
+            // and latency samples don't carry into the next CycleStats row.
+            transport_->take_wait_times(); transport_->take_bytes();
+            transport_->take_rx_mean(); transport_->take_stale();
             return;
         }
         const double t_cycle_wall =

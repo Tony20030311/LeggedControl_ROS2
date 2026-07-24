@@ -184,8 +184,9 @@ public:
     // last call, accumulated at COMMIT time so injected delay (the C-experiment variable) is
     // included. Same-host wall clock -> valid for localhost sweeps; real robots need NTP sync.
     double take_rx_mean() {
-        const int n = rx_lat_n_.exchange(0);
-        const long long ns = rx_lat_ns_.exchange(0);
+        std::lock_guard<std::mutex> l(rx_mu_);  // (ns,n) must be read+reset as a pair vs accountRx
+        const int n = rx_lat_n_; const long long ns = rx_lat_ns_;
+        rx_lat_n_ = 0; rx_lat_ns_ = 0;
         return n > 0 ? (ns * 1e-9) / n : 0.0;
     }
     // Messages that arrived for a slot older than the newest already committed (late-but-arrived).
@@ -217,15 +218,18 @@ private:
         return std::chrono::duration<double>(
                    std::chrono::system_clock::now().time_since_epoch()).count();
     }
-    void accountRx(double tx_wall) {  // one-way latency, lock-free
+    void accountRx(double tx_wall) {  // one-way latency; (ns,n) updated as a pair under rx_mu_
         if (tx_wall > 0.0) {
-            rx_lat_ns_.fetch_add(static_cast<long long>((wall_now_s() - tx_wall) * 1e9),
-                                 std::memory_order_relaxed);
-            rx_lat_n_.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> l(rx_mu_);
+            rx_lat_ns_ += static_cast<long long>((wall_now_s() - tx_wall) * 1e9);
+            rx_lat_n_ += 1;
         }
     }
     void accountStale(std::uint64_t cycle_id) {  // call with mu_ held
-        if (cycle_id < newest_commit_) stale_.fetch_add(1, std::memory_order_relaxed);
+        // A backward jump far past the prune window is a /clock reset (Gazebo reset / cross-talk),
+        // not a late message -> re-arm the high-water-mark instead of flagging everything stale.
+        if (cycle_id + kKeep < newest_commit_) newest_commit_ = cycle_id;
+        else if (cycle_id < newest_commit_) stale_.fetch_add(1, std::memory_order_relaxed);
         else newest_commit_ = cycle_id;
     }
     using Key = std::tuple<int, int, std::uint64_t, int>;
@@ -372,8 +376,10 @@ private:
     std::atomic<int> timeouts_{0};  // per-hop recv deadline misses (read-and-reset by take_timeouts)
     std::atomic<long long> wait_state_ns_{0}, wait_xi_ns_{0}, wait_z_ns_{0};  // per-cycle recv waits
     std::atomic<std::uint64_t> bytes_tx_{0}, bytes_rx_{0};  // read-and-reset by take_bytes
-    std::atomic<long long> rx_lat_ns_{0};  // sum of one-way (rx-tx) latencies since take_rx_mean
-    std::atomic<int> rx_lat_n_{0}, stale_{0};
+    std::mutex rx_mu_;               // guards the (rx_lat_ns_, rx_lat_n_) pair
+    long long rx_lat_ns_ = 0;        // sum of one-way (rx-tx) latencies since take_rx_mean
+    int rx_lat_n_ = 0;
+    std::atomic<int> stale_{0};
     std::uint64_t newest_commit_ = 0;  // guarded by mu_ (accountStale)
     // fault injection (C experiment): atomics set by set_inject; queue owned by inj_thread_
     std::atomic<double> inj_drop_p_{0.0}, inj_delay_ms_{0.0}, inj_jitter_ms_{0.0};
