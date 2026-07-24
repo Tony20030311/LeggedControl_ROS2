@@ -38,6 +38,8 @@ def read_stats(d):
                 "t_wait_state": float(r["t_wait_state"]), "t_wait_xi": float(r["t_wait_xi"]),
                 "t_wait_z": float(r["t_wait_z"]), "achieved_rounds": int(r["achieved_rounds"]),
                 "hold": int(r["hold"]), "hist": hist,
+                "t_rx_mean": float(r.get("t_rx_mean", 0.0) or 0.0),
+                "reset": int(r.get("reset", 0) or 0), "n_stale": int(r.get("n_stale", 0) or 0),
             })
     return rows
 
@@ -65,26 +67,39 @@ def read_traj(d):
 # ---------- 1. comm latency ----------
 stats = [r for d in RUN_DIRS for r in read_stats(d)]
 if stats:
+    # CDF excludes HOLD cycles (no barrier completes) -> report hold-rate alongside so the
+    # exclusion is explicit, not silent (§C: the stressed cycles are exactly the held ones).
+    hold_rate = 100.0 * np.mean([s["hold"] for s in stats]) if stats else 0.0
     st = np.array([s["t_wait_state"] for s in stats if not s["hold"]]) * 1e3
     xi = np.array([s["t_wait_xi"] for s in stats if not s["hold"]]) * 1e3
     z = np.array([s["t_wait_z"] for s in stats if not s["hold"]]) * 1e3
+    rx = np.array([s["t_rx_mean"] for s in stats if not s["hold"] and s["t_rx_mean"] > 0]) * 1e3
     tot = st + xi + z
+    HOP_DEADLINE_MS = 20.0  # per-hop recv deadline (admm_agent_node hop_deadline_ms default)
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    for arr, lab in [(st, "state barrier"), (xi, "edge xi"), (z, "edge z"), (tot, "total / cycle")]:
+    curves = [(st, "state barrier"), (xi, "edge xi"), (z, "edge z"), (tot, "total / cycle")]
+    if len(rx):
+        curves.append((rx, "one-way rx"))
+    for arr, lab in curves:
         if len(arr) == 0:
             continue
         xs = np.sort(arr)
         ys = np.arange(1, len(xs) + 1) / len(xs)
         ax.plot(xs, ys, label=f"{lab}  (med {np.median(arr):.2f} ms, p95 {np.percentile(arr,95):.2f})")
+    ax.axvline(HOP_DEADLINE_MS, color="k", ls="--", lw=1, alpha=0.6, label=f"hop deadline {HOP_DEADLINE_MS:.0f} ms")
     ax.set_xlabel("per-cycle DDS recv wait [ms]")
     ax.set_ylabel("CDF")
-    ax.set_title("Distributed ADMM communication latency (DDS recv wait)")
+    ax.set_title(f"Distributed ADMM communication latency (DDS recv wait); hold rate {hold_rate:.1f}%")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(os.path.join(OUT, "latency.png"), dpi=130)
+    p95 = np.percentile(tot, 95) if len(tot) else float("nan")
+    slo = "PASS" if len(tot) and p95 < HOP_DEADLINE_MS else "FAIL"
     print(f"latency.png: n={len(tot)} cycles, total/cycle median {np.median(tot):.2f} ms, "
-          f"mean {np.mean(tot):.2f} ms, p95 {np.percentile(tot,95):.2f} ms")
+          f"mean {np.mean(tot):.2f} ms, p95 {p95:.2f} ms")
+    print(f"SLO: p95 total wait {p95:.2f} ms vs {HOP_DEADLINE_MS:.0f} ms hop deadline -> {slo}; "
+          f"hold rate {hold_rate:.1f}%")
 
 # ---------- 2. trajectory error ----------
 fig, (a1, a2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)

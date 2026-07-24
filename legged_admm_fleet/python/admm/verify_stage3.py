@@ -32,9 +32,9 @@ Gate (per scenario; a bad curve is a bug to report, NEVER tune geometry to force
   5. formation error f=||L_hat - L_hat_des||^2 behaves (V/column: falls & stays low;
      squeeze: rises at the door then recovers -- asserted only if they pass).
 
-Run inside the container (ROS sourced -> core.formation imports rospy; osqp 0.6.x):
-  source /opt/ros/noetic/setup.bash
-  python3 legged_upper_control/admm/verify_stage3.py
+Run inside the legged_stack container (ROS 2 Jazzy sourced; osqp 0.6.x):
+  PYTHONPATH=<install>/lib/legged_admm_fleet/python:$PYTHONPATH \
+  python3 python/admm/verify_stage3.py
 """
 
 import os
@@ -57,7 +57,7 @@ from admm_impl import LaplacianFormation  # noqa: E402
 PNG_DIR = os.path.normpath(os.path.join(HERE, "..", "..", "docs", "progress"))
 DOGS = (1, 2, 3)
 EDGES = ((1, 2), (1, 3), (2, 3))
-MAX_CYCLES = 450
+MAX_CYCLES = 600   # V threads the door single-file-ish under D_MIN=1.3; needs headroom
 GOAL_TOL = 0.20
 W_FORM = 10.0
 ROBOT_MARGIN = 0.30                            # node default; r_eff = radius + margin
@@ -65,18 +65,25 @@ DOOR_X = 0.0
 
 # loose corridor walls, shared by all scenarios (exercise the wall CBF plumbing +
 # multi-feature assembly; realized wall h stays well > 0 here -- said so honestly).
-WALLS = [{"normal": (0.0, -1.0), "point": (0.0, 1.7), "d_safe": 0.30},
-         {"normal": (0.0, 1.0), "point": (0.0, -1.7), "d_safe": 0.30}]
+# keep-out |y| >= 1.9: the D_MIN=1.3 starts sit at |y|=1.4 -> wall h = 0.5 > 0 (was 1.7,
+# which put the old 0.7 starts at h ~ 0).
+WALLS = [{"normal": (0.0, -1.0), "point": (0.0, 2.2), "d_safe": 0.30},
+         {"normal": (0.0, 1.0), "point": (0.0, -2.2), "d_safe": 0.30}]
 # door = two posts flanking a clear gap (a half-plane wall can't make an opening).
-DOOR_WIDE = [{"pos": (0.0, 1.15), "radius": 0.30},     # clear |y| < 0.55
-             {"pos": (0.0, -1.15), "radius": 0.30}]
+# Posts widened 1.15->1.6 for D_MIN=1.3: the wider formation's straight (planner-less)
+# reference transits the door at y~0.96, so a ±1.15 door deadlocks and ±1.3 forces the
+# dogs through in safety violation (measured inter-agent h=-0.046); ±1.6 threads safely
+# (h=+0.020). Curved-reference threading of the tighter door is stage 4's job (verify_door).
+DOOR_WIDE = [{"pos": (0.0, 1.6), "radius": 0.30},      # dog-center band |y| < 1.0
+             {"pos": (0.0, -1.6), "radius": 0.30}]
 DOOR_NARROW = [{"pos": (0.0, 1.0), "radius": 0.30},    # clear |y| < 0.40 (squeeze)
                {"pos": (0.0, -1.0), "radius": 0.30}]
 
-ABREAST = {1: (-3.0, 0.0), 2: (-3.0, 0.7), 3: (-3.0, -0.7)}
-WIDEV_START = {1: (-3.0, 0.0), 2: (-3.7, 0.8), 3: (-3.7, -0.8)}
+# Starts re-spaced to >= D_MIN=1.3 (were 0.7/1.6-diagonal, statically infeasible).
+ABREAST = {1: (-3.0, 0.0), 2: (-3.0, 1.4), 3: (-3.0, -1.4)}
+WIDEV_START = {1: (-3.0, 0.0), 2: (-3.8, 1.2), 3: (-3.8, -1.2)}
 
-# kept in sync with admm_core/fleet_config.cpp (D_MIN=1.0; V = equilateral triangle side 1.4)
+# kept in sync with admm_core/fleet_config.cpp (D_MIN=1.3; V = equilateral triangle side 1.4)
 FORMATIONS = {
     "V":      [(0.808, 0.0), (-0.404, 0.7), (-0.404, -0.7)],
     "column": [(0.0, 0.0), (-1.5, 0.0), (-3.0, 0.0)],
@@ -85,10 +92,10 @@ FORMATIONS = {
 SCENARIOS = [
     dict(label="V", formation="V", png="stage3_formation.png", overlay0=True,
          start=ABREAST, obstacles=DOOR_WIDE,
-         goal={1: (3.0, 0.0), 2: (2.3, 0.5), 3: (2.3, -0.5)}),
+         goal={1: (3.0, 0.0), 2: (1.788, 0.7), 3: (1.788, -0.7)}),
     dict(label="column", formation="column", png="stage3_variant_column.png",
          overlay0=False, start=ABREAST, obstacles=DOOR_WIDE,
-         goal={1: (3.0, 0.0), 2: (2.3, 0.0), 3: (1.6, 0.0)}),
+         goal={1: (4.0, 0.0), 2: (2.5, 0.0), 3: (1.0, 0.0)}),
     # squeeze is a DIAGNOSTIC PROBE (gating=False): it deadlocks by design -- a wide
     # V meeting a door narrower than the formation, fed a straight per-dog reference.
     # The deadlock is a known limit of the missing planner layer (stage 4), same as
@@ -97,8 +104,19 @@ SCENARIOS = [
     dict(label="squeeze", formation="V_wide", png="stage3_squeeze.png",
          overlay0=True, squeeze=True, gating=False, start=WIDEV_START,
          obstacles=DOOR_NARROW,
-         goal={1: (3.0, 0.0), 2: (2.3, 0.8), 3: (2.3, -0.8)}),
+         goal={1: (3.0, 0.0), 2: (2.0, 1.0), 3: (2.0, -1.0)}),
 ]
+
+# Static feasibility guard (see admm_impl): every start/goal must clear D_MIN, else the
+# inter-agent CBF forbids the terminal set and the gate cannot pass by construction.
+from admm_impl import assert_min_spacing  # noqa: E402
+assert_min_spacing(ABREAST, "stage3 ABREAST start")
+assert_min_spacing(WIDEV_START, "stage3 WIDEV_START")
+for _s in SCENARIOS:
+    assert_min_spacing(_s["start"], "stage3 %s start" % _s["label"])
+    assert_min_spacing(_s["goal"], "stage3 %s goal" % _s["label"])
+for _n, _o in FORMATIONS.items():
+    assert_min_spacing(_o, "stage3 FORMATIONS[%s]" % _n)
 
 
 # ---- realized barriers (the gate quantities) ---------------------------------

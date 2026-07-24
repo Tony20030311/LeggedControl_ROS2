@@ -2,7 +2,7 @@
 # G4 gate: 3x vision60, distributed — one admm_agent_node per dog, ADMM consensus over DDS.
 # Same phased bring-up as g3_run.sh; phase 3 launches the distributed agents instead of the
 # one centralized node. Each agent stands its dog in place (goal := current odom) until the
-# /formation/goal -> FleetPlan (hosted on robot1) moves them.
+# /formation/goal -> FleetPlan (from the standalone fleet_coordinator_node) moves them.
 WS=/root/legged_ros2_ws
 LOGD=$WS/g2_logs/g4_$(date +%m%d_%H%M%S)
 mkdir -p "$LOGD"
@@ -113,7 +113,7 @@ say "phase 3: distributed agents (ids=$IDS v=$V deadline=${DEADLINE}ms)"
 setsid ros2 launch legged_admm_fleet admm_fleet.launch.py mode:=distributed \
   robot_ids:="$IDS" v:=$V hop_deadline_ms:=$DEADLINE > "$LOGD/admm.log" 2>&1 &
 setsid python3 $WS/src/legged_fleet/legged_admm_fleet/scripts/g3_dist_logger.py \
-  "$ROBOTS" "$LOGD/dist.csv" 1.0 --ros-args -p use_sim_time:=true > "$LOGD/dist_logger.log" 2>&1 &
+  "$ROBOTS" "$LOGD/dist.csv" 1.3 --ros-args -p use_sim_time:=true > "$LOGD/dist_logger.log" 2>&1 &  # 1.3 = admm::D_MIN
 DLPID=$!
 trap 'kill -9 $DLPID 2>/dev/null' EXIT
 # agents stand each dog in place (goal := current odom). Wait for standing.

@@ -145,7 +145,8 @@ PYBIND11_MODULE(admm_core_cpp, m) {
     m.doc() = "ADMM-CBF-DMPC C++ core (staged port of legged_upper_control/admm)";
     m.def("roundtrip", &roundtrip, "Eigen<->numpy roundtrip check");
     m.def("osqp_version", []() { return std::string(osqp_version()); },
-          "Version of the linked OSQP C library (must equal osqp-python's 0.6.3)");
+          "Version of the linked OSQP C library (pinned by test_constants.py; the "
+          "osqp-python 0.6.3 solver path was retired at C6h)");
     m.def("h_obstacle",
           [](const Eigen::VectorXd& p, const Eigen::VectorXd& p_obs, double r_eff) {
               return admm::h_obstacle(Eigen::Vector2d(p(0), p(1)),

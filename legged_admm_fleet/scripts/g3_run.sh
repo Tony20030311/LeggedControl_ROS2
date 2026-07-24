@@ -139,8 +139,8 @@ setsid ros2 run legged_admm_fleet fleet_centralized_node --ros-args \
   > "$LOGD/admm.log" 2>&1 &
 # 20 Hz distance/CBF recorder (the 5s monitor below is far too sparse to catch contact)
 setsid python3 $WS/src/legged_fleet/legged_admm_fleet/scripts/g3_dist_logger.py \
-  "$ROBOTS" "$LOGD/dist.csv" 1.0 --ros-args -p use_sim_time:=true \
-  > "$LOGD/dist_logger.log" 2>&1 &
+  "$ROBOTS" "$LOGD/dist.csv" 1.3 --ros-args -p use_sim_time:=true \
+  > "$LOGD/dist_logger.log" 2>&1 &   # 1.3 = admm::D_MIN (admm_constants.hpp:57)
 DLPID=$!
 trap 'kill -9 $DLPID 2>/dev/null' EXIT
 for i in $(seq 1 20); do
@@ -186,7 +186,7 @@ cx=sum(p[0] for p in pts)/len(pts); cy=sum(p[1] for p in pts)/len(pts)
 print(f'{math.hypot(cx-$GX, cy-$GY):.3f}')")
   # min_pair from the 20Hz logger (single-timestamp truth); the per-robot echoes above are
   # skewed by ~1s each -> computing cross-robot distance from them yields phantom dips.
-  MIND=$(tail -1 "$LOGD/dist.csv" 2>/dev/null | cut -d, -f8); MIND=${MIND:-99}
+  MIND=$(tail -1 "$LOGD/dist.csv" 2>/dev/null | cut -d, -f8); case "$MIND" in ''|*[!0-9.-]*) MIND=99;; esac
   say "  pos=($POSLINE ) centroid_dist=$D min_pair=$MIND"
   BAD=$(python3 -c "print(1 if $MIND<$DMIN_ABORT else 0)")
   [ "$BAD" = 1 ] && die "pairwise distance $MIND < $DMIN_ABORT (collision guard)"

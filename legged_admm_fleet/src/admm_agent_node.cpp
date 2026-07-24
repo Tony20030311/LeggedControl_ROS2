@@ -525,7 +525,12 @@ private:
         const auto b = transport_->take_bytes();  // G5 comm-volume: payload bytes this cycle
         m.bytes_tx = b.tx;
         m.bytes_rx = b.rx;
+        m.t_rx_mean = transport_->take_rx_mean();  // G5 one-way latency (mean rx-tx this cycle)
+        m.n_stale = transport_->take_stale();
         m.hold = res.hold;
+        // A finite-guard (NaN xi) cycle returns hold=false but publishes NO target and
+        // announces a fleet cold-start next slot; mark it so G5 doesn't read it as a normal cycle.
+        m.reset = !res.hold && !res.xi.allFinite();
         stats_pub_->publish(m);
     }
 
@@ -569,7 +574,9 @@ private:
     nav_msgs::msg::Odometry odom_;
     Eigen::Vector2d goal_{0, 0}, v_ema_{0, 0};
     bool has_obs_ = false, has_odom_ = false, has_goal_ = false, has_vema_ = false;
-    bool yaw_latched_ = false;
+    // Callbacks (executor threads) clear this under mu_; the worker read-modify-writes it WITHOUT
+    // mu_ -> atomic to avoid a torn bool. yaw_latch_val_ is worker-thread-only, needs no atomic.
+    std::atomic<bool> yaw_latched_{false};
     double yaw_latch_val_ = 0.0;
 
     std::atomic<bool> run_{false};

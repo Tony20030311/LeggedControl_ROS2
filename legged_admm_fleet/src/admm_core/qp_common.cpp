@@ -119,6 +119,9 @@ void OsqpProblem::setup(const CscPattern& P, const std::vector<double>& Px,
     settings.eps_rel = 1e-6;
     settings.polish = 1;
     settings.max_iter = 8000;
+    // Fixed-iteration rho adaptation (multiple of check_termination=25). OSQP 0.6.x
+    // default (0) adapts on WALL-CLOCK time -> solves are not run-to-run reproducible.
+    settings.adaptive_rho_interval = 25;
     // parity debugging only: NOT used in production paths
     if (const char* env = std::getenv("ADMM_OSQP_POLISH"))
         settings.polish = std::atoi(env);

@@ -96,3 +96,12 @@ def test_admm_edge_constants():
     # the tail clamps to a safe point instead of interpolating into the unsafe tail.
     assert 1 <= C.K_SEND <= C.N                # a valid sub-horizon
     assert C.K_SEND * C.TS <= 1.0 + 1e-9       # within OCS2's 1.0s mpc.timeHorizon
+
+
+def test_osqp_c_lib_version_pinned():
+    # Linked OSQP C library. osqp-python (0.6.3) is NOT asserted: the Python solver
+    # path was retired at C6h, so the known 0.6.2-vs-0.6.3 mismatch never participates
+    # in a solve. Fails loudly if the linked lib silently changes under us (which would
+    # invalidate the bit-parity gate).
+    import admm_core_cpp as cpp
+    assert cpp.osqp_version() == "0.6.2"

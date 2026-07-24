@@ -95,6 +95,7 @@ public:
         for (int k = 0; k < 4; ++k) w.xnow[k] = m.xnow[k];
         w.xibar = to_std(m.xibar);
         w.reset = m.reset;
+        w.tx_wall = wall_now_s();  // one-way latency stamp (same-host valid; real robots need NTP)
         bytes_tx_.fetch_add(wire_bytes(w), std::memory_order_relaxed);
         state_pub_->publish(w);
     }
@@ -124,6 +125,7 @@ public:
         w.from_robot = m.from_robot;
         w.xi = to_std(m.xi);
         w.lam = to_std(m.lam);
+        w.tx_wall = wall_now_s();
         bytes_tx_.fetch_add(wire_bytes(w), std::memory_order_relaxed);
         xi_pubs_.at(m.edge)->publish(w);
     }
@@ -144,6 +146,7 @@ public:
         w.edge_j = m.edge.second;
         w.z_i = to_std(m.z_i);
         w.z_j = to_std(m.z_j);
+        w.tx_wall = wall_now_s();
         bytes_tx_.fetch_add(wire_bytes(w), std::memory_order_relaxed);
         z_pubs_.at(m.edge)->publish(w);
     }
@@ -177,6 +180,17 @@ public:
         return {bytes_tx_.exchange(0), bytes_rx_.exchange(0)};
     }
 
+    // G5 one-way latency instrument: mean (rx_wall - tx_wall) over messages committed since the
+    // last call, accumulated at COMMIT time so injected delay (the C-experiment variable) is
+    // included. Same-host wall clock -> valid for localhost sweeps; real robots need NTP sync.
+    double take_rx_mean() {
+        const int n = rx_lat_n_.exchange(0);
+        const long long ns = rx_lat_ns_.exchange(0);
+        return n > 0 ? (ns * 1e-9) / n : 0.0;
+    }
+    // Messages that arrived for a slot older than the newest already committed (late-but-arrived).
+    int take_stale() { return stale_.exchange(0); }
+
     // Eviction telemetry (experiment D): newest cycle_id seen per peer's AgentState.
     // The node compares against the current slot to detect a permanently-dead peer.
     std::map<int, std::uint64_t> last_seen() {
@@ -198,6 +212,21 @@ private:
     static long long elapsed_ns(std::chrono::steady_clock::time_point t0) {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
                    std::chrono::steady_clock::now() - t0).count();
+    }
+    static double wall_now_s() {  // system (wall) clock for cross-node tx/rx stamps
+        return std::chrono::duration<double>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+    void accountRx(double tx_wall) {  // one-way latency, lock-free
+        if (tx_wall > 0.0) {
+            rx_lat_ns_.fetch_add(static_cast<long long>((wall_now_s() - tx_wall) * 1e9),
+                                 std::memory_order_relaxed);
+            rx_lat_n_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    void accountStale(std::uint64_t cycle_id) {  // call with mu_ held
+        if (cycle_id < newest_commit_) stale_.fetch_add(1, std::memory_order_relaxed);
+        else newest_commit_ = cycle_id;
     }
     using Key = std::tuple<int, int, std::uint64_t, int>;
     static Key key(const EdgeKey& e, std::uint64_t c, int it) { return {e.first, e.second, c, it}; }
@@ -268,22 +297,28 @@ private:
         }
     }
 
-    void commitState(const AgentStateMsg& m) {
+    void commitState(const AgentStateMsg& m, double tx_wall) {
+        accountRx(tx_wall);
         {
             std::lock_guard<std::mutex> l(mu_);
             states_[m.cycle_id][m.robot_id] = m;
             auto& seen = last_seen_[m.robot_id];
             seen = std::max(seen, m.cycle_id);
+            accountStale(m.cycle_id);
             pruneOld(m.cycle_id);
         }
         cv_.notify_all();
     }
-    void commitXi(const EdgeXiMsg& m) {
-        { std::lock_guard<std::mutex> l(mu_); xi_[key(m.edge, m.cycle_id, m.iter)][m.from_robot] = m; }
+    void commitXi(const EdgeXiMsg& m, double tx_wall) {
+        accountRx(tx_wall);
+        { std::lock_guard<std::mutex> l(mu_); accountStale(m.cycle_id);
+          xi_[key(m.edge, m.cycle_id, m.iter)][m.from_robot] = m; }
         cv_.notify_all();
     }
-    void commitZ(const EdgeZMsg& m) {
-        { std::lock_guard<std::mutex> l(mu_); z_[key(m.edge, m.cycle_id, m.iter)] = m; }
+    void commitZ(const EdgeZMsg& m, double tx_wall) {
+        accountRx(tx_wall);
+        { std::lock_guard<std::mutex> l(mu_); accountStale(m.cycle_id);
+          z_[key(m.edge, m.cycle_id, m.iter)] = m; }
         cv_.notify_all();
     }
 
@@ -296,7 +331,7 @@ private:
         for (int k = 0; k < 4; ++k) m.xnow[k] = w.xnow[k];
         m.xibar = to_vec(w.xibar);
         m.reset = w.reset;
-        injDeliver([this, m] { commitState(m); });
+        injDeliver([this, m, tx = w.tx_wall] { commitState(m, tx); });
     }
     void onXi(const admm_fleet_msgs::msg::EdgeXi& w) {
         if (injDrop()) return;
@@ -308,7 +343,7 @@ private:
         m.from_robot = w.from_robot;
         m.xi = to_vec(w.xi);
         m.lam = to_vec(w.lam);
-        injDeliver([this, m] { commitXi(m); });
+        injDeliver([this, m, tx = w.tx_wall] { commitXi(m, tx); });
     }
     void onZ(const admm_fleet_msgs::msg::EdgeZ& w) {
         if (injDrop()) return;
@@ -319,7 +354,7 @@ private:
         m.edge = EdgeKey(w.edge_i, w.edge_j);
         m.z_i = to_vec(w.z_i);
         m.z_j = to_vec(w.z_j);
-        injDeliver([this, m] { commitZ(m); });
+        injDeliver([this, m, tx = w.tx_wall] { commitZ(m, tx); });
     }
 
     rclcpp::Node* node_;
@@ -337,6 +372,9 @@ private:
     std::atomic<int> timeouts_{0};  // per-hop recv deadline misses (read-and-reset by take_timeouts)
     std::atomic<long long> wait_state_ns_{0}, wait_xi_ns_{0}, wait_z_ns_{0};  // per-cycle recv waits
     std::atomic<std::uint64_t> bytes_tx_{0}, bytes_rx_{0};  // read-and-reset by take_bytes
+    std::atomic<long long> rx_lat_ns_{0};  // sum of one-way (rx-tx) latencies since take_rx_mean
+    std::atomic<int> rx_lat_n_{0}, stale_{0};
+    std::uint64_t newest_commit_ = 0;  // guarded by mu_ (accountStale)
     // fault injection (C experiment): atomics set by set_inject; queue owned by inj_thread_
     std::atomic<double> inj_drop_p_{0.0}, inj_delay_ms_{0.0}, inj_jitter_ms_{0.0};
     std::mt19937 rng_;

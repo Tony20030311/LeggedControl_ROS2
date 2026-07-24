@@ -21,10 +21,9 @@ Gate (a bad curve is a bug to report, NEVER tune geometry to force):
   4. r_prim AND r_dual descend over ADMM iterations
   5. formation error f falls and stays low
 
-Run inside the container (ROS sourced -> core.formation + the publisher import rospy;
-osqp 0.6.x):
-  source /opt/ros/noetic/setup.bash
-  python3 legged_upper_control/admm/verify_arena.py
+Run inside the legged_stack container (ROS 2 Jazzy sourced; osqp 0.6.x):
+  PYTHONPATH=<install>/lib/legged_admm_fleet/python:$PYTHONPATH \
+  python3 python/admm/verify_arena.py
 """
 
 import os

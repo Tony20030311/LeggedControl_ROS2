@@ -20,8 +20,9 @@ Gate:
   5. realized WALL h (boundary half-planes) >= -eps
   6. r_prim AND r_dual descend
 
-Run in the container: source /opt/ros/noetic/setup.bash
-  python3 legged_upper_control/admm/verify_door.py
+Run in the legged_stack container (ROS 2 Jazzy sourced):
+  PYTHONPATH=<install>/lib/legged_admm_fleet/python:$PYTHONPATH \
+  python3 python/admm/verify_door.py
 """
 
 import os
@@ -41,6 +42,7 @@ from admm_impl import LaplacianFormation  # noqa: E402
 from admm_impl import AStarPlanner                      # noqa: E402
 import verify_arena as va                                   # noqa: E402
 from admm_impl import ARENAS, FORMATIONS         # noqa: E402  (single source of truth)
+from admm_impl import assert_gaps_passable, assert_min_spacing  # noqa: E402
 
 PNG_DIR = os.path.normpath(os.path.join(HERE, "..", "..", "docs", "progress"))
 DOGS = (1, 2, 3)
@@ -50,7 +52,7 @@ MAX_CYCLES = 900
 GOAL_TOL = 0.25
 W_FORM = 10.0
 # Aligned to legacy reactive QP: obstacle r_eff = radius + ROBOT_MARGIN = 0.30 + 0.20 = 0.50
-# (was 0.60), A* inflation radius + ASTAR = 0.50 (was 0.65). Dog-dog D_MIN stays 0.60.
+# (was 0.60), A* inflation radius + ASTAR = 0.50 (was 0.65). Dog-dog D_MIN is 1.3 (fleet_config).
 ROBOT_MARGIN = 0.20
 ASTAR_ROBOT_RADIUS = 0.20
 
@@ -62,13 +64,7 @@ def _assert_two_abreast_passable(obstacles):
     0.5m apart and are never threaded between, so they are excluded."""
     assert ROBOT_MARGIN >= 0.15, "obstacle buffer %.2f below 0.15 floor" % ROBOT_MARGIN
     field = [o for o in obstacles if o["radius"] > 0.20]
-    for a in range(len(field)):
-        for b in range(a + 1, len(field)):
-            d = float(np.linalg.norm(np.subtract(field[a]["pos"], field[b]["pos"])))
-            thr = (field[a]["radius"] + ROBOT_MARGIN) + (field[b]["radius"] + ROBOT_MARGIN) + C.D_MIN
-            assert d >= thr - 1e-9, (
-                "field cyl (%.1f,%.1f)-(%.1f,%.1f) gap %.3f < 2r_eff+D_MIN %.3f -> two dogs abreast blocked"
-                % (field[a]["pos"][0], field[a]["pos"][1], field[b]["pos"][0], field[b]["pos"][1], d, thr))
+    assert_gaps_passable(field, ROBOT_MARGIN, C.D_MIN, "door field cylinders")
 
 
 def realized_wall_h(p, walls):

@@ -16,19 +16,41 @@ const std::map<std::string, Arena>& arenas() {
             {{{4.0, 0.40}, 0.30}, {{5.5, 0.40}, 0.30}},
             {},
             {},
-            {{1, {7.0, 0.0}}, {2, {6.3, 0.5}}, {3, {6.3, -0.5}}},
+            // V(side 1.40) translated: pairwise spacing 1.40 >= D_MIN=1.3 (dogs stop at
+            // zero formation stress). Follower->cyl(5.5,0.40) clearance hypot(0.688,0.30)
+            // =0.751 >= r_eff 0.60 (verify_arena margin 0.30).
+            {{1, {7.4, 0.0}}, {2, {6.188, 0.7}}, {3, {6.188, -0.7}}},
         };
         Arena plum;
-        // Vision60 upscale: arena is A1-native (min peg spacing 1.64 m -> only +0.09 m
-        // planner clearance at r_eff 0.30+0.43). Positions (obstacles AND goals) scaled
-        // 1.4x about origin -> spacing 2.30 m, +0.42 m clearance == A1's original margin.
-        // CBF radius (0.30) is NOT scaled; keep gen_arena_world.py plum in sync.
+        // Vision60 quincunx weave, 7 rows / 17 piles (row pitch 1.82; A-rows y=+-1.54,
+        // B-rows y=0,+-2.94). CBF radius 0.30 per pile (physical pile r=0.20 in the SDF).
+        // Clearances (live robot_margin 0.60, so a corridor must span 2*(0.30+0.60)=1.80):
+        //   in-row gaps 3.08 (A) / 2.94 (B); min diagonal anywhere hypot(1.82,1.40)=2.296
+        //   -> +0.496 slack, corridor half-width 0.248 > A* res 0.15 (a grid path exists).
+        //   offline verify (margin 0.20, need >=1.00): +1.30 slack. Keep gen_arena_world in sync.
         for (const auto& p : std::vector<Eigen::Vector2d>{
                  {4.76, 1.54}, {4.76, -1.54}, {6.58, 0.0}, {6.58, 2.94}, {6.58, -2.94},
-                 {8.40, 1.54}, {8.40, -1.54}, {10.22, 0.0}, {10.22, 2.94}, {10.22, -2.94}})
+                 {8.40, 1.54}, {8.40, -1.54}, {10.22, 0.0}, {10.22, 2.94}, {10.22, -2.94},
+                 {12.04, 1.54}, {12.04, -1.54}, {13.86, 0.0}, {13.86, 2.94}, {13.86, -2.94},
+                 {15.68, 1.54}, {15.68, -1.54}})
             plum.obstacles.push_back({p, 0.30});
-        plum.goals = {{1, {12.6, 0.0}}, {2, {11.62, 0.7}}, {3, {11.62, -0.7}}};
+        // V(side 1.40) past the last row; follower->last peg(15.68,+-1.54)
+        // hypot(1.108,0.84)=1.390 >= 0.90 (live r_eff).
+        plum.goals = {{1, {18.0, 0.0}}, {2, {16.788, 0.7}}, {3, {16.788, -0.7}}};
         a["plum"] = plum;
+        Arena plum_dense;
+        // Denser variant: 7-row quincunx scaled 0.958x -> min diagonal gap 2.20 m (row pitch
+        // 1.744, A-rows y=+-1.48, B-rows y=0,+-2.82). Corridor half-width 2.20/2 - 0.90 = 0.20 m
+        // (> A* res 0.15). Denser than the 2.30 base but backs off the 2.10 edge where the
+        // dog-dog clearance swung to 0.128 m over 5 trials -- 2.20 keeps A* margin + spacing.
+        for (const auto& p : std::vector<Eigen::Vector2d>{
+                 {4.56, 1.48}, {4.56, -1.48}, {6.31, 0.0}, {6.31, 2.82}, {6.31, -2.82},
+                 {8.05, 1.48}, {8.05, -1.48}, {9.79, 0.0}, {9.79, 2.82}, {9.79, -2.82},
+                 {11.54, 1.48}, {11.54, -1.48}, {13.28, 0.0}, {13.28, 2.82}, {13.28, -2.82},
+                 {15.02, 1.48}, {15.02, -1.48}})
+            plum_dense.obstacles.push_back({p, 0.30});
+        plum_dense.goals = {{1, {17.2, 0.0}}, {2, {15.988, 0.7}}, {3, {15.988, -0.7}}};
+        a["plum_dense"] = plum_dense;
         Arena door;
         // Vision60 upscale: A1-native door scaled 1.4x about origin (matching plum). Obstacle
         // positions AND wall/rect geometry AND goals scale; obstacle radii + wall d_safe stay
@@ -55,7 +77,10 @@ const std::map<std::string, Arena>& arenas() {
             {{11.2, 7.0}, {5.6, 0.21}},      // wall_top
             {{11.2, -7.0}, {5.6, 0.21}},     // wall_bottom
         };
-        door.goals = {{1, {13.02, 0.7}}, {2, {12.04, 1.4}}, {3, {12.04, 0.0}}};
+        // Followers 0.232 deeper (x 12.04->11.808) so all pairs = 1.400 >= D_MIN=1.3;
+        // leader x=13.02 UNCHANGED (:43-46 wall-stall lesson). Follower->cyl(11.2,0.7)
+        // hypot(0.608,0.7)=0.927 >= 0.90 (live r_eff).
+        door.goals = {{1, {13.02, 0.7}}, {2, {11.808, 1.4}}, {3, {11.808, 0.0}}};
         a["door"] = door;
         return a;
     }();
@@ -76,8 +101,10 @@ const std::map<std::string, std::vector<Eigen::Vector2d>>& formations() {
 }
 
 const std::map<int, Eigen::Vector2d>& default_goals() {
+    // V(side 1.40) translated: pairwise spacing 1.40 >= D_MIN=1.3 (was 0.860, statically
+    // infeasible vs the inter-agent CBF). g3/g4 override these with live odom anyway.
     static const std::map<int, Eigen::Vector2d> kGoals = {
-        {1, {3.0, 0.0}}, {2, {2.3, 0.5}}, {3, {2.3, -0.5}}};
+        {1, {3.0, 0.0}}, {2, {1.788, 0.7}}, {3, {1.788, -0.7}}};
     return kGoals;
 }
 

@@ -21,9 +21,9 @@ Gate (a bad curve is a bug to REPORT, never tune geometry to force):
 Also REPORTED (documents necessity, not gated -- a negative test is fragile): straight
 refs on the SAME field DEADLOCK.
 
-Run in the container (ROS sourced -> core.formation + the publisher import rospy):
-  source /opt/ros/noetic/setup.bash
-  python3 legged_upper_control/admm/verify_plum.py
+Run in the legged_stack container (ROS 2 Jazzy sourced):
+  PYTHONPATH=<install>/lib/legged_admm_fleet/python:$PYTHONPATH \
+  python3 python/admm/verify_plum.py
 """
 
 import os
@@ -42,13 +42,14 @@ from admm_impl import LaplacianFormation  # noqa: E402
 from admm_impl import AStarPlanner                      # noqa: E402
 import verify_arena as va                                   # noqa: E402  (reuse realized_* + gate + _plot)
 from admm_impl import ARENAS, FORMATIONS         # noqa: E402  (single source of truth)
+from admm_impl import assert_gaps_passable       # noqa: E402
 
 PNG_DIR = os.path.normpath(os.path.join(HERE, "..", "..", "docs", "progress"))
 DOGS = (1, 2, 3)
 EDGES = ((1, 2), (1, 3), (2, 3))
 # Gazebo V spawn (three_dogs_plum.launch): dog1(2,0) dog2(1,1) dog3(1,-1).
 START = {1: (2.0, 0.0), 2: (1.0, 1.0), 3: (1.0, -1.0)}
-MAX_CYCLES = 800
+MAX_CYCLES = 2000   # goal now at x~18 (7-row field); ~0.015 m/cycle cruise + weaving
 GOAL_TOL = 0.20
 W_FORM = 10.0
 TOL = 1e-6
@@ -104,6 +105,8 @@ def main():
     obstacles = [{"pos": o["pos"], "radius": o["radius"]} for o in arena["obstacles"]]
     goal = arena["goals"]
     va._assert_arena_shape(obstacles)
+    # single-file weave (extra=0): every pile pair must leave a corridor for one dog.
+    assert_gaps_passable(obstacles, ROBOT_MARGIN, 0.0, "plum piles")
 
     lf = LaplacianFormation(FORMATIONS)
 
@@ -124,7 +127,7 @@ def main():
                                walls=[], formation=lf, w_form=W_FORM,
                                robot_margin=ROBOT_MARGIN)
     planner = AStarPlanner(resolution=0.15, robot_radius=ASTAR_ROBOT_RADIUS,
-                           obstacles=obstacles, x_min=0.0, x_max=10.0,
+                           obstacles=obstacles, x_min=0.0, x_max=20.0,
                            y_min=-4.0, y_max=4.0)
     paths, wp_ok = {}, True
     for i in DOGS:

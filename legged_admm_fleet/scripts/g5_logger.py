@@ -44,7 +44,8 @@ class G5Logger(Node):
         self.sf = open(f"{OUTDIR}/stats.csv", "w", buffering=1)
         self.sf.write("t,robot,cycle,achieved_rounds,n_timeouts,"
                       "t_wait_state,t_wait_xi,t_wait_z,t_cycle_wall,"
-                      "t_node,t_edge_solve,bytes_tx,bytes_rx,hold,r_prim_hist\n")
+                      "t_node,t_edge_solve,bytes_tx,bytes_rx,hold,"
+                      "reset,n_stale,t_rx_mean,r_prim_hist\n")
         self.tf = open(f"{OUTDIR}/traj.csv", "w", buffering=1)
         cols = ",".join(f"pos_err{r},vel_err{r},ax{r},ay{r},cx{r},cy{r}" for r in ROBOTS)
         self.tf.write("t," + cols + "\n")
@@ -76,7 +77,8 @@ class G5Logger(Node):
         self.sf.write(f"{t:.3f},{m.robot_id},{m.cycle_id},{m.achieved_rounds},{m.n_timeouts},"
                       f"{m.t_wait_state:.6g},{m.t_wait_xi:.6g},{m.t_wait_z:.6g},"
                       f"{m.t_cycle_wall:.6g},{m.t_node:.6g},{m.t_edge_solve:.6g},"
-                      f"{m.bytes_tx},{m.bytes_rx},{int(m.hold)},{hist}\n")
+                      f"{m.bytes_tx},{m.bytes_rx},{int(m.hold)},"
+                      f"{int(m.reset)},{m.n_stale},{m.t_rx_mean:.6g},{hist}\n")
 
     def tick(self):
         if len(self.odom) < len(ROBOTS) or len(self.ref) < len(ROBOTS):

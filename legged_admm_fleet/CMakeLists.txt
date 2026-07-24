@@ -23,6 +23,9 @@ add_library(admm_core STATIC
   src/agent_core.cpp
 )
 target_compile_features(admm_core PUBLIC cxx_std_17)
+# No FMA contraction: parity gates (Python oracle / G1 bit-identity) rely on exact
+# a*b+c rounding; a -march=native build would otherwise legally fuse and break them.
+target_compile_options(admm_core PUBLIC -ffp-contract=off)
 target_include_directories(admm_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>

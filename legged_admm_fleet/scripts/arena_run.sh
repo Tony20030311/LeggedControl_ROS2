@@ -41,8 +41,9 @@ GOALS_IN="${GOALS:-}"          # was a single goal-set given explicitly on the e
 # per-dog goals — MUST match fleet_config.cpp arenas() <arena>.goals (kept in sync manually).
 if [ -z "${GOALS:-}" ]; then
   case "$ARENA" in
-    plum) GOALS="12.6 0.0 11.62 0.7 11.62 -0.7" ;;
-    door) GOALS="13.02 0.7 12.04 1.4 12.04 0.0" ;;
+    plum) GOALS="18.0 0.0 16.788 0.7 16.788 -0.7" ;;
+    plum_dense) GOALS="17.2 0.0 15.988 0.7 15.988 -0.7" ;;   # 0.958x plum, gap 2.20; A* plans full weave (single set)
+    door) GOALS="13.02 0.7 11.808 1.4 11.808 0.0" ;;
     *) echo "unknown arena $ARENA"; exit 1 ;;
   esac
 fi
@@ -54,11 +55,12 @@ fi
 if [ -z "${SEQ:-}" ]; then
   if [ -n "$GOALS_IN" ]; then SEQ="$GOALS"          # explicit single set -> keep old behaviour
   else case "$ARENA" in
-    # staggered columns (leader ahead, two followers offset): every pair >= 1.28 m so the inter-robot
-    # CBF (D_MIN=1.0) never forbids the goal, and every goal sits in a clear lane (>=0.29 m off any
-    # pillar/wall). "5.5 0.9 / 5.5 -0.9 / 5.5 0" style abreast sets deadlock 3 dogs in a <1 m gap.
-    plum) SEQ="4.5 0.0 3.2 0.7 3.2 -0.7 ; 7.5 0.0 5.8 0.8 5.8 -0.8 ; 12.5 0.0 11.5 0.8 11.5 -0.8" ;;
-    door) SEQ="6.5 0.0 5.2 0.9 5.2 -0.9 ; 10.0 0.0 9.2 1.0 9.2 -1.0 ; 12.5 0.0 12.5 2.2 12.5 -3.0" ;;
+    # staggered columns (leader ahead, two followers offset): every pair >= D_MIN=1.3 so the
+    # inter-robot CBF never forbids the goal, and every waypoint sits >=0.90 m (live r_eff) off
+    # any pillar. Abreast sets would deadlock 3 dogs in a sub-D_MIN gap.
+    # plum: 4 sets threading the 7-row field (min pair 1.95, min waypoint-to-pile 0.91).
+    plum) SEQ="5.67 0.0 4.0 1.0 4.0 -1.0 ; 9.31 0.0 7.6 1.0 7.6 -1.0 ; 12.95 0.0 11.2 1.0 11.2 -1.0 ; 18.0 0.0 16.788 0.7 16.788 -0.7" ;;
+    door) SEQ="6.5 0.0 5.2 0.9 5.2 -0.9 ; 10.0 0.0 8.9 1.1 8.9 -1.1 ; 12.5 0.0 12.5 2.2 12.5 -3.0" ;;
     *) SEQ="$GOALS" ;;
   esac; fi
 fi
@@ -72,7 +74,7 @@ SET_ITERS=${SET_ITERS:-70}     # per-set arrival cap (iters of the 5s monitor lo
 # lets each dog take its own gap and the V expand/contract freely. FSEQ = centroids "cx cy ; cx cy".
 if [ -z "${FSEQ:-}" ]; then
   case "$ARENA" in
-    plum) FSEQ="4.0 0.0 ; 8.0 0.0 ; 12.0 0.0" ;;
+    plum) FSEQ="4.0 0.0 ; 8.0 0.0 ; 12.0 0.0 ; 16.0 0.0" ;;
     door) FSEQ="5.0 0.0 ; 9.0 0.0 ; 12.5 0.0" ;;
     *) FSEQ="6.0 0.0" ;;
   esac
@@ -162,7 +164,7 @@ setsid python3 $WS/src/legged_fleet/legged_admm_fleet/scripts/g5_logger.py \
   "$ROBOTS" "$LOGD" --ros-args -p use_sim_time:=true > "$LOGD/g5_logger.log" 2>&1 &
 G5PID=$!
 setsid python3 $WS/src/legged_fleet/legged_admm_fleet/scripts/g3_dist_logger.py \
-  "$ROBOTS" "$LOGD/dist.csv" 1.0 --ros-args -p use_sim_time:=true > "$LOGD/dist_logger.log" 2>&1 &
+  "$ROBOTS" "$LOGD/dist.csv" 1.3 --ros-args -p use_sim_time:=true > "$LOGD/dist_logger.log" 2>&1 &  # 1.3 = admm::D_MIN
 DLPID=$!
 RVIZPID=""; RVGRABPID=""; VIZPID=""; RECPID=""; BRPID=""
 trap 'kill -9 $G5PID $DLPID $RVIZPID $RVGRABPID $VIZPID $RECPID $BRPID 2>/dev/null' EXIT
@@ -270,7 +272,7 @@ goto_set() {
       ok=$(python3 -c "print(1 if $e < $GOAL_TOL else 0)"); [ "$ok" = 1 ] || DONE=0
       k=$((k+1))
     done
-    MIND=$(tail -1 "$LOGD/dist.csv" 2>/dev/null | cut -d, -f8); MIND=${MIND:-99}
+    MIND=$(tail -1 "$LOGD/dist.csv" 2>/dev/null | cut -d, -f8); case "$MIND" in ""|*[!0-9.-]*) MIND=99;; esac
     say "  [set $idx] $LINE min_pair=$MIND"
     BAD=$(python3 -c "print(1 if $MIND<$DMIN_ABORT else 0)")
     [ "$BAD" = 1 ] && die "pairwise $MIND < $DMIN_ABORT (collision guard)"
@@ -301,7 +303,7 @@ import math
 v=[float(x) for x in '$XY'.split()]; xs=v[0::2]; ys=v[1::2]
 mx=sum(xs)/len(xs); my=sum(ys)/len(ys)
 print(f'{mx:.2f} {my:.2f} {math.hypot(mx-$cx,my-$cy):.2f}')")
-    MIND=$(tail -1 "$LOGD/dist.csv" 2>/dev/null | cut -d, -f8); MIND=${MIND:-99}
+    MIND=$(tail -1 "$LOGD/dist.csv" 2>/dev/null | cut -d, -f8); case "$MIND" in ""|*[!0-9.-]*) MIND=99;; esac
     say "  [fset $idx] centroid=($mx,$my)/e$e min_pair=$MIND"
     BAD=$(python3 -c "print(1 if $MIND<$DMIN_ABORT else 0)")
     [ "$BAD" = 1 ] && die "pairwise $MIND < $DMIN_ABORT (collision guard)"

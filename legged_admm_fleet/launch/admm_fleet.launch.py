@@ -1,5 +1,5 @@
-# ADMM upper-control launch. mode:=centralized (default, P2 baseline) runs the single
-# fleet_centralized_node; mode:=distributed (P4/G4) runs one admm_agent_node per robot.
+# ADMM upper-control launch. mode:=distributed (default, P4/G4) runs one admm_agent_node
+# per robot; mode:=centralized (P2 baseline oracle) runs the single fleet_centralized_node.
 import ast
 
 from ament_index_python.packages import get_package_share_directory
@@ -77,7 +77,7 @@ def generate_launch_description():
         DeclareLaunchArgument('astar_robot_radius', default_value='0.60'),
         # generous defaults covering both arenas (plum goals reach x=12.6, y=5.7; door to x=10):
         DeclareLaunchArgument('astar_x_min', default_value='-2.0'),
-        DeclareLaunchArgument('astar_x_max', default_value='14.0'),
+        DeclareLaunchArgument('astar_x_max', default_value='20.0'),  # plum goals now reach x=18
         DeclareLaunchArgument('astar_y_min', default_value='-7.0'),
         DeclareLaunchArgument('astar_y_max', default_value='7.0'),
         DeclareLaunchArgument('robot_ids', default_value='[1, 2, 3]'),
