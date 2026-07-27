@@ -696,6 +696,11 @@ PYBIND11_MODULE(admm_core_cpp, m) {
                  return py::make_tuple(cand, path);
              },
              py::arg("start"), py::arg("goal"))
+        .def("set_circles",
+             [](admm::AStarPlanner& self, const py::object& obstacles) {
+                 self.set_circles(parse_astar_obstacles(obstacles));
+             },
+             py::arg("obstacles"))
         .def("_debug_omap", [](const admm::AStarPlanner& self) {
             Eigen::MatrixXi omap(self.nx(), self.ny());
             for (int i = 0; i < self.nx(); ++i)

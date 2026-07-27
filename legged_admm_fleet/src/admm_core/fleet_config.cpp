@@ -96,8 +96,30 @@ const std::map<std::string, std::vector<Eigen::Vector2d>>& formations() {
         {"V", {{0.808, 0.0}, {-0.404, 0.7}, {-0.404, -0.7}}},
         {"column", {{0.0, 0.0}, {-1.5, 0.0}, {-3.0, 0.0}}},
         {"V_wide", {{0.0, 0.0}, {-1.0, 1.0}, {-1.0, -1.0}}},
+        // Two-dog degraded shape (one peer evicted). A COLUMN, not a line abreast:
+        // centroid_slot_targets rotates offsets by yaw = atan2(goal - centroid), so +x is the
+        // direction of travel -> the pair strings out along the path and its LATERAL footprint
+        // is one body wide, which is what fits through the plum-post gaps. Spacing 1.50 > D_MIN
+        // 1.30, else the slot targets would fight the inter-agent CBF forever.
+        // NOTE: with n=2 the normalized-Laplacian shape cost is identically zero (L_hat is
+        // [[1,-1],[-1,1]] regardless of distance), so this shape is held by the coordinator's
+        // slot targets alone, not by w_form. That is expected, not a bug.
+        {"COL2", {{0.75, 0.0}, {-0.75, 0.0}}},
     };
     return kFormations;
+}
+
+std::optional<CorpseKeepout> corpse_keepout(const Eigen::Vector4d& xnow,
+                                            const Eigen::VectorXd& xibar,
+                                            double robot_margin) {
+    CorpseKeepout k;
+    const bool plan_ok = xibar.size() > py_index(N) &&
+                         std::isfinite(xibar[px_index(N)]) && std::isfinite(xibar[py_index(N)]);
+    k.pos = plan_ok ? Eigen::Vector2d(xibar[px_index(N)], xibar[py_index(N)])
+                    : xnow.head<2>();
+    if (!k.pos.allFinite()) return std::nullopt;
+    k.radius = std::max(0.10, D_MIN - robot_margin);
+    return k;
 }
 
 const std::map<int, Eigen::Vector2d>& default_goals() {

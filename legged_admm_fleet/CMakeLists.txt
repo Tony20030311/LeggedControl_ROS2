@@ -91,6 +91,8 @@ add_executable(test_agent_timeout test/test_agent_timeout.cpp)
 target_link_libraries(test_agent_timeout admm_core Threads::Threads)
 add_executable(test_agent_failover test/test_agent_failover.cpp)
 target_link_libraries(test_agent_failover admm_core Threads::Threads)
+add_executable(test_corpse_keepout test/test_corpse_keepout.cpp)
+target_link_libraries(test_corpse_keepout admm_core)
 
 # register the gates with ctest so `colcon test` actually runs them (they used to be
 # build-only; the D_MIN 1.0->1.3 change shipped with nothing re-running them)
@@ -98,5 +100,6 @@ enable_testing()
 add_test(NAME distributed_parity COMMAND test_distributed_parity)
 add_test(NAME agent_timeout COMMAND test_agent_timeout)
 add_test(NAME agent_failover COMMAND test_agent_failover)
+add_test(NAME corpse_keepout COMMAND test_corpse_keepout)
 
 ament_package()

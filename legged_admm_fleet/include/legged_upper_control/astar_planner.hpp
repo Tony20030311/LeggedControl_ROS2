@@ -64,6 +64,13 @@ public:
     ReachableGoal find_reachable_goal(const Eigen::Vector2d& start,
                                       const Eigen::Vector2d& goal) const;
 
+    // Replace the CIRCLE obstacle set in place, keeping resolution / bounds / rects.
+    // Lets a fleet add or drop a dead peer's keep-out without rebuilding the planner and
+    // thereby losing the arena-sized bounds it was constructed with.
+    // The occupancy grid BAKES obstacles in (see build_map), so omap_ must be recomputed —
+    // swapping the vector alone would leave the old circles blocking cells.
+    void set_circles(std::vector<AStarCircle> circles);
+
     int nx() const { return nx_; }
     int ny() const { return ny_; }
     const std::vector<uint8_t>& omap() const { return omap_; }
@@ -75,6 +82,10 @@ private:
     std::vector<uint8_t> build_map(double inflate) const;
     std::vector<Eigen::Vector2d> plan_on_map(const Eigen::Vector2d& start,
                                              const Eigen::Vector2d& goal) const;
+    // The bare grid search. plan_on_map wraps it with the occupied-start escape; keeping the
+    // search itself untouched is what makes that escape provably additive.
+    std::vector<Eigen::Vector2d> search_(const Eigen::Vector2d& start,
+                                         const Eigen::Vector2d& goal) const;
     // (dist, point) candidates sorted stably by dist, mirrored insertion order.
     std::vector<std::pair<double, Eigen::Vector2d>> nearest_free_candidates(
         const Eigen::Vector2d& goal) const;

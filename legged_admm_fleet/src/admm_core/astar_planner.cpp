@@ -91,6 +91,11 @@ AStarPlanner::AStarPlanner(double resolution, double robot_radius,
     omap_ = build_map(robot_radius_);
 }
 
+void AStarPlanner::set_circles(std::vector<AStarCircle> circles) {
+    obstacles_ = std::move(circles);
+    omap_ = build_map(robot_radius_);  // obstacles are baked into the grid, not tested live
+}
+
 std::vector<uint8_t> AStarPlanner::build_map(double inflate) const {
     // xs[i] = i*res + x_min (np.arange(nx)*res + x_min); conditions OR'd per cell
     // in the Python mask order (walls, circles, rects) — OR is order-free.
@@ -138,7 +143,34 @@ std::vector<Eigen::Vector2d> AStarPlanner::plan(const Eigen::Vector2d& start,
     return plan_on_map(start, goal);
 }
 
+// A robot can end up INSIDE a keep-out without ever driving into one: a peer dies beside it and
+// a circle appears around where it already stands. If the search from there comes back empty the
+// caller falls back to a straight line through the keep-out, the QP bounds invert, and the dog
+// freezes for the rest of the run. An occupied GOAL has always been rescued (find_reachable_goal);
+// give the START the same courtesy. "You are too close, walk away" is the answer; "no path" is not.
+//
+// Deliberately layered ON TOP of the untouched search rather than folded into it: search_ runs
+// first and unchanged, so every input that already produced a path still produces the SAME path.
+// Only outcomes that used to be "no path at all" can differ. (An occupied start with a free
+// neighbour already planned fine — snapping it unconditionally would have moved those paths too.)
 std::vector<Eigen::Vector2d> AStarPlanner::plan_on_map(
+    const Eigen::Vector2d& start, const Eigen::Vector2d& goal) const {
+    auto path = search_(start, goal);
+    if (!path.empty()) return path;
+    const auto [sx0, sy0] = w2g(start(0), start(1));
+    if (is_free(sx0, sy0)) return {};  // start was fine; the goal is simply unreachable
+    for (const auto& c : nearest_free_candidates(start)) {
+        const auto [cx, cy] = w2g(c.second(0), c.second(1));
+        if (!is_free(cx, cy)) continue;
+        auto out = search_(c.second, goal);
+        if (out.empty()) continue;
+        out.insert(out.begin(), start);  // lead with the body, then the step out
+        return out;
+    }
+    return {};  // walled in on every side: genuinely nothing to plan
+}
+
+std::vector<Eigen::Vector2d> AStarPlanner::search_(
     const Eigen::Vector2d& start, const Eigen::Vector2d& goal) const {
     const auto [sx, sy] = w2g(start(0), start(1));
     const auto [gx, gy] = w2g(goal(0), goal(1));

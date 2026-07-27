@@ -225,8 +225,78 @@ int main() {
         std::cout << "C: 2-dog survivor consensus with corpse obstacle OK\n";
     }
 
+    // ---------- D. REJOIN: a 2-dog survivor pair grows back to the full roster ----------
+    // Phase 2 rests on one assumption: rebuilding every agent onto the FULL roster (formation
+    // restored, corpse dropped) cold-starts the fleet cleanly instead of ping-ponging. The
+    // rebuilt cores all have cycle_==0, so every one of them broadcasts reset=true; the §2b rule
+    // table must resolve that as "all cold together -> just go", not as a repeating all-HOLD.
+    // Nothing about this needs Gazebo, so it is pinned here rather than discovered in a 6-minute
+    // run: a ping-pong would mean the fleet cold-starts forever and never converges.
+    {
+        const std::vector<int> dogs2 = {1, 2};
+        const std::vector<EdgeKey> edges2 = {{1, 2}};
+        const std::vector<int> dogs3 = {1, 2, 3};
+        const std::vector<EdgeKey> edges3 = {{1, 2}, {1, 3}, {2, 3}};
+        std::map<int, Eigen::Vector4d> xnow;
+        xnow[1] = Eigen::Vector4d(-1.0, 0.8, 0.0, 0.0);
+        xnow[2] = Eigen::Vector4d(-1.0, -0.8, 0.0, 0.0);
+        xnow[3] = Eigen::Vector4d(-2.2, 0.0, 0.0, 0.0);
+        std::map<int, Eigen::MatrixXd> xdes;
+        for (int i : dogs3) xdes[i] = straight_ref(xnow[i].head<2>());
+        std::vector<Obstacle> obs;
+        obs.push_back({Eigen::Vector2d(-2.2, 0.0), 0.7});  // robot3's keep-out while it is out
+
+        LaplacianFormation form(formations());
+        form.set_formation("V");
+        DeadlineLoopback tp(200ms);
+        std::map<int, std::unique_ptr<AgentCore>> ag;
+        // survivors only, robot3 fenced off
+        for (int i : dogs2)
+            ag[i] = std::make_unique<AgentCore>(i, dogs2, edges2, /*formation=*/nullptr, 0.3,
+                                                obs, no_walls, 1, &tp);
+        std::uint64_t slot = 0;
+        auto cycle = [&](const std::vector<int>& who) {
+            std::map<int, StepResult> res;
+            std::mutex rm;
+            std::vector<std::thread> th;
+            for (int i : who)
+                th.emplace_back([&, i] {
+                    auto r = ag[i]->step(xnow[i], xdes[i], slot);
+                    std::lock_guard<std::mutex> l(rm);
+                    res[i] = std::move(r);
+                });
+            for (auto& t : th) t.join();
+            ++slot;
+            return res;
+        };
+        for (int c = 0; c < 3; ++c) cycle(dogs2);  // warm the pair up first
+
+        // rejoin: every agent rebuilds onto the full roster, formation back, keep-out gone —
+        // exactly what admm_agent_node::rebuild() does on both sides of a view change.
+        for (int i : dogs3)
+            ag[i] = std::make_unique<AgentCore>(i, dogs3, edges3, &form, 0.3, no_obs, no_walls,
+                                                1, &tp);
+        int holds = 0, full = 0;
+        for (int c = 0; c < 6; ++c) {
+            auto res = cycle(dogs3);
+            bool any_hold = false;
+            for (int i : dogs3) {
+                CHECK(res[i].xi.allFinite(), "D: non-finite after rejoin, dog " << i);
+                any_hold |= res[i].hold;
+            }
+            if (any_hold) ++holds;
+            else if (res[1].achieved_rounds == P_ITERS) ++full;
+        }
+        // All three are cold on the same slot, so the rule table should let them straight through;
+        // even if an announce slot slips in, one is the ceiling. More than that is a ping-pong.
+        CHECK(holds <= 1, "D: rejoin ping-pong (" << holds << " hold cycles, expected <= 1)");
+        CHECK(full >= 4, "D: rejoin never reached full rounds (" << full << " of 6)");
+        std::cout << "D: rejoin to full roster OK (" << holds << " hold, " << full
+                  << " full-round cycles)\n";
+    }
+
     if (failures == 0) {
-        std::cout << "D-failover PASS: reset broadcast + solo + survivor pair\n";
+        std::cout << "D-failover PASS: reset broadcast + solo + survivor pair + rejoin\n";
         return 0;
     }
     std::cout << "D-failover FAIL (" << failures << " checks)\n";

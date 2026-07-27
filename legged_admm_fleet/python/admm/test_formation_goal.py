@@ -54,3 +54,39 @@ def test_180_turn_reassigns_no_crossing():
     # identity would send the front dog (east slot0) to the now-west slot0 = a full crossing;
     # the min-cost assignment must NOT be identity here.
     assert assign != (0, 1, 2), assign
+
+
+# --- degraded (2-dog) formation: exercised after one peer is evicted -----------
+COL2 = FORMATIONS["COL2"]
+
+
+def test_col2_spacing_clears_d_min():
+    """The 2-dog fallback shape must sit clear of the inter-agent CBF floor, else its slot
+    targets fight the CBF forever. (admm_impl also asserts this at import for EVERY shape;
+    this pins the specific value so a silent shrink is a named failure.)"""
+    from admm_impl import constants
+    d = np.linalg.norm(np.array(COL2[0]) - np.array(COL2[1]))
+    assert abs(d - 1.5) < 1e-12, d
+    assert d >= constants.D_MIN, (d, constants.D_MIN)
+
+
+def test_col2_is_a_column_along_travel():
+    """COL2 must string the pair out ALONG the direction of travel, not abreast: the plum-post
+    gaps only fit one body width. centroid_slot_targets rotates by yaw = bearing to the goal,
+    so the two slots must differ only along that bearing."""
+    for yaw in (0.0, 0.7, np.pi / 2, -2.5, np.pi):
+        slots = centroid_slot_targets((5.0, 2.0), COL2, yaw)
+        assert np.allclose(np.mean(slots, axis=0), [5.0, 2.0], atol=1e-9), yaw
+        heading = np.array([np.cos(yaw), np.sin(yaw)])
+        sep = np.array(slots[0]) - np.array(slots[1])
+        # fully along the heading -> zero component on the perpendicular
+        lateral = float(sep @ np.array([-heading[1], heading[0]]))
+        assert abs(lateral) < 1e-9, (yaw, lateral)
+        assert abs(np.linalg.norm(sep) - 1.5) < 1e-9, (yaw, sep)
+
+
+def test_col2_assignment_does_not_cross():
+    """Two survivors already strung out along the path keep their order (no swap-through)."""
+    slots = centroid_slot_targets((5.0, 0.0), COL2, 0.0)
+    assign = min_cost_assignment([slots[0], slots[1]], slots)
+    assert assign == (0, 1), assign

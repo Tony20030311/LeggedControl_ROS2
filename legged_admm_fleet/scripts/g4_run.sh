@@ -1,5 +1,8 @@
 #!/bin/bash
 # G4 gate: 3x vision60, distributed — one admm_agent_node per dog, ADMM consensus over DDS.
+# ponytail: phases 0-3 below are duplicated in scripts/_fleet_bringup.sh (which d_run.sh sources).
+# Left duplicated so this verified gate stays byte-identical; fix bring-up in BOTH, or fold this
+# script onto _fleet_bringup.sh and re-run the gate.
 # Same phased bring-up as g3_run.sh; phase 3 launches the distributed agents instead of the
 # one centralized node. Each agent stands its dog in place (goal := current odom) until the
 # /formation/goal -> FleetPlan (from the standalone fleet_coordinator_node) moves them.

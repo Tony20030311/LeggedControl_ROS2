@@ -57,6 +57,8 @@ public:
         self_id_ = declare_parameter<int>("robot_id", 1);
         const auto ids = declare_parameter<std::vector<int64_t>>("robot_ids", {1, 2, 3});
         for (auto v : ids) dogs_.push_back(static_cast<int>(v));
+        std::sort(dogs_.begin(), dogs_.end());
+        roster_n_ = dogs_.size();  // dogs_ shrinks on eviction; the full roster picks the shape
         edges_ = complete_graph(dogs_);
         v_ = declare_parameter<double>("v", 0.4);
         ts_ = admm::TS;
@@ -66,6 +68,9 @@ public:
         // experiment D: consecutive missing slots of a peer's AgentState before it is
         // declared dead and evicted (10 slots = 1 s sim). 0 disables eviction.
         evict_after_ = declare_parameter<int>("evict_after_misses", 10);
+        // Stop broadcasting if our own obs/odom go stale (see ready()). Must be generous
+        // enough that an RTF dip is not mistaken for a dead controller.
+        input_stale_s_ = declare_parameter<double>("input_stale_s", 1.0);
         // #1 leader-aware follower brake (ported from fleet_centralized_node::followSpeed).
         // Uses peers' xnow from the consensus barrier so a dog slowed by a peg never gets
         // rear-ended by the constant-cruise follower behind it. Same defaults as centralized.
@@ -95,7 +100,8 @@ public:
         ocs2::loadData::loadEigenMatrix(ref, "defaultJointState", default_joints);
 
         formation_ = std::make_unique<admm::LaplacianFormation>(admm::formations());
-        formation_->set_formation(declare_parameter<std::string>("formation", "V"));
+        formation_name_ = declare_parameter<std::string>("formation", "V");
+        formation_->set_formation(formation_name_);
         adapter_ = std::make_unique<admm::MotionAdapter>(
             com_height_, default_joints, admm::N, ts_, 0.05, 0.2, 24, "path", 5, 0.02,
             admm::K_SEND, true, declare_parameter<double>("yaw_rate_max", 1.2));
@@ -164,12 +170,12 @@ public:
         obs_sub_ = create_subscription<ocs2_msgs::msg::MpcObservation>(
             "/" + ns + "/" + ns + "_mpc_observation", 1,
             [this](ocs2_msgs::msg::MpcObservation::SharedPtr m) {
-                std::lock_guard<std::mutex> l(mu_); obs_ = *m; has_obs_ = true; }, cmd_opts);
+                std::lock_guard<std::mutex> l(mu_); obs_ = *m; has_obs_ = true; t_obs_ = now(); }, cmd_opts);
         odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
             "/" + ns + "/controller/odom", 1,
             [this](nav_msgs::msg::Odometry::SharedPtr m) {
                 std::lock_guard<std::mutex> l(mu_);
-                odom_ = *m; has_odom_ = true;
+                odom_ = *m; has_odom_ = true; t_odom_ = now();
                 if (!has_goal_) {  // stand in place until commanded
                     goal_ = Eigen::Vector2d(m->pose.pose.position.x, m->pose.pose.position.y);
                     has_goal_ = true;
@@ -215,8 +221,30 @@ private:
     bool ready() {
         // size guard: during the WBC activation race the observation can arrive with a
         // short/empty state vector; indexing it (BASE_PX=6, BASE_YAW=9) would be UB.
-        return has_obs_ && has_odom_ && has_goal_ && obs_.time != 0.0 &&
-               obs_.state.value.size() >= 24;
+        if (!(has_obs_ && has_odom_ && has_goal_ && obs_.time != 0.0 &&
+              obs_.state.value.size() >= 24))
+            return false;
+        // FRESHNESS, not just "has arrived once". has_obs_/has_odom_ latch true forever, so a dog
+        // whose controller dies (WBC deactivation, controller crash) would keep stepping on its
+        // last frozen observation and keep broadcasting AgentState from a position it can no
+        // longer leave. Peers would never see silence, never evict it, and the fleet would wait
+        // on a heartbeat-alive zombie indefinitely. Going quiet instead self-fences: it turns an
+        // undetectable body failure into the plain silence the eviction path already handles.
+        // A stamp of exactly 0 means the sample landed before this node had seen its first
+        // /clock, so now() was still 0 when we stamped it. Comparing that against a later
+        // sim time reports the whole elapsed sim time as "age" and self-fences a perfectly
+        // healthy agent at bring-up (observed: "inputs stale 18.27s" == sim time itself).
+        // Wait for a real stamp instead; one more sample arrives within a slot.
+        if (t_obs_.nanoseconds() == 0 || t_odom_.nanoseconds() == 0) return true;
+        const double age = std::max((now() - t_obs_).seconds(), (now() - t_odom_).seconds());
+        if (age > input_stale_s_) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                                 "[agent%d] inputs stale %.2fs (> %.2f) — holding OFF the wire so "
+                                 "peers can evict me instead of waiting forever",
+                                 self_id_, age, input_stale_s_);
+            return false;
+        }
+        return true;
     }
 
     // ---- per-slot cycle (worker thread) ----
@@ -320,6 +348,14 @@ private:
         Eigen::MatrixX2d wp;
         if (planner_ && (goal - path_goal_).norm() > 1e-6) {
             const auto rg = planner_->find_reachable_goal(P0, goal);
+            // Silent fallback to a straight line was the failure mode behind "the dog just
+            // freezes": the line crosses a keep-out, the CBF linearizes to l>u and the QP
+            // dies every cycle with nothing in the log pointing at the planner.
+            if (rg.path.empty())
+                RCLCPP_WARN(get_logger(),
+                            "[agent%d] A* found NO path to (%.2f,%.2f) from (%.2f,%.2f) — "
+                            "falling back to STRAIGHT LINE (may cross a keep-out)",
+                            self_id_, goal[0], goal[1], P0[0], P0[1]);
             path_ = rg.path.empty() ? std::vector<Eigen::Vector2d>{P0, goal} : rg.path;
             path_goal_ = goal;
         }
@@ -423,6 +459,14 @@ private:
         publishStats(slot, res, t_cycle_wall);
     }
 
+    // Static terrain + every evicted peer's keep-out. This is what the node QP and the A*
+    // both consume; arena_obs_ alone is never passed anywhere after bring-up.
+    std::vector<admm::Obstacle> allObstacles() const {
+        std::vector<admm::Obstacle> all = arena_obs_;
+        for (const auto& kv : corpses_) all.insert(all.end(), kv.second.begin(), kv.second.end());
+        return all;
+    }
+
     // Experiment D: a peer whose AgentState has been absent for evict_after_ consecutive
     // slots is dead — remove it from the fleet graph and rebuild the AgentCore over the
     // survivors so consensus (and motion) continues without it. The corpse's last known
@@ -433,7 +477,13 @@ private:
     // Runs on the worker thread only (same thread as cycle()), so no locking needed.
     void maybeEvict(std::uint64_t slot) {
         if (evict_after_ <= 0 || dogs_.size() < 2) return;
-        if (!agent_->has_prev()) return;  // arm only after one full-fleet success (bring-up grace)
+        // Bring-up grace: don't evict anyone until this agent has completed one good cycle, so a
+        // slow discovery at startup is never mistaken for a death. LATCHED, because has_prev() is
+        // cleared by every rebuild — re-requiring it after an eviction deadlocks the fleet when a
+        // second peer dies inside the cold-start window: the barrier waits for the dead peer, HOLDs
+        // forever, and this guard blocks the very eviction that would end the wait.
+        if (agent_->has_prev()) evict_armed_ = true;
+        if (!evict_armed_) return;
         const auto seen = transport_->last_seen();
         std::vector<int> dead;
         std::map<int, std::uint64_t> silent;  // per-dead-peer missing-slot count (log)
@@ -464,27 +514,21 @@ private:
                 RCLCPP_WARN(get_logger(), "[agent%d] EVICT robot%d (never seen a state)", self_id_, j);
                 continue;
             }
+            // Geometry lives in admm::corpse_keepout (fleet_config) so it is unit-testable:
+            // where to fence, how wide, and when NOT to fence at all. See test_corpse_keepout.
+            const auto kp = admm::corpse_keepout(
+                itn->second, itb != pxibar.end() ? itb->second : Eigen::VectorXd(), robot_margin_);
+            if (!kp) {
+                RCLCPP_WARN(get_logger(),
+                            "[agent%d] EVICT robot%d — no finite position (plan and state both "
+                            "non-finite); NO keep-out placed",
+                            self_id_, j);
+                continue;
+            }
             admm::Obstacle o;
-            if (itb != pxibar.end() && itb->second.size() > admm::py_index(admm::N)) {
-                o.pos = Eigen::Vector2d(itb->second[admm::px_index(admm::N)],
-                                        itb->second[admm::py_index(admm::N)]);
-            } else {
-                o.pos = itn->second.head<2>();  // no plan seen: fall back to last position
-            }
-            // desired: D_MIN-equivalent + 0.5 rest-position uncertainty. But NEVER larger
-            // than what keeps every survivor OUTSIDE the keep-out at eviction time — a
-            // survivor born inside makes its hard obstacle-CBF infeasible at k=0 -> the
-            // node QP NaNs every cycle and the whole fleet freezes (verified live 08:24:
-            // formation spacing 1.4 m < desired keep-out 1.8 m). Obstacles only enter each
-            // agent's OWN node QP, so this clamp needs no cross-agent bit-consistency.
-            double nearest = 1e9;
-            for (const auto& pk : pxnow) {
-                if (pk.first == j) continue;
-                nearest = std::min(nearest, (pk.second.head<2>() - o.pos).norm());
-            }
-            const double desired = std::max(0.30, admm::D_MIN - robot_margin_) + 0.5;
-            o.radius = std::max(0.30, std::min(desired, nearest - robot_margin_ - 0.10));
-            arena_obs_.push_back(o);
+            o.pos = kp->pos;
+            o.radius = kp->radius;
+            corpses_[j].push_back(o);
             RCLCPP_WARN(get_logger(),
                         "[agent%d] EVICT robot%d (silent %lu slots) — corpse CBF at predicted rest (%.2f,%.2f) r=%.2f (last seen (%.2f,%.2f))",
                         self_id_, j, static_cast<unsigned long>(silent[j]), o.pos[0], o.pos[1],
@@ -493,32 +537,74 @@ private:
         std::vector<int> survivors;
         for (int j : dogs_)
             if (std::find(dead.begin(), dead.end(), j) == dead.end()) survivors.push_back(j);
-        dogs_ = survivors;
+        rebuild(survivors, pxnow);
+    }
+
+    // Rebuild everything that depends on the member list: the fleet graph, the shape cost,
+    // the node QP's obstacle set (which fixes the QP dimensions, hence a fresh AgentCore) and
+    // the local A*. Eviction and rejoin both route through here, and because it constructs a
+    // NEW AgentCore it also zeroes the consensus duals — a dead peer's stale lambda would
+    // otherwise keep applying a constraint force from a robot that no longer exists.
+    // Worker-thread only (same thread as cycle()), so no locking.
+    // pxnow is a VALUE COPY of the last peer states: agent_ is replaced below, so a reference
+    // into the old core would dangle (that segfaulted both survivors, 2026-07-23 08:36).
+    void rebuild(std::vector<int> new_dogs, const std::map<int, Eigen::Vector4d>& pxnow) {
+        dogs_ = std::move(new_dogs);
+        std::sort(dogs_.begin(), dogs_.end());  // complete_graph edge order must match bring-up
         edges_ = complete_graph(dogs_);
+
+        // Shape must agree with what the coordinator lays out (shape_for is the shared rule).
+        // set_formation("") is a silent no-op leaving the OLD offsets in place, so the size
+        // check below — not a null check — is what actually catches "no shape for this n".
+        formation_->set_formation(admm::shape_for(dogs_.size(), roster_n_, formation_name_));
+        const auto* off = formation_->current_offsets();
+        const bool has_shape = (off != nullptr && off->size() == dogs_.size());
+
+        const auto obs = allObstacles();
         agent_ = std::make_unique<admm::AgentCore>(
-            self_id_, dogs_, edges_, /*formation=*/nullptr, w_form_, arena_obs_, arena_walls_,
-            hard_through_, transport_.get(), robot_margin_);
+            self_id_, dogs_, edges_, has_shape ? formation_.get() : nullptr, w_form_, obs,
+            arena_walls_, hard_through_, transport_.get(), robot_margin_);
+
         // The stack's obstacle contract is CBF + A* detour: a straight REFERENCE through a
         // keep-out linearizes into an l>u bound box -> the (now guarded) QP fails loudly and
-        // the dog freezes (verified live 08:31). So corpses go to the local A* too — rebuild
-        // it over arena + corpse circles with a generous box around the fleet, and force a
-        // replan so the current goal reroutes immediately.
+        // the dog freezes (verified live 08:31). So corpses go to the local A* too.
+        // Swap the circles IN PLACE when a planner already exists: rebuilding it would replace
+        // the arena-sized bounds from launch (x[-2,20] y[-7,7]) with a box around the current
+        // fleet, and a later goal outside that box then yields no path -> straight line through
+        // a keep-out -> frozen dog. Only the no-arena case (empty world) has to construct one.
         std::vector<admm::AStarCircle> circles;
-        for (const auto& ob : arena_obs_) circles.push_back({ob.pos[0], ob.pos[1], ob.radius});
+        for (const auto& ob : obs) circles.push_back({ob.pos[0], ob.pos[1], ob.radius});
+        // circles == arena_obs_ + corpses, so empty means "nothing to route around at all"
+        // (empty world, last corpse just dropped) -> go back to the straight-line reference.
+        if (circles.empty()) planner_.reset();
+        else if (planner_) planner_->set_circles(circles);
+        else planner_ = makePlannerFromFleet(circles, pxnow);
+        path_goal_ = Eigen::Vector2d(1e9, 1e9);  // force replan against the new obstacle set
+        RCLCPP_WARN(get_logger(),
+                    "[agent%d] REBUILD -> %zu dog(s), %zu edge(s), shape=%s, %zu obstacle(s) — cold-starting consensus",
+                    self_id_, dogs_.size(), edges_.size(),
+                    has_shape ? admm::shape_for(dogs_.size(), roster_n_, formation_name_).c_str() : "none",
+                    circles.size());
+    }
+
+    // Fallback planner for a fleet running WITHOUT an arena (no static obstacles -> no planner
+    // was built at bring-up). Box = fleet bounding box + 12 m, generous enough for the goals a
+    // demo hands out; an arena run never takes this path.
+    std::unique_ptr<admm::AStarPlanner> makePlannerFromFleet(
+        const std::vector<admm::AStarCircle>& circles,
+        const std::map<int, Eigen::Vector4d>& pxnow) const {
         double xmin = 1e9, xmax = -1e9, ymin = 1e9, ymax = -1e9;
         for (const auto& pk : pxnow) {
             xmin = std::min(xmin, pk.second[0]); xmax = std::max(xmax, pk.second[0]);
             ymin = std::min(ymin, pk.second[1]); ymax = std::max(ymax, pk.second[1]);
         }
+        if (xmin > xmax) { xmin = xmax = ymin = ymax = 0.0; }  // no peer states yet
         std::vector<admm::AStarRect> rects;
         for (const auto& r : arena_rects_)
             rects.push_back({r.center[0], r.center[1], r.size[0], r.size[1], robot_margin_});
-        planner_.reset(new admm::AStarPlanner(0.15, robot_margin_, circles, xmin - 12.0,
-                                              xmax + 12.0, ymin - 12.0, ymax + 12.0,
-                                              /*boundary_margin=*/0.45, rects));
-        path_goal_ = Eigen::Vector2d(1e9, 1e9);  // force replan against the new obstacle set
-        RCLCPP_WARN(get_logger(), "[agent%d] fleet now %zu dog(s), %zu edge(s); A* rebuilt with %zu obstacle(s) — cold-starting survivor consensus",
-                    self_id_, dogs_.size(), edges_.size(), circles.size());
+        return std::make_unique<admm::AStarPlanner>(0.15, robot_margin_, circles, xmin - 12.0,
+                                                    xmax + 12.0, ymin - 12.0, ymax + 12.0,
+                                                    /*boundary_margin=*/0.45, rects);
     }
 
     void publishStats(std::uint64_t slot, const admm::StepResult& res, double t_cycle_wall) {
@@ -551,6 +637,8 @@ private:
     int self_id_;
     std::vector<int> dogs_;
     std::vector<admm::EdgeKey> edges_;
+    std::size_t roster_n_ = 0;                      // launch-time fleet size (dogs_ shrinks on evict)
+    std::string formation_name_;                    // configured full-fleet shape (`formation` param)
     double v_, ts_, w_form_, com_height_, r_latch_, latch_margin_;
     double follow_gain_, follow_desired_, follow_range_, follow_floor_, follow_cone_cos_;
     double fp_half_len_, fp_half_wid_, fp_drift_;   // Vision60 body footprint (direction-aware safety)
@@ -563,11 +651,16 @@ private:
     std::unique_ptr<admm::DdsTransport> transport_;
     std::unique_ptr<admm::AgentCore> agent_;
     std::unique_ptr<admm::AStarPlanner> planner_;   // null unless use_astar && arena has obstacles
-    std::vector<admm::Obstacle> arena_obs_;         // arena circles + post-eviction corpses (CBF)
+    std::vector<admm::Obstacle> arena_obs_;         // STATIC terrain only (arena circles)
+    // Evicted peers' keep-outs, keyed by robot id so a returning peer's circle can be
+    // dropped again (rejoin). Kept OUT of arena_obs_ precisely so removal is possible —
+    // the terrain set must stay pristine across membership changes.
+    std::map<int, std::vector<admm::Obstacle>> corpses_;
     std::vector<admm::Wall> arena_walls_;
     int hard_through_ = 1;
     double robot_margin_ = 0.60;
     int evict_after_ = 10;                          // slots of peer silence before eviction (0=off)
+    double input_stale_s_ = 1.0;                    // own obs/odom age that self-fences us
     std::vector<admm::ArenaRect> arena_rects_;      // A*-only wall boxes (door)
     std::vector<Eigen::Vector2d> path_;             // cached A* route; cycle()-thread only
     Eigen::Vector2d path_goal_{1e9, 1e9};           // goal the cache was planned for (force 1st plan)
@@ -588,6 +681,8 @@ private:
     nav_msgs::msg::Odometry odom_;
     Eigen::Vector2d goal_{0, 0}, v_ema_{0, 0};
     bool has_obs_ = false, has_odom_ = false, has_goal_ = false, has_vema_ = false;
+    rclcpp::Time t_obs_{0, 0, RCL_ROS_TIME}, t_odom_{0, 0, RCL_ROS_TIME};  // last arrival (freshness)
+    bool evict_armed_ = false;   // latched bring-up grace; see maybeEvict
     // Callbacks (executor threads) clear this under mu_; the worker read-modify-writes it WITHOUT
     // mu_ -> atomic to avoid a torn bool. yaw_latch_val_ is worker-thread-only, needs no atomic.
     std::atomic<bool> yaw_latched_{false};
