@@ -96,4 +96,17 @@ private:
     bool update_failed_ = false;
 };
 
+// QP health telemetry (process-wide, read-and-reset — same pattern as Transport::take_*()).
+// n_nonconverged counts solves whose OSQP status was not SOLVED but whose x was accepted
+// anyway (MAX_ITER_REACHED / SOLVED_INACCURATE / TIME_LIMIT_REACHED). Those iterates carry
+// no feasibility guarantee, so they can violate the hard k=0 CBF row; infeasible/non-convex
+// are NOT counted here because solve() already turns them into NaN and the callers handle
+// that. last_status_val is the raw OSQP status_val of the most recent such solve (0 = none).
+// Instrumentation only: nothing reads these back into a solution, so parity is unaffected.
+struct QpHealth {
+    unsigned long n_nonconverged = 0;
+    int last_status_val = 0;
+};
+QpHealth take_qp_health();
+
 }  // namespace admm

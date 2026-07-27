@@ -2,12 +2,20 @@
 #include "legged_upper_control/admm_qp_common.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
 
 namespace admm {
+
+// Process-wide QP health accumulators (read-and-reset, like the transport's take_*()).
+// Telemetry only — nothing here feeds a solution value, so bit-parity is unaffected.
+namespace {
+std::atomic<unsigned long> g_qp_nonconverged{0};
+std::atomic<int> g_qp_last_status{0};
+}  // namespace
 
 CscPattern build_csc_pattern(long long m, long long n, const std::vector<Trip>& t) {
     CscPattern out;
@@ -188,11 +196,28 @@ OsqpProblem::Result OsqpProblem::solve() {
                              sv == OSQP_DUAL_INFEASIBLE_INACCURATE ||
                              sv == OSQP_NON_CVX);
     if (x_present) {
+        // Instrumentation only (no control-path effect): OSQP is itself an ADMM solver,
+        // so a non-SOLVED iterate is not guaranteed to satisfy the constraints — including
+        // the hard k=0 CBF row. Infeasible/non-convex already become NaN above and are
+        // handled; what lands here is MAX_ITER_REACHED / SOLVED_INACCURATE / TIME_LIMIT,
+        // which are accepted silently today. Count them so we can find out whether that
+        // ever actually happens before deciding any policy. See take_qp_health().
+        if (sv != OSQP_SOLVED) {
+            g_qp_nonconverged.fetch_add(1, std::memory_order_relaxed);
+            g_qp_last_status.store(static_cast<int>(sv), std::memory_order_relaxed);
+        }
         for (c_int j = 0; j < n; ++j) r.x(j) = work_->solution->x[j];
     } else {
         r.x.setConstant(std::numeric_limits<double>::quiet_NaN());
     }
     return r;
+}
+
+QpHealth take_qp_health() {
+    QpHealth h;
+    h.n_nonconverged = g_qp_nonconverged.exchange(0, std::memory_order_relaxed);
+    h.last_status_val = g_qp_last_status.exchange(0, std::memory_order_relaxed);
+    return h;
 }
 
 }  // namespace admm

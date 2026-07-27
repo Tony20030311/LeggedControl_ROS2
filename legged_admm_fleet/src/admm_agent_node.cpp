@@ -34,6 +34,7 @@
 #include "legged_upper_control/astar_planner.hpp"
 #include "legged_upper_control/fleet_logic.hpp"
 #include "legged_upper_control/admm_motion_adapter.hpp"
+#include "legged_upper_control/admm_qp_common.hpp"
 #include "legged_upper_control/admm_reference.hpp"
 #include "legged_upper_control/fleet_config.hpp"
 
@@ -345,10 +346,19 @@ private:
             // and latency samples don't carry into the next CycleStats row.
             transport_->take_wait_times(); transport_->take_bytes();
             transport_->take_rx_mean(); transport_->take_stale();
+            admm::take_qp_health();
             return;
         }
         const double t_cycle_wall =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t_wall0).count();
+        // Did any QP this cycle hand back a non-SOLVED iterate that we accepted anyway?
+        // Silent today (callers only test allFinite()); we are measuring whether it ever
+        // fires at all before deciding whether it should be treated as a failure.
+        if (const auto qh = admm::take_qp_health(); qh.n_nonconverged > 0)
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                                 "QP not converged: %lu solve(s) this cycle accepted with "
+                                 "osqp status_val=%d (no feasibility guarantee)",
+                                 qh.n_nonconverged, qh.last_status_val);
         if (res.hold || !res.xi.allFinite()) {
             if (res.hold) maybeEvict(slot);
             publishStats(slot, res, t_cycle_wall);
