@@ -4,12 +4,14 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 
 namespace admm {
 
 Eigen::VectorXd cumulative_arclength(const Eigen::MatrixX2d& wp) {
     const int m = static_cast<int>(wp.rows());
     Eigen::VectorXd cum(m);
+    if (m == 0) return cum;  // empty path -> empty cumsum; cum(0) below would write OOB
     cum(0) = 0.0;
     for (int i = 0; i + 1 < m; ++i) {
         const double dx = wp(i + 1, 0) - wp(i, 0);
@@ -21,6 +23,9 @@ Eigen::VectorXd cumulative_arclength(const Eigen::MatrixX2d& wp) {
 
 Eigen::Vector2d point_at_arclength(const Eigen::MatrixX2d& wp,
                                    const Eigen::VectorXd& cum, double s) {
+    // Empty path: there is no point to pin on, so there is no valid return. Only
+    // reachable from the pybind surface -- build_reference guards before it gets here.
+    if (wp.rows() == 0) throw std::invalid_argument("point_at_arclength: empty waypoints");
     // Single-point path: no segment to interpolate -- pin on the point. Without this
     // the index clamp below lands on row -1 (out-of-bounds read, UB) whenever a
     // degenerate 1-waypoint path reaches build_reference (seen via rescue, PF2).
@@ -64,10 +69,19 @@ double project_arclength(const Eigen::Vector2d& pos, const Eigen::MatrixX2d& wp,
 Eigen::MatrixXd build_reference(const Eigen::Vector2d& cur_pos,
                                 const Eigen::MatrixX2d& waypoints,
                                 int n, double ts, double v_cruise, double d_brake) {
+    // No path: A* returns an empty vector on failure (plan() / find_reachable_goal()),
+    // so this input is produced in normal operation. Hold position -- the same "pin on
+    // what we have" rule as the 1-waypoint case above. Without this, cum(size()-1)
+    // below reads index -1 (UB; verified segfault).
+    Eigen::MatrixXd x_des = Eigen::MatrixXd::Zero(n, 4);
+    if (waypoints.rows() == 0) {
+        x_des.col(0).setConstant(cur_pos(0));
+        x_des.col(1).setConstant(cur_pos(1));
+        return x_des;
+    }
     const Eigen::VectorXd cum = cumulative_arclength(waypoints);
     const double L = cum(cum.size() - 1);
     double s = project_arclength(cur_pos, waypoints, cum);
-    Eigen::MatrixXd x_des = Eigen::MatrixXd::Zero(n, 4);
     for (int k = 0; k < n; ++k) {
         const double d_remain = std::max(0.0, L - s);
         const double v_ref =

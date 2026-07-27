@@ -94,3 +94,19 @@ def test_three_dog_wiring_generic():
         assert set(coord.prev_z[e].keys()) == set(e)
     assert set(xi.keys()) == {1, 2, 3}
     assert len(hist["r_prim"]) == 2
+
+
+def test_build_reference_degenerate_paths():
+    """A* returns an EMPTY vector when it finds no path (plan() / find_reachable_goal()),
+    so build_reference sees 0 waypoints in normal operation. Before the guard this wrote
+    cum(0) into a size-0 vector and then read cum(-1) -> segfault (NDEBUG strips Eigen's
+    bounds asserts). Contract: no path -> hold position. The 1-waypoint sibling was
+    hardened earlier after a live incident; this pins both."""
+    cur = np.array([1.5, -2.0])
+    zero_wp = ref.build_reference(cur, np.zeros((0, 2)), 5)
+    assert zero_wp.shape == (5, 4)
+    assert np.all(zero_wp[:, 0] == cur[0]) and np.all(zero_wp[:, 1] == cur[1])
+    assert np.all(zero_wp[:, 2:] == 0.0)          # velocity columns untouched
+    one_wp = ref.build_reference(cur, np.array([[3.0, 0.0]]), 5)
+    assert one_wp.shape == (5, 4)
+    assert np.all(one_wp[:, 0] == 3.0) and np.all(one_wp[:, 1] == 0.0)
