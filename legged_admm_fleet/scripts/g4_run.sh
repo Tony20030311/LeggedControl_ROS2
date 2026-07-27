@@ -19,7 +19,7 @@ CTRL_YAML=$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/vision60_
 V=${V:-0.4}
 GOAL_X=${GOAL_X:-2.0}
 DEADLINE=${DEADLINE:-20}        # per-hop recv deadline [ms]
-DMIN_ABORT=${DMIN_ABORT:-0.5}
+DMIN_ABORT=${DMIN_ABORT:-0.87}  # contact line (base half-diag 0.433 x2); see g3_run.sh
 SOAK=${SOAK:-0}                 # if >0: after reaching goal, keep running this many more sec
 
 say() { echo "[g4 $(date +%H:%M:%S)] $*" | tee -a "$LOGD/g4.log"; }
@@ -173,9 +173,10 @@ T_WALL1=$(date +%s); T_SIM1=$(timeout 4 ros2 topic echo /clock --once 2>/dev/nul
 RTF=$(python3 -c "w=$T_WALL1-$T_WALL0;s=${T_SIM1:-0}-${T_SIM0:-0};print(f'{s/w:.2f}' if w>0 else '?')")
 [ "$R" = 1 ] || die "centroid not at goal in 600s (last dist=$D)"
 
-# collision guard only counts if the dist logger actually produced data
-[ "$(wc -l < "$LOGD/dist.csv" 2>/dev/null || echo 0)" -gt 10 ] \
-  || say "WARN: dist.csv empty — collision guard was OFF this run"
+# Barrier stats are informational; "the logger produced nothing" is not — a run whose
+# collision guard never ran must not claim PASS (this was a WARN, which nothing read).
+python3 "$WS/src/legged_fleet/legged_admm_fleet/scripts/dist_summary.py" "$LOGD/dist.csv" \
+  || die "collision guard produced no data — PASS not claimable"
 # achieved_rounds sample (G5 telemetry sanity)
 AR=$(timeout 5 ros2 topic echo /robot1/admm/stats --once 2>/dev/null | grep achieved_rounds | awk '{print $2}')
 say "G4 PASS: centroid reached ($GX,$GY); min_pair>=$DMIN_ABORT; RTF=$RTF; achieved_rounds(r1)=${AR:-?}; logs $LOGD"

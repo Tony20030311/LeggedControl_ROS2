@@ -34,7 +34,7 @@ ROSTER=$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/fleet_robots
 CTRL_YAML=$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/vision60_fleet_controller.yaml
 V=${V:-0.4}
 DEADLINE=${DEADLINE:-20}
-DMIN_ABORT=${DMIN_ABORT:-0.5}
+DMIN_ABORT=${DMIN_ABORT:-0.87}  # contact line (base half-diag 0.433 x2); see g3_run.sh
 GOAL_TOL=${GOAL_TOL:-0.5}
 GOALS_IN="${GOALS:-}"          # was a single goal-set given explicitly on the env?
 
@@ -58,9 +58,15 @@ if [ -z "${SEQ:-}" ]; then
     # staggered columns (leader ahead, two followers offset): every pair >= D_MIN=1.3 so the
     # inter-robot CBF never forbids the goal, and every waypoint sits >=0.90 m (live r_eff) off
     # any pillar. Abreast sets would deadlock 3 dogs in a sub-D_MIN gap.
+    # SIDES MUST MATCH THE SPAWN (fleet_robots.yaml: robot2 y=-0.7, robot3 y=+0.7). These goals
+    # go straight to /robotN/goal in per-dog mode -- there is no min_cost_assignment to sort the
+    # dogs onto the nearest slot the way formation mode does, so mirroring the y signs makes
+    # robot2 and robot3 swap sides on the very first move. Measured cost of that swap (plum,
+    # 2026-07-27): centre distance 0.902 m vs D_MIN 1.3, 21% of the run inside the 1.22 m
+    # knee-contact envelope, base boxes still ~0.31 m apart (no contact, but no margin either).
     # plum: 4 sets threading the 7-row field (min pair 1.95, min waypoint-to-pile 0.91).
-    plum) SEQ="5.67 0.0 4.0 1.0 4.0 -1.0 ; 9.31 0.0 7.6 1.0 7.6 -1.0 ; 12.95 0.0 11.2 1.0 11.2 -1.0 ; 18.0 0.0 16.788 0.7 16.788 -0.7" ;;
-    door) SEQ="6.5 0.0 5.2 0.9 5.2 -0.9 ; 10.0 0.0 8.9 1.1 8.9 -1.1 ; 12.5 0.0 12.5 2.2 12.5 -3.0" ;;
+    plum) SEQ="5.67 0.0 4.0 -1.0 4.0 1.0 ; 9.31 0.0 7.6 -1.0 7.6 1.0 ; 12.95 0.0 11.2 -1.0 11.2 1.0 ; 18.0 0.0 16.788 -0.7 16.788 0.7" ;;
+    door) SEQ="6.5 0.0 5.2 -0.9 5.2 0.9 ; 10.0 0.0 8.9 -1.1 8.9 1.1 ; 12.5 0.0 12.5 -3.0 12.5 2.2" ;;
     *) SEQ="$GOALS" ;;
   esac; fi
 fi
@@ -337,5 +343,9 @@ if [ -n "$RECPID" ]; then kill -INT "$RECPID" 2>/dev/null; sleep 3; kill -9 "$BR
   say "video: $LOGD/demo.mp4 ($(du -h "$LOGD/demo.mp4" 2>/dev/null | cut -f1))"; fi
 if [ -n "$RVGRABPID" ]; then kill -INT "$RVGRABPID" 2>/dev/null; sleep 3; \
   say "rviz video: $LOGD/rviz.mp4 ($(du -h "$LOGD/rviz.mp4" 2>/dev/null | cut -f1))"; fi
-say "ARENA DONE: $ARENA reached $NARR/$TOTSET waypoint sets (mode=$([ "${FORMATION:-0}" = 1 ] && echo formation-V || echo per-dog)); min_pair>=$DMIN_ABORT; RTF=$RTF; logs $LOGD"
+# Barrier stats are informational; "the logger produced nothing" is not — this script had
+# no dist.csv check at all, so a dead logger read as a clean run.
+python3 "$WS/src/legged_fleet/legged_admm_fleet/scripts/dist_summary.py" "$LOGD/dist.csv" \
+  || die "collision guard produced no data — run not claimable"
+say "ARENA DONE: $ARENA reached $NARR/$TOTSET waypoint sets (mode=$([ "${FORMATION:-0}" = 1 ] && echo formation-V || echo per-dog)); no contact (min_pair>=$DMIN_ABORT); RTF=$RTF; logs $LOGD"
 say "csv: stats=$LOGD/stats.csv traj=$LOGD/traj.csv dist=$LOGD/dist.csv"

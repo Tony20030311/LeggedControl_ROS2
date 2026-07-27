@@ -20,7 +20,12 @@ CTRL_YAML=$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/vision60_
 REF=$WS/install/legged_robot_controller/share/legged_robot_controller/config/vision60/reference.info
 V=${V:-0.4}                    # StepGate 門檻的最小可行速度（G2 驗證）
 GOAL_X=${GOAL_X:-2.0}          # formation goal = 當前 centroid + GOAL_X（沿 +x）
-DMIN_ABORT=${DMIN_ABORT:-0.5}  # 任兩狗距離低於此值 -> abort（D_MIN=0.6 的碰撞警戒線）
+# Contact line, not the design margin: base box 0.83x0.25 -> half-diagonal 0.433, so below
+# 0.867 m centre distance two dogs interpenetrate at ANY yaw. 0.5 was the retired D_MIN=0.6
+# era value and could only fire once they were 0.37 m inside each other. Barrier violations
+# (h<0 vs D_MIN=1.3) are transient and expected on swaps/turns -- those are REPORTED by
+# dist_summary.py at the end of the run, not fatal. This aborts only on real contact.
+DMIN_ABORT=${DMIN_ABORT:-0.87}
 
 say() { echo "[g3 $(date +%H:%M:%S)] $*" | tee -a "$LOGD/g3.log"; }
 die() { say "FAIL: $*"; exit 1; }
@@ -198,4 +203,8 @@ done
 T_WALL1=$(date +%s); T_SIM1=$(timeout 4 ros2 topic echo /clock --once 2>/dev/null | grep -m1 sec: | awk '{print $2}')
 RTF=$(python3 -c "w=$T_WALL1-$T_WALL0;s=${T_SIM1:-0}-${T_SIM0:-0};print(f'{s/w:.2f}' if w>0 else '?')")
 [ "$R" = 1 ] || die "centroid not at goal in 450s (last dist=$D)"
-say "G3 PASS: centroid reached ($GX,$GY) within 0.30 m; min_pair>=$DMIN_ABORT held; RTF=$RTF; logs in $LOGD"
+# Barrier stats are informational; "the logger produced nothing" is not — a run whose
+# collision guard never ran must not claim PASS.
+python3 "$WS/src/legged_fleet/legged_admm_fleet/scripts/dist_summary.py" "$LOGD/dist.csv" \
+  || die "collision guard produced no data — PASS not claimable"
+say "G3 PASS: centroid reached ($GX,$GY) within 0.30 m; no contact (min_pair>=$DMIN_ABORT); RTF=$RTF; logs in $LOGD"
