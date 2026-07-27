@@ -12,6 +12,8 @@ graphify-out/
 # logs / run outputs
 *.log
 g2_logs/
+# verify_*.py plots (regenerable: python -m admm.verify_plum etc.)
+**/docs/progress/*.png
 
 # editor / OS
 .vscode/
