@@ -38,10 +38,26 @@ wait_for_log() {
   count_agents "$pat"
 }
 
+# EXPECT=stall: this scenario is known to be geometrically infeasible (plum_dense in two-dog
+# degraded mode — 0.20 m of free corridor half-width against a 1.30 m effective corpse radius).
+# Not reaching the goal is then the ACCEPTED outcome, but only if an independent detector says
+# the fleet is genuinely wedged. "The script gave up" is not evidence; stall_detect.py reads the
+# trajectory and is allowed to answer "it was still moving", in which case this still fails.
+# Everything else stays strict: both survivors must evict, min_pair must hold, WBC must not drop.
+EXPECT=${EXPECT:-reach}
+STALL_T=${STALL_T:-15}
+# $1,$2 = goal, $3 = robots. Echoes the verdict; returns 0 only for a CONFIRMED safe stall.
+confirm_stall() {
+  say "EXPECT=stall: asking stall_detect.py whether robots '$3' are genuinely wedged"
+  python3 "$SCRIPTS/stall_detect.py" "$LOGD/dist.csv" \
+    --robots "$(echo $3 | tr ' ' ',')" --goal "$1,$2" --T "$STALL_T" 2>&1 | tee -a "$LOGD/$TAG.log"
+  return "${PIPESTATUS[0]}"
+}
+
 walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
   # `local` is load-bearing: without it this clobbered the caller's saved home coordinates and
   # the return leg became "walk to where you already are" — a PASS that tested nothing.
-  local wx wy D M i
+  local wx wy D M i BEST=99 STALE=0
   for i in $(seq 1 "$4"); do
     read wx wy <<< "$(fleet_centroid "$3")"
     D=$(python3 -c "import math;print(f'{math.hypot($wx-$1, $wy-$2):.3f}')")
@@ -50,6 +66,21 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
     [ "$(python3 -c "print(1 if $M<$DMIN_ABORT else 0)")" = 1 ] && die "pairwise $M < $DMIN_ABORT (collision guard)"
     gz_deactivated && die "WBC deactivated mid-walk"
     [ "$(python3 -c "print(1 if $D<0.45 else 0)")" = 1 ] && return 0
+    # A SLOT can be inside the corpse keep-out, and then the centroid can never reach the goal.
+    # Measured (late kill at x=15.3): corpse at (16.16,-0.55), COL2 rear slot at (17.24,-0.02) is
+    # 1.20 m away against an effective 1.30 m (r 0.70 + robot_margin 0.60) -- unreachable BY
+    # DESIGN. The fleet parked at 0.48 m for 2.5 min, safe and still tracking; hand-sending the
+    # next goal made it walk off immediately, so this is arrival, not a freeze.
+    # The bound is derived, not tuned: one blocked dog is displaced by at most the effective
+    # radius 1.30 m, which moves a two-dog centroid by at most half of that. Past 0.65 m no
+    # blocked slot explains it and the fleet really is stuck -- keep failing there.
+    if [ "$(python3 -c "print(1 if $BEST-$D > 0.03 else 0)")" = 1 ]; then BEST=$D; STALE=0
+    else STALE=$((STALE + 1)); fi
+    if [ "$STALE" -ge 6 ] && [ "$(python3 -c "print(1 if $D<0.65 else 0)")" = 1 ]; then
+      say "  converged at dist=$D (>0.45) with no progress for ${STALE} polls — a slot is inside a"
+      say "  keep-out; accepting as arrived (bound 0.65 = half the 1.30 m effective corpse radius)"
+      return 0
+    fi
     sleep 5
   done
   return 1
@@ -153,7 +184,18 @@ grep_agents "REBUILD" | tail -2 | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
 
 # survivors must keep going to the ORIGINAL goal, routing around the corpse
 say "phase 6: survivors continue to ($GX,$GY)"
-walk_until "$GX" "$GY" "$SURVIVORS" 60 || die "survivors never reached the outbound goal"
+if ! walk_until "$GX" "$GY" "$SURVIVORS" 60; then
+  [ "$EXPECT" = stall ] || die "survivors never reached the outbound goal"
+  # Geometrically infeasible by design — but prove it rather than assume it. The collision
+  # guard and the WBC check inside walk_until already ran on every poll and did not fire.
+  confirm_stall "$GX" "$GY" "$SURVIVORS" \
+    || die "EXPECT=stall but the detector found no stall — the fleet was moving, so this is a plain miss"
+  stop_recording
+  python3 "$SCRIPTS/dist_summary.py" "$LOGD/dist.csv" \
+    || die "collision guard produced no data — STALL-SAFE not claimable"
+  say "D STALL-SAFE: victim=robot$VICTIM, evicted by $N_EVICT, survivors wedged without collision; logs $LOGD"
+  exit 0
+fi
 say "survivors reached the outbound goal with robot$VICTIM down"
 
 if [ "$REJOIN" = 1 ]; then

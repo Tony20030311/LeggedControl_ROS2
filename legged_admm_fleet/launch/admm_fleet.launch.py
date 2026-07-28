@@ -53,6 +53,7 @@ def _distributed_agents(context, *_a, **_k):
                 'formation': LaunchConfiguration('formation').perform(context),
                 'arena': arena,
                 'use_astar': use_astar,
+                'hard_through': int(LaunchConfiguration('hard_through').perform(context)),
                 'astar_robot_radius': float(LaunchConfiguration('astar_robot_radius').perform(context)),
                 'astar_x_min': float(LaunchConfiguration('astar_x_min').perform(context)),
                 'astar_x_max': float(LaunchConfiguration('astar_x_max').perform(context)),
@@ -83,6 +84,10 @@ def generate_launch_description():
         DeclareLaunchArgument('robot_ids', default_value='[1, 2, 3]'),
         DeclareLaunchArgument('v', default_value='0.4'),
         DeclareLaunchArgument('hop_deadline_ms', default_value='20'),
+        # Number of edge-CBF steps k=0..hard_through-1 with slack forced to 0. Was reachable only
+        # as a node default; exposed so the safety/feasibility trade can be swept. Raising it
+        # tightens the published reference but risks an infeasible QP -> NaN -> fleet cold start.
+        DeclareLaunchArgument('hard_through', default_value='1'),
         DeclareLaunchArgument('formation', default_value='V'),
         Node(
             package='legged_admm_fleet',

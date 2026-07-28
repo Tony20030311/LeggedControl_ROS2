@@ -28,7 +28,13 @@ ALL=(
   "early|VICTIM=2 KILL_AT_X=4.0"                      # dies entering the field
   "deep|VICTIM=2 KILL_AT_X=11.0"                      # dies deep inside the quincunx
   "late|VICTIM=2 KILL_AT_X=14.0"                      # dies one row from the exit
-  "dense|VICTIM=2 KILL_AT_X=7.0 ARENA=plum_dense"     # 2.20 m gaps, the measured bottleneck
+  # 2.20 m gaps, the measured dog-dog bottleneck. Held as a STRICT case: it was written off as
+  # "needs Phase 3 convoy, two abreast cannot fit 2.20/2 - 0.30 - 0.60 = 0.20 m", but the premise
+  # was wrong — two survivors re-form as COL2 {+-0.75, 0}, which is single file already. It has
+  # since walked both legs clean twice (d_0728_033054, d_0728_044753), so anything less than
+  # reaching the goal here is a regression, not a geometry limit. (d_run.sh still understands
+  # EXPECT=stall; that is for the 2.10 m stress point, where the fleet genuinely wedges.)
+  "dense|VICTIM=2 KILL_AT_X=7.0 ARENA=plum_dense"
   "farhome|VICTIM=2 KILL_AT_X=7.0 HOME_OVERRIDE=-5.0" # return target outside the fleet bbox (T1.4)
 )
 
@@ -42,6 +48,8 @@ for entry in "${ALL[@]}"; do
   RC=$?
   D=$(ls -dt $WS/g2_logs/d_* 2>/dev/null | head -1)
   RES=PASS; [ "$RC" = 0 ] || RES=FAIL
+  # A confirmed safe stall is its own verdict, not a PASS — it must stay visible in the matrix.
+  grep -q "D STALL-SAFE" "$OUT/$name.out" && RES=STALL-SAFE
   python3 - "$name" "$D" "$RES" "$SUM" <<'PY'
 import csv, math, os, re, sys
 name, D, res, out = sys.argv[1:5]

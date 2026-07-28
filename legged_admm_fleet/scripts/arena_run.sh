@@ -165,6 +165,7 @@ IDS="[${ROBOTS// /, }]"
 say "phase 3: distributed agents (arena=$ARENA use_astar=true)"
 setsid ros2 launch legged_admm_fleet admm_fleet.launch.py mode:=distributed \
   robot_ids:="$IDS" v:=$V hop_deadline_ms:=$DEADLINE arena:=$ARENA use_astar:=true \
+  hard_through:=${HARD_THROUGH:-1} \
   > "$LOGD/admm.log" 2>&1 &
 setsid python3 $WS/src/legged_fleet/legged_admm_fleet/scripts/g5_logger.py \
   "$ROBOTS" "$LOGD" --ros-args -p use_sim_time:=true > "$LOGD/g5_logger.log" 2>&1 &

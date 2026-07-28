@@ -51,8 +51,18 @@ def below(x):
     return sum(1 for v in d if v < x) * dt
 
 
+t_contact = below(contact)
 print("separation: min=%.3f mean=%.3f over %.1fs | "
       "below D_MIN %.2f: %.1fs (%.0f%%) | below knee %.2f: %.1fs | contact %.2f: %.1fs"
       % (min(d), sum(d) / len(d), span,
          d_min, below(d_min), 100.0 * below(d_min) / span if span else 0.0,
-         knee, below(knee), contact, below(contact)))
+         knee, below(knee), contact, t_contact))
+
+# The run scripts' live guard only samples the LAST dist.csv line every 5 s -- 1 of every 100
+# rows -- so an excursion shorter than the poll interval slips past it and the run still prints
+# "no contact". Observed: a hard_through=2 plum run reached 0.526 m for 4.3 s and reported PASS.
+# This pass reads every row, so it is the one that must fail the run.
+if t_contact > 0.0:
+    print("dist_summary: %.1fs below the %.2f m contact line (min %.3f) -- NOT a clean run"
+          % (t_contact, contact, min(d)))
+    sys.exit(1)
