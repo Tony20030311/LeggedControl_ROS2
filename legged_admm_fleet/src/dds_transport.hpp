@@ -18,6 +18,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -61,7 +62,12 @@ public:
             if (j != self_id_)
                 state_subs_.push_back(node_->create_subscription<admm_fleet_msgs::msg::AgentState>(
                     "/robot" + std::to_string(j) + "/admm/state", qos,
-                    [this](admm_fleet_msgs::msg::AgentState::SharedPtr m) { onState(*m); }));
+                    // Capture j so the TOPIC the message arrived on can be checked against the
+                    // id it claims. Without it robot_id is entirely self-declared and a
+                    // compromised peer can publish as somebody else: Gate 2 then compares the
+                    // forged state against the INNOCENT robot's odom, the residual explodes,
+                    // and the fleet evicts the wrong dog while the attacker stays a member.
+                    [this, j](admm_fleet_msgs::msg::AgentState::SharedPtr m) { onState(*m, j); }));
         // per incident edge: owner sub xi / pub z; non-owner pub xi / sub z
         for (const EdgeKey& e : edges)
             if (e.first == self_id_ || e.second == self_id_) {
@@ -92,8 +98,26 @@ public:
         w.cycle_id = m.cycle_id;
         w.iter = 0;
         w.robot_id = m.robot_id;
-        for (int k = 0; k < 4; ++k) w.xnow[k] = m.xnow[k];
-        w.xibar = to_std(m.xibar);
+        AgentStateMsg s = m;
+        // SENDER-side lie (experiment C). Deliberately NOT reusing set_inject, which acts on
+        // INCOMING messages: a receiver-side fake is processed separately by each receiver and
+        // therefore can never disagree, which would hide the failure that matters — two
+        // survivors reaching DIFFERENT verdicts, so their dogs_ diverge and edge_owner() routes
+        // the edge QP to nobody. One lie, broadcast once, judged independently: that is the
+        // property under test.
+        // The offset is applied to BOTH the claimed state and every knot of the plan, so the
+        // message stays internally consistent and Gate 1 passes it — this must be caught by
+        // Gate 2 (odom), which is the point of having an independent observation channel.
+        if (const double off = inj_fake_offset_.load(); off != 0.0) {
+            s.xnow[0] += off;
+            s.xnow[1] += off;
+            for (int k = 1; k <= N; ++k) {
+                s.xibar[px_index(k)] += off;
+                s.xibar[py_index(k)] += off;
+            }
+        }
+        for (int k = 0; k < 4; ++k) w.xnow[k] = s.xnow[k];
+        w.xibar = to_std(s.xibar);
         w.reset = m.reset;
         w.tx_wall = wall_now_s();  // one-way latency stamp (same-host valid; real robots need NTP)
         bytes_tx_.fetch_add(wire_bytes(w), std::memory_order_relaxed);
@@ -209,7 +233,62 @@ public:
         inj_jitter_ms_.store(jitter_ms);
     }
 
+    // Map bounds for Gate 1's arena test. Set once from the same parameters the A* planner is
+    // built with, so "plausible ground" means one thing in this process.
+    void set_gate_limits(const GateLimits& g) { gate_ = g; }
+    // The receiver's own current slot, so Gate 1 can bound a claimed cycle_id. Pushed by the
+    // worker once per cycle; 0 (the initial value) disables the check during bring-up.
+    void set_now_slot(std::uint64_t s) { now_slot_.store(s); }
+
+    // Experiment C: make THIS agent lie about where it is, by `off` metres in x and y, from the
+    // next broadcast on. 0 disables. Dynamic so a live fleet can be compromised mid-run without
+    // a re-bring-up, exactly like set_inject.
+    void set_fake_offset(double off) { inj_fake_offset_.store(off); }
+
+    // How many of this peer's messages have been REJECTED (Gate 1 here, Gate 2 from the node
+    // layer via drop_peer). Non-zero means the peer is talking and the content is bad, which is
+    // what separates a liar from a corpse: a liar is still walking, so its keep-out has to
+    // follow its odom rather than sit where it was last believed.
+    std::uint32_t dropped(int j) {
+        std::lock_guard<std::mutex> l(mu_);
+        const auto it = dropped_.find(j);
+        return it == dropped_.end() ? 0u : it->second;
+    }
+    std::map<int, std::uint32_t> dropped_all() {
+        std::lock_guard<std::mutex> l(mu_);
+        return dropped_;
+    }
+    double gate_worst() const { return gate_worst_.load(); }
+    // Gate 2 lives in the node layer (it needs the peer's odom, which the transport has no
+    // business subscribing to), but its verdict has to land here to have any effect.
+    //
+    // LATCHING, and that is the whole point: Gate 2 runs once per solved cycle, while messages
+    // arrive continuously. Merely counting one bad verdict would leave every later message to
+    // sail through Gate 1, keep advancing last_seen_, and the peer would never be evicted. Once
+    // blocked, a peer stays blocked — consistent with the rest of the failure semantics, where
+    // rejoin is not supported either.
+    void block_peer(int j, const char* why) {
+        { std::lock_guard<std::mutex> l(mu_); if (!blocked_.insert(j).second) return; }
+        drop(j, why);
+    }
+    bool blocked(int j) {
+        std::lock_guard<std::mutex> l(mu_);
+        return blocked_.count(j) != 0;
+    }
+
 private:
+    void drop(int j, const char* why, double margin = 0.0) {
+        std::uint32_t n = 0;
+        { std::lock_guard<std::mutex> l(mu_); n = ++dropped_[j]; }
+        // The COUNT is in the line because the line itself is throttled: reading "REJECTED"
+        // twice in a log and concluding two messages were dropped is how a 10-slot blackout
+        // looked like a two-message hiccup (2026-07-28).
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                             "[agent%d] REJECTED AgentState from robot%d — %s (margin %.3f), "
+                             "%u dropped so far; peer will look silent to eviction",
+                             self_id_, j, why, margin, n);
+    }
+
     static long long elapsed_ns(std::chrono::steady_clock::time_point t0) {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
                    std::chrono::steady_clock::now() - t0).count();
@@ -326,15 +405,44 @@ private:
         cv_.notify_all();
     }
 
-    void onState(const admm_fleet_msgs::msg::AgentState& w) {
+    void onState(const admm_fleet_msgs::msg::AgentState& w, int from_topic) {
         if (injDrop()) return;
         bytes_rx_.fetch_add(wire_bytes(w), std::memory_order_relaxed);
+        // Sender authentication, such as it is: DDS delivered this on robot `from_topic`'s
+        // topic, so that is who sent it whatever the payload says. Counted against the LIAR
+        // (from_topic), never against the robot it tried to impersonate.
+        if (w.robot_id != from_topic) {
+            drop(from_topic, "impersonation", static_cast<double>(w.robot_id));
+            return;
+        }
         AgentStateMsg m;
         m.cycle_id = w.cycle_id;
         m.robot_id = w.robot_id;
         for (int k = 0; k < 4; ++k) m.xnow[k] = w.xnow[k];
         m.xibar = to_vec(w.xibar);
         m.reset = w.reset;
+        // GATE 1. Returning HERE — before commitState — is the whole mechanism: last_seen_ is
+        // not advanced, so the peer looks silent to maybeEvict and the EXISTING crash-failover
+        // path takes over. Nothing else needs a concept of "liar". accountStale/pruneOld are
+        // skipped too, on purpose: a rejected message must not steer the prune window either.
+        {   // Gate 2's latched verdict, applied on every message rather than once per cycle.
+            std::lock_guard<std::mutex> l(mu_);
+            if (blocked_.count(m.robot_id)) { ++dropped_[m.robot_id]; return; }
+        }
+        double margin = 0.0;
+        // now_slot_ comes from the RECEIVER's own sim clock (set by the worker each cycle), not
+        // from anything on the wire — checking a claimed cycle_id against a number the claimant
+        // also controls would check nothing.
+        if (const GateReason why = gateCheck(m, dogs_, gate_, &margin, now_slot_.load());
+            why != GateReason::kOk) {
+            drop(m.robot_id, gateReasonName(why), margin);
+            return;
+        }
+        // Worst margin on ACCEPTED traffic, as a fraction of the limit: this is the number the
+        // thresholds should be set from. >1 would mean a rejection, so a clean run reporting
+        // e.g. 0.3 says the tightest check has 3x of headroom.
+        for (double cur = gate_worst_.load(); margin > cur;)
+            if (gate_worst_.compare_exchange_weak(cur, margin)) break;
         injDeliver([this, m, tx = w.tx_wall] { commitState(m, tx); });
     }
     void onXi(const admm_fleet_msgs::msg::EdgeXi& w) {
@@ -365,6 +473,12 @@ private:
     int self_id_;
     std::vector<int> dogs_;
     std::chrono::milliseconds deadline_;
+    GateLimits gate_;                        // Gate 1 thresholds (set_gate_limits)
+    std::map<int, std::uint32_t> dropped_;   // per-peer rejected-message count (guarded by mu_)
+    std::set<int> blocked_;                  // peers latched off by Gate 2 (guarded by mu_)
+    std::atomic<double> gate_worst_{0.0};    // tightest Gate 1 margin seen on ACCEPTED traffic
+    std::atomic<std::uint64_t> now_slot_{0}; // receiver's own slot (set_now_slot)
+    std::atomic<double> inj_fake_offset_{0.0};  // experiment C: sender-side lie, metres
 
     rclcpp::Publisher<admm_fleet_msgs::msg::AgentState>::SharedPtr state_pub_;
     std::vector<rclcpp::Subscription<admm_fleet_msgs::msg::AgentState>::SharedPtr> state_subs_;

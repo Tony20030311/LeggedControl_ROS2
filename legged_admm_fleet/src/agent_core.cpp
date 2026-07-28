@@ -97,6 +97,10 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
     out.xibar = xibar_self;
     out.reset = (cycle_ == 0);
     transport_->send_state(out);
+    // How far the plan we just broadcast is from where we actually are. Diagnostic only.
+    const double chain_margin =
+        (Eigen::Vector2d(xibar_self[px_index(1)], xibar_self[py_index(1)]) - xnow_self.head<2>())
+            .norm();
     std::vector<int> peers;
     for (const int i : dogs_)
         if (i != self_id_) peers.push_back(i);
@@ -109,6 +113,8 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
         hr.xi = has_prev_ ? prev_xi_ : xibar_self;
         hr.hold = true;
         hr.n_timeouts = transport_->take_timeouts();
+        hr.chain_margin = chain_margin;
+        hr.hold_streak = ++hold_streak_;
         return hr;
     }
     std::map<int, Eigen::VectorXd> xibar;
@@ -138,6 +144,8 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
             hr.xi = has_prev_ ? prev_xi_ : xibar_self;
             hr.hold = true;
             hr.n_timeouts = transport_->take_timeouts();
+            hr.chain_margin = chain_margin;
+            hr.hold_streak = ++hold_streak_;
             if (!self_cold) {  // join the fleet reset
                 has_prev_ = false;
                 cycle_ = 0;
@@ -304,6 +312,10 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
         cycle_ = 0;
     }
     StepResult res;
+    res.k0_slack = node_->last_k0_slack();
+    res.chain_margin = chain_margin;
+    res.hold_streak = 0;
+    hold_streak_ = 0;
     res.xi = xi_self;
     if (!xi_self.allFinite()) res.warm_cleared = StepResult::kWarmNaN;
     // per-edge final primal residual (output only; same pairwise-sum as the in-loop metric).

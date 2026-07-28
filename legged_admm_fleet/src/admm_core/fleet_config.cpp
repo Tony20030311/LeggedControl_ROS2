@@ -111,14 +111,19 @@ const std::map<std::string, std::vector<Eigen::Vector2d>>& formations() {
 
 std::optional<CorpseKeepout> corpse_keepout(const Eigen::Vector4d& xnow,
                                             const Eigen::VectorXd& xibar,
-                                            double robot_margin) {
+                                            double robot_margin, bool mobile, int anchor_knot) {
     CorpseKeepout k;
-    const bool plan_ok = xibar.size() > py_index(N) &&
-                         std::isfinite(xibar[px_index(N)]) && std::isfinite(xibar[py_index(N)]);
-    k.pos = plan_ok ? Eigen::Vector2d(xibar[px_index(N)], xibar[py_index(N)])
+    const int kk = std::clamp(anchor_knot, 1, N);
+    const bool plan_ok = xibar.size() > py_index(kk) &&
+                         std::isfinite(xibar[px_index(kk)]) && std::isfinite(xibar[py_index(kk)]);
+    k.pos = plan_ok ? Eigen::Vector2d(xibar[px_index(kk)], xibar[py_index(kk)])
                     : xnow.head<2>();
     if (!k.pos.allFinite()) return std::nullopt;
-    k.radius = std::max(0.10, D_MIN - robot_margin);
+    // Static corpse: r_eff = radius + robot_margin = D_MIN exactly — a dead dog is held at the
+    // same distance as a live one, no extra margin. A MOBILE one (evicted for lying, still
+    // walking, cooperating with nobody) gets MAX_VX * TAU_REACT more, which is how far it can
+    // come while this agent notices and responds. 0.70 -> 0.81, i.e. r_eff 1.30 -> 1.41.
+    k.radius = std::max(0.10, D_MIN - robot_margin) + (mobile ? MAX_VX * TAU_REACT : 0.0);
     return k;
 }
 

@@ -54,6 +54,8 @@ def _distributed_agents(context, *_a, **_k):
                 'arena': arena,
                 'use_astar': use_astar,
                 'hard_through': int(LaunchConfiguration('hard_through').perform(context)),
+                'corpse_anchor_knot': int(
+                    LaunchConfiguration('corpse_anchor_knot').perform(context)),
                 'astar_robot_radius': float(LaunchConfiguration('astar_robot_radius').perform(context)),
                 'astar_x_min': float(LaunchConfiguration('astar_x_min').perform(context)),
                 'astar_x_max': float(LaunchConfiguration('astar_x_max').perform(context)),
@@ -88,6 +90,10 @@ def generate_launch_description():
         # as a node default; exposed so the safety/feasibility trade can be swept. Raising it
         # tightens the published reference but risks an infeasible QP -> NaN -> fleet cold start.
         DeclareLaunchArgument('hard_through', default_value='1'),
+        # Which knot of a dead peer's last plan predicts where its body parks. K_SEND (10) is
+        # the correct and default value; N (20) is the known-unsafe setting kept only so the
+        # before/after can be measured with ONE binary. The node warns loudly if it is not 10.
+        DeclareLaunchArgument('corpse_anchor_knot', default_value='10'),
         DeclareLaunchArgument('formation', default_value='V'),
         Node(
             package='legged_admm_fleet',

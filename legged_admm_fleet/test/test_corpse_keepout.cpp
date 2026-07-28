@@ -15,8 +15,14 @@
 using namespace admm;
 
 namespace {
-Eigen::VectorXd plan_at(double x, double y) {  // a well-formed xibar whose terminal knot is (x,y)
+// A well-formed xibar whose ANCHOR knot (K_SEND — the last step the lower layer was actually
+// given) is (x,y). The terminal knot is filled with the same value so these cases stay about
+// the fallback logic rather than about which knot is read; case 1 is where that distinction
+// is pinned.
+Eigen::VectorXd plan_at(double x, double y) {
     Eigen::VectorXd v = Eigen::VectorXd::Zero(py_index(N) + 1);
+    v[px_index(K_SEND)] = x;
+    v[py_index(K_SEND)] = y;
     v[px_index(N)] = x;
     v[py_index(N)] = y;
     return v;
@@ -25,10 +31,20 @@ const double kMargin = 0.60;
 }  // namespace
 
 int main() {
-    // 1. the plan's terminal knot wins: it leads the body, which keeps coasting after the agent dies
+    // 1. the plan predicts where the body coasts to after the agent dies — but at knot K_SEND,
+    //    not the terminal knot. The lower layer only ever received K_SEND steps and parks when
+    //    it runs out, so the terminal knot overshoots by (N-K_SEND)*TS*v. Measured over 16
+    //    evictions: 0.385 m mean against a derived 0.40 m, which put the real body that much
+    //    closer to the survivors than the keep-out believed.
     {
-        const auto k = corpse_keepout(Eigen::Vector4d(1.0, 2.0, 0, 0), plan_at(3.0, 4.0), kMargin);
+        Eigen::VectorXd v = Eigen::VectorXd::Zero(py_index(N) + 1);
+        v[px_index(K_SEND)] = 3.0; v[py_index(K_SEND)] = 4.0;   // where it actually stops
+        v[px_index(N)] = 5.0;      v[py_index(N)] = 6.0;        // where the plan ran on to
+        const auto k = corpse_keepout(Eigen::Vector4d(1.0, 2.0, 0, 0), v, kMargin);
         assert(k && std::abs(k->pos.x() - 3.0) < 1e-12 && std::abs(k->pos.y() - 4.0) < 1e-12);
+        const auto old = corpse_keepout(Eigen::Vector4d(1.0, 2.0, 0, 0), v, kMargin,
+                                        /*mobile=*/false, /*anchor_knot=*/N);
+        assert(old && std::abs(old->pos.x() - 5.0) < 1e-12);    // the A/B knob still reaches it
     }
     // 2. realised keep-out is exactly D_MIN — a dead dog is held like a live one, no extra margin
     {

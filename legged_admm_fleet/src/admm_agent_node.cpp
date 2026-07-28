@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -68,6 +69,19 @@ public:
         // experiment D: consecutive missing slots of a peer's AgentState before it is
         // declared dead and evicted (10 slots = 1 s sim). 0 disables eviction.
         evict_after_ = declare_parameter<int>("evict_after_misses", 10);
+        // Silence needs patience — it might be a network hiccup. A lie is POSITIVE evidence and
+        // does not: waiting the full 10 slots hands a hostile peer another 0.55 m of approach.
+        evict_after_lying_ = declare_parameter<int>("evict_after_lying", 3);
+        corpse_anchor_knot_ = declare_parameter<int>("corpse_anchor_knot", admm::K_SEND);
+        if (corpse_anchor_knot_ != admm::K_SEND)
+            RCLCPP_WARN(get_logger(),
+                        "[agent%d] corpse_anchor_knot=%d, not K_SEND=%d — A/B USE ONLY. The "
+                        "terminal knot overshoots where the body actually parks by ~0.39 m, "
+                        "leaving 0.92 m of real clearance against a 0.867 m contact line.",
+                        self_id_, corpse_anchor_knot_, admm::K_SEND);
+        resid_alpha_ = declare_parameter<double>("odom_residual_alpha", 0.2);
+        resid_gate_ = declare_parameter<double>("odom_residual_gate", 0.5);
+        log_only_ = declare_parameter<bool>("detection_log_only", true);
         // Stop broadcasting if our own obs/odom go stale (see ready()). Must be generous
         // enough that an RTF dip is not mistaken for a dead controller.
         input_stale_s_ = declare_parameter<double>("input_stale_s", 1.0);
@@ -112,19 +126,11 @@ public:
         inj_drop_p_ = declare_parameter<double>("inject_drop_p", 0.0);
         inj_delay_ms_ = declare_parameter<double>("inject_delay_ms", 0.0);
         inj_jitter_ms_ = declare_parameter<double>("inject_jitter_ms", 0.0);
+        // Experiment C, a DIFFERENT injection: this one corrupts what we SEND, so one lie is
+        // broadcast once and every receiver judges the same bytes independently.
+        declare_parameter<double>("inject_fake_offset", 0.0);
         transport_->set_inject(inj_drop_p_, inj_delay_ms_, inj_jitter_ms_);
-        param_cb_ = add_on_set_parameters_callback(
-            [this](const std::vector<rclcpp::Parameter>& ps) {
-                for (const auto& p : ps) {
-                    if (p.get_name() == "inject_drop_p") inj_drop_p_ = p.as_double();
-                    else if (p.get_name() == "inject_delay_ms") inj_delay_ms_ = p.as_double();
-                    else if (p.get_name() == "inject_jitter_ms") inj_jitter_ms_ = p.as_double();
-                }
-                transport_->set_inject(inj_drop_p_, inj_delay_ms_, inj_jitter_ms_);
-                rcl_interfaces::msg::SetParametersResult r;
-                r.successful = true;
-                return r;
-            });
+        // (the on-set callback is registered at the END of this constructor; see there)
         // Arena obstacle-CBF + A* (mirrors fleet_centralized_node; "" -> empty world). Every
         // agent knows the same 2D-known arena, so obstacle CBF and A* routing are fully local.
         const std::string arena_name = declare_parameter<std::string>("arena", "");
@@ -139,13 +145,39 @@ public:
         agent_ = std::make_unique<admm::AgentCore>(self_id_, dogs_, edges_, formation_.get(),
                                                    w_form_, arena_obs_, arena_walls_, hard_through_,
                                                    transport_.get(), robot_margin_);
+        // Declared unconditionally: these bounds are "the ground this fleet operates on", which
+        // Gate 1 needs whether or not A* is planning on it. (declare_parameter is once-only.)
+        const double ax_min = declare_parameter<double>("astar_x_min", 0.0);
+        const double ax_max = declare_parameter<double>("astar_x_max", 10.0);
+        const double ay_min = declare_parameter<double>("astar_y_min", -5.0);
+        const double ay_max = declare_parameter<double>("astar_y_max", 5.0);
+        admm::GateLimits gl;
+        gl.x_min = ax_min; gl.x_max = ax_max; gl.y_min = ay_min; gl.y_max = ay_max;
+        gl.arena_slack = declare_parameter<double>("gate1_arena_slack", 20.0);
+        gl.vel_margin = declare_parameter<double>("gate1_vel_margin", 3.0);
+        gate_ = gl;
+        transport_->set_gate_limits(gl);
+        // SELF-CHECK, at bring-up, loudly. The contract above ("goals live inside the map")
+        // fixes legitimate trajectories leaving the bounds; it does nothing about the bounds
+        // themselves being wrong. The node default for astar_x_max is 10.0 while plum's last
+        // post stands at x=15.68, so a launch that forgets to override it leaves Gate 1
+        // rejecting every honest message from a dog past x=11 — and because a rejected message
+        // is indistinguishable from a missing one, all three would evict each other and lose
+        // the pairwise CBF entirely. That must fail at startup, not silently mid-run.
+        RCLCPP_INFO(get_logger(), "[agent%d] Gate 1 bounds x[%.2f,%.2f] y[%.2f,%.2f] slack=%.1f",
+                    self_id_, gl.x_min, gl.x_max, gl.y_min, gl.y_max, gl.arena_slack);
+        for (const auto& ob : arena_obs_)
+            if (ob.pos[0] < gl.x_min || ob.pos[0] > gl.x_max ||
+                ob.pos[1] < gl.y_min || ob.pos[1] > gl.y_max)
+                RCLCPP_ERROR(get_logger(),
+                             "[agent%d] MISCONFIGURED: arena obstacle (%.2f,%.2f) lies OUTSIDE "
+                             "the map x[%.2f,%.2f] y[%.2f,%.2f] — the fleet must walk where "
+                             "Gate 1 will reject it. Fix astar_x_min/x_max/y_min/y_max.",
+                             self_id_, ob.pos[0], ob.pos[1],
+                             gl.x_min, gl.x_max, gl.y_min, gl.y_max);
         if (use_astar && !arena_obs_.empty()) {
             const double r_astar = declare_parameter<double>("astar_robot_radius", 0.60);
             const double res = declare_parameter<double>("astar_res", 0.15);
-            const double ax_min = declare_parameter<double>("astar_x_min", 0.0);
-            const double ax_max = declare_parameter<double>("astar_x_max", 10.0);
-            const double ay_min = declare_parameter<double>("astar_y_min", -5.0);
-            const double ay_max = declare_parameter<double>("astar_y_max", 5.0);
             std::vector<admm::AStarCircle> circles;
             for (const auto& o : arena_obs_) circles.push_back({o.pos[0], o.pos[1], o.radius});
             std::vector<admm::AStarRect> rects;
@@ -181,6 +213,22 @@ public:
                     has_goal_ = true;
                 }
             }, cmd_opts);
+        // GATE 2's independent observation channel. A compromised agent owns the planning and
+        // comms layer, so everything it SAYS is suspect; it does not own the state estimator,
+        // so /robotJ/controller/odom is the one thing about robot J it cannot forge. Without a
+        // channel outside the one being attacked there is no detector at all (Pasqualetti et
+        // al. 2013: content-only detectors cannot see an undetectable attack).
+        // Depth 1: only the latest position matters, and a backlog would age the residual.
+        for (int j : dogs_) {
+            if (j == self_id_) continue;
+            peer_odom_subs_.push_back(create_subscription<nav_msgs::msg::Odometry>(
+                "/robot" + std::to_string(j) + "/controller/odom", 1,
+                [this, j](nav_msgs::msg::Odometry::SharedPtr m) {
+                    std::lock_guard<std::mutex> l(mu_);
+                    peer_odom_[j] = Eigen::Vector2d(m->pose.pose.position.x,
+                                                    m->pose.pose.position.y);
+                }, cmd_opts));
+        }
         // Latch the per-dog goal (transient_local), same discovery-race reason as plan_sub_ below:
         // a short-lived `ros2 topic pub` goal burst can match one agent late and drop its goal for
         // that dog -> it parks at spawn while the others walk. Latching lets a late-matching agent
@@ -189,7 +237,7 @@ public:
             "/" + ns + "/goal", rclcpp::QoS(1).transient_local(),
             [this](geometry_msgs::msg::PoseStamped::SharedPtr m) {
                 std::lock_guard<std::mutex> l(mu_);
-                goal_ = Eigen::Vector2d(m->pose.position.x, m->pose.position.y);
+                goal_ = clampGoal(Eigen::Vector2d(m->pose.position.x, m->pose.position.y));
                 has_goal_ = true; yaw_latched_ = false;
             }, cmd_opts);
         // FleetPlan is an event-triggered one-shot; latch it (transient_local) so a robot
@@ -201,10 +249,54 @@ public:
                 std::lock_guard<std::mutex> l(mu_);
                 for (size_t k = 0; k < m->robot_ids.size(); ++k)
                     if (m->robot_ids[k] == self_id_) {
-                        goal_ = Eigen::Vector2d(m->goals[2 * k], m->goals[2 * k + 1]);
+                        goal_ = clampGoal(Eigen::Vector2d(m->goals[2 * k], m->goals[2 * k + 1]));
                         has_goal_ = true; yaw_latched_ = false;
                     }
             }, cmd_opts);
+
+        // Registered LAST, on purpose: rclcpp runs the on-set callbacks from declare_parameter
+        // too, so a callback that refuses unknown names would make every parameter declared
+        // after it throw at construction. Registering here means it only ever sees runtime sets.
+        param_cb_ = add_on_set_parameters_callback(
+            [this](const std::vector<rclcpp::Parameter>& ps) {
+                rcl_interfaces::msg::SetParametersResult r;
+                r.successful = true;
+                for (const auto& p : ps) {
+                    const std::string& n = p.get_name();
+                    if (n == "inject_drop_p") inj_drop_p_ = p.as_double();
+                    else if (n == "inject_delay_ms") inj_delay_ms_ = p.as_double();
+                    else if (n == "inject_jitter_ms") inj_jitter_ms_ = p.as_double();
+                    else if (n == "inject_fake_offset") {
+                        transport_->set_fake_offset(p.as_double());
+                        RCLCPP_WARN(get_logger(), "[agent%d] COMPROMISED: broadcasting a %.2f m "
+                                    "lie about its own position", self_id_, p.as_double());
+                    }
+                    // The detection knobs. These used to fall through to "successful = true"
+                    // while changing nothing: `ros2 param set detection_log_only false` reported
+                    // OK and left the detector in log-only mode, so the calibration procedure
+                    // ends by arming a gate that is not armed. An operator cannot see that.
+                    else if (n == "detection_log_only") {
+                        log_only_ = p.as_bool();
+                        RCLCPP_WARN(get_logger(), "[agent%d] Gate 2 is now %s", self_id_,
+                                    log_only_ ? "LOG-ONLY (not blocking)" : "BLOCKING");
+                    } else if (n == "odom_residual_gate") {
+                        resid_gate_ = p.as_double();
+                    } else if (n == "odom_residual_alpha") {
+                        resid_alpha_ = p.as_double();
+                    } else if (n == "evict_after_lying") {
+                        evict_after_lying_ = static_cast<int>(p.as_int());
+                    } else {
+                        // Anything else is read once at construction. Say so rather than
+                        // accepting it: a silent no-op is worse than a refusal.
+                        r.successful = false;
+                        r.reason = n + " is not settable at runtime (read once at startup)";
+                        RCLCPP_WARN(get_logger(), "[agent%d] REFUSED param '%s' — %s",
+                                    self_id_, n.c_str(), r.reason.c_str());
+                    }
+                }
+                transport_->set_inject(inj_drop_p_, inj_delay_ms_, inj_jitter_ms_);
+                return r;
+            });
 
         run_ = true;
         worker_ = std::thread([this] { loop(); });
@@ -334,7 +426,27 @@ private:
         }
         return v_eff;
     }
+    // THE CONTRACT: goals live inside the A* map. The planner already clamps an outside goal
+    // and walks the last leg straight, but leaving the contract implicit is what let a demo
+    // send the fleet to x=-5 against x_min=-2 and then produced a class of failures nobody was
+    // looking for (2026-07-28). Clamping HERE makes "where may this fleet be told to go" one
+    // answer, stated once, and audible when something asks for more.
+    Eigen::Vector2d clampGoal(const Eigen::Vector2d& g) const {
+        const Eigen::Vector2d c(clip(g[0], gate_.x_min, gate_.x_max),
+                                clip(g[1], gate_.y_min, gate_.y_max));
+        // Throttled: the plan is republished continuously, so an out-of-map slot goal produced
+        // 593 identical lines in one run and buried everything else.
+        if ((c - g).squaredNorm() > 1e-12)
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                        "[agent%d] goal (%.2f,%.2f) is outside the map x[%.1f,%.1f] y[%.1f,%.1f]"
+                        " — clamped to (%.2f,%.2f)",
+                        self_id_, g[0], g[1], gate_.x_min, gate_.x_max, gate_.y_min, gate_.y_max,
+                        c[0], c[1]);
+        return c;
+    }
+
     void cycle(std::uint64_t slot) {
+        transport_->set_now_slot(slot);  // Gate 1 bounds a claimed cycle_id against OUR clock
         ocs2_msgs::msg::MpcObservation obs;
         nav_msgs::msg::Odometry odom;
         Eigen::Vector2d goal;
@@ -421,6 +533,19 @@ private:
                                  qh.n_nonconverged, qh.last_status_val);
         // Warm start thrown away? Say so. has_prev() gates eviction arming, so a silent clear
         // used to turn into "this agent never evicts anyone" with nothing in the log to explain it.
+        // PROBE for the plan-vs-measurement gap. Logged only in the tail (>0.2 m) because that
+        // is the part with an open question: the Gate 1 chain check died on values of 0.6–1.3 m,
+        // and the suspected driver is HOLD freezing the plan while the body walks off the last
+        // published prefix — which caps the drift at prefix*speed ~0.4 m and therefore does NOT
+        // explain 1.335. Recording speed alongside separates "drift, still moving" from
+        // "parked, so something else". One line per occurrence, no throttle: it is rare.
+        if (res.chain_margin > 0.2)
+            RCLCPP_INFO(get_logger(),
+                        "chainprobe slot=%lu peer=%d margin=%.3f warm_cleared=%d hold=%d "
+                        "hold_streak=%d speed=%.3f",
+                        static_cast<unsigned long>(slot), self_id_, res.chain_margin,
+                        res.warm_cleared, int(res.hold), res.hold_streak,
+                        std::hypot(X0[2], X0[3]));
         if (res.warm_cleared != admm::StepResult::kWarmKept)
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                                  "[agent%d] warm start dropped (%s) — cold-starting consensus",
@@ -440,6 +565,8 @@ private:
         // dog it is not allowed to evict. Measured 2026-07-28 (d_0728_045133): 51 straight
         // "NOT ARMED", peer silent 370 slots, zero evictions, run dead.
         evict_armed_ = true;
+        gate2(slot);
+        trackMobileCorpses();
 
         // ADAPT: translate xi to estimator frame, build 24-D target, yaw latch, publish.
         Eigen::VectorXd xi_mpc = res.xi;
@@ -506,6 +633,46 @@ private:
         for (const auto& kv : corpses_) all.insert(all.end(), kv.second.begin(), kv.second.end());
         return all;
     }
+    // Where peer j's keep-out sits in that vector — same order as allObstacles(), which is the
+    // order the AgentCore was constructed with, so this index is valid for set_obstacle_pos.
+    std::size_t corpseIndex(int j) const {
+        std::size_t idx = arena_obs_.size();
+        for (const auto& kv : corpses_) {
+            if (kv.first == j) return idx;
+            idx += kv.second.size();
+        }
+        return idx;
+    }
+
+    // A peer evicted for LYING is still walking. Its keep-out must walk with it, or the fleet
+    // dodges a ghost and hits the body — the same mistake the corpse anchor already exists to
+    // avoid, except here it repeats every slot instead of once.
+    // Moving the obstacle in the node QP is free (set_obstacle_pos: values only, no rebuild,
+    // no cold start). The A* copy is NOT free — set_circles rebuilds the occupancy grid — so it
+    // is refreshed only once the tracked peer has drifted far enough for the cached route to be
+    // wrong, and that refresh forces a replan. ponytail: 0.5 m is 3 A* cells; tighten only if a
+    // run shows the route stale enough to matter.
+    void trackMobileCorpses() {
+        if (mobile_corpse_.empty()) return;
+        std::map<int, Eigen::Vector2d> od;
+        { std::lock_guard<std::mutex> l(mu_); od = peer_odom_; }
+        bool astar_stale = false;
+        for (int j : mobile_corpse_) {
+            const auto it = od.find(j);
+            auto cit = corpses_.find(j);
+            if (it == od.end() || cit == corpses_.end() || cit->second.empty()) continue;
+            cit->second[0].pos = it->second;
+            agent_->set_obstacle_pos(corpseIndex(j), it->second);
+            auto& last = astar_corpse_[j];
+            if ((last - it->second).norm() > 0.5) { last = it->second; astar_stale = true; }
+        }
+        if (astar_stale && planner_) {
+            std::vector<admm::AStarCircle> circles;
+            for (const auto& ob : allObstacles()) circles.push_back({ob.pos[0], ob.pos[1], ob.radius});
+            planner_->set_circles(circles);
+            path_goal_ = Eigen::Vector2d(1e9, 1e9);  // force a replan around where it is NOW
+        }
+    }
 
     // Experiment D: a peer whose AgentState has been absent for evict_after_ consecutive
     // slots is dead — remove it from the fleet graph and rebuild the AgentCore over the
@@ -515,6 +682,50 @@ private:
     // no defined meaning for 2 dogs — survivors keep chasing their latched goals with
     // pairwise CBF safety. Rejoin is NOT supported (a returning peer stays ignored).
     // Runs on the worker thread only (same thread as cycle()), so no locking needed.
+    // GATE 2 — the detector that actually decides, and the only one that can catch a lie a
+    // healthy agent could plausibly have produced. Gate 1 already chained xibar to xnow, so
+    // anchoring xnow to odom anchors both: one norm, and no allowance for the TS the two knots
+    // are apart (that allowance is not a constant — it grows when the dog turns hard).
+    //
+    // Low-passed because a single sample cannot separate a lie from odom noise, and armed only
+    // after a solved cycle: during bring-up odom and the broadcast state are not yet the same
+    // dog's idea of "now" and the residual is meaningless.
+    //
+    // Exceeding the gate does NOT introduce a new failure mode — it increments the same
+    // dropped_ counter Gate 1 uses, the peer stops being committed, its last_seen_ freezes and
+    // the crash-failover path evicts it. One mechanism, two entry points.
+    void gate2(std::uint64_t slot) {
+        if (!evict_armed_) return;
+        std::map<int, Eigen::Vector2d> od;
+        { std::lock_guard<std::mutex> l(mu_); od = peer_odom_; }
+        for (const auto& kv : agent_->peer_xnow()) {
+            const int j = kv.first;
+            if (j == self_id_) continue;
+            const auto it = od.find(j);
+            if (it == od.end()) continue;  // no independent channel yet -> no opinion
+            const double r = (it->second - kv.second.head<2>()).norm();
+            double& R = resid_[j];
+            R = (1.0 - resid_alpha_) * R + resid_alpha_ * r;
+            // Logged unconditionally: this line IS the calibration procedure. Run the fleet
+            // clean with detection_log_only, take max R, set the gate well above it.
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+                                 "[agent%d] residual robot%d r=%.3f R=%.3f gate=%.2f | "
+                                 "gate1_worst=%.3f dropped=%u",
+                                 self_id_, j, r, R, resid_gate_,
+                                 transport_->gate_worst(), transport_->dropped(j));
+            if (R <= resid_gate_) continue;
+            if (log_only_) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                                     "[agent%d] GATE2 would reject robot%d (R=%.3f > %.2f) — "
+                                     "log_only, message still accepted",
+                                     self_id_, j, R, resid_gate_);
+            } else {
+                transport_->block_peer(j, "gate2 odom residual");
+            }
+        }
+        (void)slot;
+    }
+
     void maybeEvict(std::uint64_t slot) {
         if (evict_after_ <= 0 || dogs_.size() < 2) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -543,7 +754,19 @@ private:
             if (j == self_id_) continue;
             const auto it = seen.find(j);
             const std::uint64_t last = (it == seen.end()) ? 0 : it->second;
-            if (slot > last && slot - last >= static_cast<std::uint64_t>(evict_after_)) {
+            // One line, one code path: a peer we have caught lying is silent for a different
+            // REASON (we are refusing its messages), and that reason is positive evidence, so
+            // it does not earn the patience that a possible network hiccup does.
+            //
+            // The test is Gate 2's LATCHED verdict, NOT the dropped_ counter. dropped_ also
+            // counts Gate 1 rejections, and Gate 1 legitimately rejects a single NaN broadcast
+            // from a DYING peer — the crash path, which has its own 10-slot patience. Keying
+            // off the counter made one such rejection permanently mark a healthy peer as a
+            // liar: measured 2026-07-28 (d_0728_072027), agent2 and agent3 each rejected one
+            // NaN message from the other, then evicted each other at the 3-slot threshold,
+            // ended up alone with no pairwise CBF at all, and closed to 0.838 m.
+            const int need = transport_->blocked(j) ? evict_after_lying_ : evict_after_;
+            if (slot > last && slot - last >= static_cast<std::uint64_t>(need)) {
                 dead.push_back(j);
                 silent[j] = slot - last;
             }
@@ -572,6 +795,10 @@ private:
         // core (a dangling reference here segfaulted both survivors, 2026-07-23 08:36)
         const auto pxnow = agent_->peer_xnow();
         const auto pxibar = agent_->peer_xibar();
+        // Snapshot under the lock: peer_odom_ is written by the odom callbacks (cmd_cbg_) while
+        // this runs on the worker thread. Same copy-don't-reference rule as pxnow above.
+        std::map<int, Eigen::Vector2d> odom_snap;
+        { std::lock_guard<std::mutex> l(mu_); odom_snap = peer_odom_; }
         for (int j : dead) {
             const auto itn = pxnow.find(j);
             const auto itb = pxibar.find(j);
@@ -579,10 +806,17 @@ private:
                 RCLCPP_WARN(get_logger(), "[agent%d] EVICT robot%d (never seen a state)", self_id_, j);
                 continue;
             }
+            // Talking, but talking garbage -> it is ALIVE and walking, not a corpse. Its
+            // keep-out has to be wider (it is cooperating with nobody) and, below, it has to
+            // follow its odom instead of standing where it was last believed to be.
+            // Gate 2's latched verdict, for the same reason as `need` above: a peer that emitted
+            // one NaN is dying, not lying, and a dying dog's body does stop.
+            const bool mobile = transport_->blocked(j);
             // Geometry lives in admm::corpse_keepout (fleet_config) so it is unit-testable:
             // where to fence, how wide, and when NOT to fence at all. See test_corpse_keepout.
             const auto kp = admm::corpse_keepout(
-                itn->second, itb != pxibar.end() ? itb->second : Eigen::VectorXd(), robot_margin_);
+                itn->second, itb != pxibar.end() ? itb->second : Eigen::VectorXd(), robot_margin_,
+                mobile, corpse_anchor_knot_);
             if (!kp) {
                 RCLCPP_WARN(get_logger(),
                             "[agent%d] EVICT robot%d — no finite position (plan and state both "
@@ -591,7 +825,12 @@ private:
                 continue;
             }
             admm::Obstacle o;
-            o.pos = kp->pos;
+            // A liar's own broadcast is exactly what we stopped believing, and corpse_keepout
+            // anchors on its xibar terminal knot — so for a mobile peer the anchor comes from
+            // odom instead. Believing the plan here would let the attacker choose where its own
+            // keep-out is drawn, which is the attack, not the defence.
+            const auto oit = mobile ? odom_snap.find(j) : odom_snap.end();
+            o.pos = (mobile && oit != odom_snap.end()) ? oit->second : kp->pos;
             o.radius = kp->radius;
             // The one obstacle kind that can be born already violated: it materialises around
             // wherever the survivors happen to be standing, and the dead peer's body kept
@@ -599,6 +838,7 @@ private:
             // running on frozen data. Hard at k=0 would mean "infeasible, forever". See Obstacle.
             o.soft_k0 = true;
             corpses_[j].push_back(o);
+            if (mobile) { mobile_corpse_.insert(j); astar_corpse_[j] = o.pos; }
             RCLCPP_WARN(get_logger(),
                         "[agent%d] EVICT robot%d (silent %lu slots) — corpse CBF at predicted rest (%.2f,%.2f) r=%.2f (last seen (%.2f,%.2f))",
                         self_id_, j, static_cast<unsigned long>(silent[j]), o.pos[0], o.pos[1],
@@ -726,10 +966,23 @@ private:
     // dropped again (rejoin). Kept OUT of arena_obs_ precisely so removal is possible —
     // the terrain set must stay pristine across membership changes.
     std::map<int, std::vector<admm::Obstacle>> corpses_;
+    std::set<int> mobile_corpse_;                   // evicted for lying -> still walking
+    std::map<int, Eigen::Vector2d> astar_corpse_;   // where A* last placed each mobile one
     std::vector<admm::Wall> arena_walls_;
     int hard_through_ = 1;
     double robot_margin_ = 0.60;
     int evict_after_ = 10;                          // slots of peer silence before eviction (0=off)
+    int evict_after_lying_ = 3;                     // ...but a CAUGHT liar is positive evidence
+    int corpse_anchor_knot_ = admm::K_SEND;         // A/B knob; K_SEND is the safe setting
+    // Gate 2 state. Budget for evict_after_lying_: the CBF has D_MIN 1.3 - contact 0.867 =
+    // 0.433 m of slack, a hostile peer closes at MAX_VX 0.55 m/s, so the whole detect-and-evict
+    // path has 0.79 s ~ 8 slots. The low-pass itself spends ~2 of them, leaving 6; 3 keeps a
+    // factor of two. Worst danger window = 2 + 3 = 5 slots = 0.5 s = 0.28 m closed, inside 0.433.
+    admm::GateLimits gate_;                         // map bounds + Gate 1 thresholds
+    std::map<int, Eigen::Vector2d> peer_odom_;      // guarded by mu_ (written from cmd_cbg_)
+    std::map<int, double> resid_;                   // low-passed |odom - claimed|, cycle() only
+    double resid_alpha_ = 0.2, resid_gate_ = 0.5;
+    bool log_only_ = true;                          // measure before you block; see calibration
     double input_stale_s_ = 1.0;                    // own obs/odom age that self-fences us
     std::vector<admm::ArenaRect> arena_rects_;      // A*-only wall boxes (door)
     std::vector<Eigen::Vector2d> path_;             // cached A* route; cycle()-thread only
@@ -739,6 +992,7 @@ private:
     rclcpp::Publisher<admm_fleet_msgs::msg::CycleStats>::SharedPtr stats_pub_;
     rclcpp::Subscription<ocs2_msgs::msg::MpcObservation>::SharedPtr obs_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    std::vector<rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr> peer_odom_subs_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
     rclcpp::Subscription<admm_fleet_msgs::msg::FleetPlan>::SharedPtr plan_sub_;  // gets this dog's goal
     // reentrant group for this agent's own command/state callbacks (obs/odom/goal/plan) so the

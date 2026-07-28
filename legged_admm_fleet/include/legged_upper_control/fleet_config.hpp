@@ -51,9 +51,31 @@ struct CorpseKeepout {
     Eigen::Vector2d pos;
     double radius;
 };
+// Reaction time budgeted against a peer that is moving and NOT cooperating (experiment C: a
+// node evicted for broadcasting lies keeps walking). 2 slots — one to see its new odom, one to
+// act on it. Lives here, not in admm_constants.hpp: it is failure-semantics geometry, and no
+// barrier, QP or oracle-pinned number depends on it.
+inline constexpr double TAU_REACT = 0.2;
+// mobile=true when the peer was evicted for LYING rather than for going silent: it is still
+// walking, and unlike a corpse it is not cooperating with anyone's CBF. The extra radius is the
+// distance it can cover while this agent reacts — the worst case is absorbed into the geometry
+// rather than into the barrier, so the CBF form is untouched.
+// anchor_knot: WHICH knot of the dead peer's last plan predicts where its body actually stops.
+// K_SEND, not N: the lower layer only ever received K_SEND steps of that trajectory and parks
+// when it runs out, so the terminal knot overshoots by (N-K_SEND)*TS*v — measured 0.385 m mean
+// over 16 evictions against a derived 0.40 m, which put the real body 0.385 m nearer the
+// survivors than the keep-out believed (1.30 nominal -> 0.915 m of real clearance on the
+// approach side, against a 0.867 m contact line). Parameterised only so the A/B can be run with
+// one binary; N is the known-unsafe setting.
+// Residual, accepted for now: k_send is not fixed — cycle() truncates the published prefix for
+// direction-aware safety and that decision is local, never broadcast, so a receiver cannot know
+// a peer sent only 4 steps. Anchoring at K_SEND then overshoots by at most (10-1)*TS*v = 0.36 m.
+// Truncation is rare. The root fix is to put the actual k_send in AgentState — one field, worth
+// doing together with Phase 2's view_id.
 std::optional<CorpseKeepout> corpse_keepout(const Eigen::Vector4d& xnow,
                                             const Eigen::VectorXd& xibar,
-                                            double robot_margin);
+                                            double robot_margin, bool mobile = false,
+                                            int anchor_knot = K_SEND);
 
 // 2D rotation matrix (world frame).
 Eigen::Matrix2d rot2d(double yaw);

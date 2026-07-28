@@ -365,6 +365,14 @@ NodeSubproblem::Out NodeSubproblem::out_from_res_(const OsqpProblem::Result& res
     for (int k = 0; k < N; ++k)
         for (int d = 0; d < 2; ++d) out.a_pred(k, d) = out.xi(a_index(k, N) + d);
     out.a0 = Eigen::Vector2d(out.a_pred(0, 0), out.a_pred(0, 1));
+    // Largest k=0 relaxation actually bought this solve. Non-zero means a soft_k0 obstacle —
+    // in practice a corpse — was violated at the current measured state and the L1 price was
+    // paid to escape. It has to be visible: "the survivor never got 1.30 m from the corpse"
+    // reads identically whether the keep-out was mis-anchored or the geometry simply pinned it,
+    // and only this number separates the two.
+    for (int j = n_soft_rows_; j < n_slack_; ++j)
+        out.k0_slack = std::max(out.k0_slack, out.xi(n_xi_ + j));
+    last_k0_slack_ = out.k0_slack;
     return out;
 }
 

@@ -8,9 +8,9 @@
 #   kill x    4 = entering the field, 7 = mid, 11 = deep, 14 = about to exit. Where the corpse
 #             lands decides which lane it blocks and how boxed-in the survivors are
 #   arena     plum_dense has 2.20 m diagonal gaps vs plum's 2.30 — the measured dog-dog bottleneck
-#   goal      a return target far outside the fleet's own bounding box is the ONLY thing that
-#             exercises the "don't rebuild the planner" fix (T1.4); every run so far came home
-#             to the start, which sits inside the box either way
+#   goal      a return target the fleet has never stood on; every other point comes home to the
+#             start. (It was meant to exercise the "don't rebuild the planner" fix, T1.4 — it
+#             does not, and cannot, in an arena run. See the farhome entry below.)
 #
 #   ./scripts/d_matrix.sh            run the default matrix
 #   CASES="victim1 deep dense" ...   run a subset by name
@@ -35,8 +35,34 @@ ALL=(
   # reaching the goal here is a regression, not a geometry limit. (d_run.sh still understands
   # EXPECT=stall; that is for the 2.10 m stress point, where the fleet genuinely wedges.)
   "dense|VICTIM=2 KILL_AT_X=7.0 ARENA=plum_dense"
-  "farhome|VICTIM=2 KILL_AT_X=7.0 HOME_OVERRIDE=-5.0" # return target outside the fleet bbox (T1.4)
+  # Return target the fleet has never stood on, but INSIDE the A* map (x_min=-2). It used to be
+  # -5.0, i.e. off the map, which turned out to test something nobody wanted: goals now live
+  # inside the map by contract (admm_agent_node::clampGoal), so -5.0 would just be clamped here.
+  # Note what this point does NOT cover, despite the original comment: the "don't rebuild the
+  # planner around the fleet bbox" fix (T1.4) is unreachable in an arena run, because rebuild()
+  # swaps circles in place whenever a planner already exists and only an EMPTY world takes the
+  # makePlannerFromFleet path. That path has no regression test. Low priority, but it is a gap.
+  # -0.5, not -1.5: the COL2 slots sit at goal +-0.75, so a goal of -1.5 puts the rear slot at
+  # -2.25, which clamps to x_min=-2.0 and then lands inside the planner's 0.45 m boundary margin
+  # (usable ground starts at -1.55) — unreachable, and the fleet parks 1.35 m short forever.
+  # -0.5 puts the rear slot at -1.25 with 0.30 m to spare, and is still behind the V's rear
+  # spawn slot at -0.40, i.e. ground this fleet has never stood on.
+  "farhome|VICTIM=2 KILL_AT_X=7.0 HOME_OVERRIDE=-0.5"
 )
+
+# PRE-REGISTERED exclusion rule, in code rather than in a README, so that the classification
+# happens before anyone sees the numbers and cannot be applied selectively afterwards.
+#
+# The lower layer's own whole-body QP goes infeasible at a measured ~7% of runs (3 of 44 on
+# 2026-07-28), independently of anything this repo changes — it predates the C-experiment gates
+# and shows up in runs recorded before they existed. Its signature is unambiguous and comes from
+# gazebo.log, not from our layer: qpOASES status 37 / an empty WBC solution.
+#
+# Such a FAIL is neither counted nor discarded: the point is re-run once, and the retry's verdict
+# is what lands in the matrix. Any FAIL WITHOUT this signature is a real failure and counts.
+wbc_flake() {  # $1 = run log dir
+  grep -qi "QP init failed with status 37\|WBC returned an empty solution" "$1/gazebo.log" 2>/dev/null
+}
 
 want="${CASES:-}"
 for entry in "${ALL[@]}"; do
@@ -47,6 +73,14 @@ for entry in "${ALL[@]}"; do
     bash "$SCRIPTS/d_run.sh" "${VICTIM:-2}" ) > "$OUT/$name.out" 2>&1
   RC=$?
   D=$(ls -dt $WS/g2_logs/d_* 2>/dev/null | head -1)
+  if [ "$RC" != 0 ] && wbc_flake "$D"; then
+    echo "=== case $name : WBC QP infeasible (known ~7% flake) — re-running once ==="
+    mv "$OUT/$name.out" "$OUT/$name.wbcflake.out"
+    ( export ARENA=plum GOAL_X=18.0 RECORD=0; eval "export $envs"
+      bash "$SCRIPTS/d_run.sh" "${VICTIM:-2}" ) > "$OUT/$name.out" 2>&1
+    RC=$?
+    D=$(ls -dt $WS/g2_logs/d_* 2>/dev/null | head -1)
+  fi
   RES=PASS; [ "$RC" = 0 ] || RES=FAIL
   # A confirmed safe stall is its own verdict, not a PASS — it must stay visible in the matrix.
   grep -q "D STALL-SAFE" "$OUT/$name.out" && RES=STALL-SAFE

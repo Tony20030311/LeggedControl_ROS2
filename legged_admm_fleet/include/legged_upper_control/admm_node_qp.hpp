@@ -50,6 +50,7 @@ public:
         Eigen::MatrixXd x_pred;   // (N,4) when finite
         Eigen::MatrixX2d a_pred;  // (N,2) when finite
         Eigen::Vector2d a0;
+        double k0_slack = 0.0;    // largest k=0 relaxation used (soft_k0 obstacles only)
     };
 
     NodeSubproblem(std::vector<Obstacle> obstacles, std::vector<Wall> walls,
@@ -67,6 +68,20 @@ public:
 
     // Drop the poisoned OSQP workspace so the next solve() rebuilds it clean.
     void reset_solver() { prob_.reset(); }
+
+    // Move one obstacle without rebuilding anything. A keep-out around a peer that is still
+    // WALKING (a node broadcasting garbage rather than a dead one) has to follow that peer's
+    // odom every slot, and rebuilding the subproblem to do it would cold-start the consensus
+    // once per slot — the fleet would never converge.
+    // Safe because features_() re-reads obstacles_ on every assemble_A_, and only the CBF row
+    // VALUES depend on the position: the count of features, the slack layout and the CSC
+    // pattern are all fixed at construction and none of them move here.
+    void set_obstacle_pos(std::size_t i, const Eigen::Vector2d& pos) {
+        if (i < obstacles_.size()) obstacles_[i].pos = pos;
+    }
+    std::size_t n_obstacles() const { return obstacles_.size(); }
+    // Largest k=0 relaxation used by the most recent solve (0 when nothing was violated).
+    double last_k0_slack() const { return last_k0_slack_; }
 
     // --- debug accessors for the bit-parity gate (test_cpp_parity.py) ---
     struct PassData {
@@ -132,6 +147,7 @@ private:
     CscPattern A_pat_, P_pat_;
     std::vector<double> P_data_;
     std::vector<double> lo_base_, up_base_;
+    mutable double last_k0_slack_ = 0.0;  // set in the const out_from_res_; telemetry only
     OsqpProblem prob_;
 };
 

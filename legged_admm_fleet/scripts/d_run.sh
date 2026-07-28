@@ -173,8 +173,35 @@ else
 # pgrep -f is read-only and safe here; `pkill -f` is banned (it matches this shell).
 PIDV=$(pgrep -f "admm_agent_$VICTIM" | head -1)
 [ -n "$PIDV" ] || die "cannot find admm_agent_$VICTIM (try: pgrep -af admm_agent)"
+# LIE=<metres>: experiment C instead of experiment D. The victim is not silenced — it is
+# COMPROMISED. Two knobs, because a real attacker has both: it broadcasts a position offset by
+# LIE metres (sender side, so every survivor judges the same bytes), and it is steered into the
+# formation with its own per-dog goal. A liar that keeps walking its honest plan is a
+# "cooperative liar" and never tests the thing that matters — being pushed away by the CBF.
+if [ -n "${LIE:-}" ]; then
+  say "phase 5: COMPROMISE admm_agent_$VICTIM — lie=${LIE}m, steering it into the fleet"
+  read CX CY <<< "$(fleet_centroid "$SURVIVORS")"
+  # The daemon caches the node graph and goes stale across a fleet restart; a param set against
+  # a stale daemon fails with no useful message. Bounce it first (measured: this is exactly why
+  # the first scripted run of this scenario died at "inject_fake_offset failed").
+  ros2 daemon stop >/dev/null 2>&1; sleep 2
+  timeout 12 ros2 param set /admm_agent_$VICTIM detection_log_only false >/dev/null 2>&1
+  timeout 12 ros2 param set /admm_agent_$VICTIM inject_fake_offset "$LIE" \
+    || die "inject_fake_offset failed (is the param declared?)"
+  # arm the DETECTORS on the survivors, not on the liar
+  for j in $SURVIVORS; do
+    timeout 12 ros2 param set /admm_agent_$j detection_log_only false >/dev/null 2>&1 \
+      || die "could not arm Gate 2 on agent$j"
+  done
+  # walk it at the survivors' centroid
+  # transient_local + a short burst: same discovery-race lesson as send_formation_goal.
+  timeout 8 ros2 topic pub -r 5 --qos-durability transient_local \
+    /robot$VICTIM/goal geometry_msgs/msg/PoseStamped \
+    "{header: {frame_id: world}, pose: {position: {x: $CX, y: $CY, z: 0.5}}}" >/dev/null 2>&1
+else
 say "phase 5: SIGSTOP admm_agent_$VICTIM (pid $PIDV)"
 kill -STOP "$PIDV" || die "SIGSTOP failed"
+fi
 
 N_EVICT=$(wait_for_log "EVICT robot$VICTIM" 2 60)
 [ "$N_EVICT" -ge 2 ] || die "only $N_EVICT survivor(s) evicted robot$VICTIM within 60s"

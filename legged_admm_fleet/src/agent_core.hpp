@@ -15,6 +15,7 @@
 // them to admm_fleet_msgs on the wire.
 #include <cstdint>
 #include <map>
+#include <algorithm>
 #include <memory>
 #include <vector>
 
@@ -37,6 +38,145 @@ struct AgentStateMsg {
     Eigen::VectorXd xibar;   // 6N operating-point plan
     bool reset = false;
 };
+
+// GATE 1 — the syntactic filter on the receive path, deliberately loose.
+//
+// Everything a peer says about itself is believed today: onState stores the message verbatim,
+// so a node that keeps talking but lies is never evicted (eviction triggers on SILENCE) and its
+// numbers go straight into the consensus and the CBF. This rejects only what a HEALTHY agent
+// could never emit. With n=3, wrongly dropping one good message costs a dog, so every threshold
+// here carries 3x slack: false negatives are cheap (Gate 2 catches the lie), false positives
+// are not.
+//
+// It also CHAINS the two claimed positions together: xibar's first knot must agree with xnow.
+// Both fields are consumed downstream (xnow feeds followSpeed and the corpse anchor fallback,
+// xibar feeds the CBF operating point), so leaving either unchecked leaves a free channel for
+// a lie. Chaining them here means Gate 2 only has to anchor ONE of them to odom.
+//
+// NOTE on indexing: xi has no k=0 — px_index(k) = 4*(k-1) starts at k=1 — so xibar's first
+// position knot is TS ahead of xnow, not equal to it. That is why the comparison carries a
+// velocity allowance rather than being an equality.
+struct GateLimits {
+    double x_min = -2.0, x_max = 20.0, y_min = -7.0, y_max = 7.0;
+    // How far outside the A* map a legitimate plan may reach — and it is a bound on "a
+    // plausible world", NOT on the planning map. The fleet is explicitly allowed to operate off
+    // the map: a return goal at x=-5 against x_min=-2 is a supported scenario (d_matrix
+    // farhome), and the planner clamps into the map while the final leg walks honestly past its
+    // edge. Sizing this to the map rejected those legitimate plans and, because each survivor
+    // then looked silent to the other, they evicted EACH OTHER and lost the pairwise CBF
+    // entirely (measured 2026-07-28, d_0728_075637: 17 mutual rejections, min pair 0.832).
+    // So: wide enough that only absurd values fail. Anything plausible-but-wrong is Gate 2's job.
+    double arena_slack = 20.0;
+    double vel_margin = 3.0;    // multiple of MAX_VX*TS allowed between consecutive plan knots
+    // How far from the receiver's own slot a claimed cycle_id may be. The mailbox only keeps 8
+    // slots (dds_transport kKeep), so anything outside that window is unusable even when
+    // honest; 16 leaves a factor of two for clock skew and scheduling jitter.
+    std::uint64_t slot_window = 16;
+};
+
+// WHICH check failed, not just that one did. A rejected message is indistinguishable from a
+// missing one by design (that is how detection reuses the crash path), so a Gate 1 false
+// positive presents as a peer dying — and with both survivors rejecting each other, as the
+// pairwise CBF disappearing entirely. Twice on 2026-07-28 the only evidence was a throttled
+// "REJECTED" line that named no reason, which is not enough to tell a bug from an attack.
+enum class GateReason { kOk = 0, kRoster, kLength, kNonFinite, kArena, kStep,
+                        kVel, kAccel, kSlot };
+inline const char* gateReasonName(GateReason r) {
+    switch (r) {
+        case GateReason::kOk: return "ok";
+        case GateReason::kRoster: return "roster";
+        case GateReason::kLength: return "length";
+        case GateReason::kNonFinite: return "non-finite";
+        case GateReason::kArena: return "arena";
+        case GateReason::kStep: return "step kinematics";
+        case GateReason::kVel: return "claimed velocity";
+        case GateReason::kAccel: return "plan acceleration";
+        case GateReason::kSlot: return "cycle_id window";
+    }
+    return "?";
+}
+
+// worst_margin (optional out): how close the message came to the limit that rejected it, or the
+// tightest margin over all checks when it passes. Feeding this back is what makes the
+// thresholds calibratable from a clean run instead of argued from the dynamics.
+inline GateReason gateCheck(const AgentStateMsg& m, const std::vector<int>& roster,
+                            const GateLimits& g, double* worst_margin = nullptr,
+                            std::uint64_t now_slot = 0) {
+    if (worst_margin) *worst_margin = 0.0;
+    if (std::find(roster.begin(), roster.end(), m.robot_id) == roster.end())
+        return GateReason::kRoster;
+    if (m.xibar.size() != XI_DIM) return GateReason::kLength;
+    if (!m.xibar.allFinite() || !m.xnow.allFinite()) return GateReason::kNonFinite;
+    // cycle_id must name a slot near NOW. It is not just a label: it keys the mailbox, it
+    // advances last_seen_ (so a peer claiming slot+1000 can never be judged silent again), and
+    // it drives the prune window (so one such message erases the honest peers' mail as well).
+    // A liar needs no position lie at all for that — it is the cheapest possible attack, and
+    // the fleet's answer would be a permanent barrier timeout with no eviction and no corpse.
+    // now_slot == 0 means "caller has no clock" (unit tests), and the check is skipped.
+    if (now_slot != 0) {
+        const std::uint64_t lo = now_slot > g.slot_window ? now_slot - g.slot_window : 0;
+        if (m.cycle_id < lo || m.cycle_id > now_slot + g.slot_window) {
+            if (worst_margin)
+                *worst_margin = static_cast<double>(m.cycle_id) - static_cast<double>(now_slot);
+            return GateReason::kSlot;
+        }
+    }
+    // Claimed velocity. Only allFinite before, and it is consumed: followSpeed brakes on a
+    // peer's claimed v_ahead, so a large negative claim pins a survivor at the follow floor
+    // (0.05 m/s) indefinitely — a denial of movement that needs no detectable position error.
+    if (std::abs(m.xnow[2]) > MAX_VX * g.vel_margin ||
+        std::abs(m.xnow[3]) > MAX_VY * g.vel_margin) {
+        if (worst_margin) *worst_margin = std::max(std::abs(m.xnow[2]), std::abs(m.xnow[3]));
+        return GateReason::kVel;
+    }
+    // The ACCELERATION block of xibar, which the position checks never touched. It is what the
+    // edge CBF linearises around (rti.cpp: u = hbar - g.(abar_i - abar_j)), so a message whose
+    // positions are honest — passing every other check here AND Gate 2's odom residual — can
+    // still make the pairwise bound vacuous, switching off the inter-robot barrier silently.
+    for (int k = 0; k < N; ++k) {
+        if (std::abs(m.xibar[ax_index(k)]) > MAX_AX * g.vel_margin ||
+            std::abs(m.xibar[ay_index(k)]) > MAX_AY * g.vel_margin) {
+            if (worst_margin)
+                *worst_margin = std::max(std::abs(m.xibar[ax_index(k)]),
+                                         std::abs(m.xibar[ay_index(k)]));
+            return GateReason::kAccel;
+        }
+    }
+    // NO xnow <-> xibar consistency check. It was here, and it had to go: xibar is last cycle's
+    // plan SHIFTED by one step while xnow is a fresh measurement, and during a HOLD the plan is
+    // deliberately frozen while the body keeps walking off the last published prefix. Measured
+    // on honest traffic: 0.597, 0.623, 0.668, 1.335 m. To stop rejecting those the bound would
+    // have to sit above 2 m — which is the size of the lie it exists to catch, so there is no
+    // threshold that both accepts honest messages and constrains a liar.
+    // Consequence, stated rather than hidden: xibar's CONTENT is only self-constrained here
+    // (finite / arena / step kinematics / acceleration). It is not anchored to any independent
+    // channel — Gate 2 anchors xnow, and nothing anchors the plan. Future work, alongside the
+    // ungated EdgeXi/EdgeZ messages.
+    const double step = MAX_VX * TS * g.vel_margin;
+    double worst = 0.0;
+    for (int k = 1; k <= N; ++k) {
+        const double x = m.xibar[px_index(k)], y = m.xibar[py_index(k)];
+        if (x < g.x_min - g.arena_slack || x > g.x_max + g.arena_slack ||
+            y < g.y_min - g.arena_slack || y > g.y_max + g.arena_slack) {
+            if (worst_margin) *worst_margin = std::max(std::abs(x), std::abs(y));
+            return GateReason::kArena;
+        }
+        if (k < N) {
+            const Eigen::Vector2d a(x, y);
+            const Eigen::Vector2d b(m.xibar[px_index(k + 1)], m.xibar[py_index(k + 1)]);
+            const double d = (b - a).norm();
+            worst = std::max(worst, d / step);
+            if (d > step) { if (worst_margin) *worst_margin = d; return GateReason::kStep; }
+        }
+    }
+    if (worst_margin) *worst_margin = worst;   // fraction of the tightest limit actually used
+    return GateReason::kOk;
+}
+
+inline bool wellFormed(const AgentStateMsg& m, const std::vector<int>& roster,
+                       const GateLimits& g) {
+    return gateCheck(m, roster, g) == GateReason::kOk;
+}
 struct EdgeXiMsg {
     std::uint64_t cycle_id = 0;
     int iter = 0;
@@ -81,6 +221,18 @@ struct StepResult {
     // Output only; AgentCore stays ROS-free, the caller does the logging.
     enum WarmCleared { kWarmKept = 0, kWarmNaN = 1, kWarmPeerReset = 2 };
     int warm_cleared = kWarmKept;
+    // Diagnostics for the plan-vs-measurement gap that killed the Gate 1 chain check. xibar is
+    // broadcast BEFORE this cycle solves and is last cycle's plan shifted one step, so this is
+    // "how far the plan I just told everyone about is from where I actually am". It grows while
+    // HOLD freezes the plan and the body walks off the published prefix — hold_streak is the
+    // suspected driver, recorded next to it so the claim can be checked instead of asserted.
+    double chain_margin = 0.0;   // |xibar[k=1] - xnow| of the message broadcast THIS cycle
+    int hold_streak = 0;         // consecutive HOLD cycles ending with this one (0 if solved)
+    // Largest k=0 keep-out relaxation this cycle bought. Non-zero means a corpse circle was
+    // violated at the measured state and the L1 price was paid — the difference between "the
+    // keep-out was in the wrong place" and "the geometry left nowhere to stand", which look
+    // identical in a separation plot.
+    double k0_slack = 0.0;
 };
 
 // Transport: send is fire-and-forget; recv blocks until the matching message(s) arrive.
@@ -135,6 +287,15 @@ public:
     // Peers' broadcast predicted trajectory xibar (6N: [px,py,vx,vy,ax,ay]*N) from the LAST
     // step(); positions feed safe_prefix_length. Keyed by robot id, self included.
     const std::map<int, Eigen::VectorXd>& peer_xibar() const { return peer_xibar_; }
+    // Move an already-registered obstacle. The node layer owns WHY an obstacle moves (a peer
+    // that broadcasts garbage is still walking, so its keep-out has to follow its odom); this
+    // is only the route to the node QP, which holds the obstacle set. No rebuild, no cold start
+    // — see NodeSubproblem::set_obstacle_pos. Obstacle ORDER is the construction order, so the
+    // caller's index is the index it passed to the constructor.
+    void set_obstacle_pos(std::size_t i, const Eigen::Vector2d& pos) {
+        if (node_) node_->set_obstacle_pos(i, pos);
+    }
+    std::size_t n_obstacles() const { return node_ ? node_->n_obstacles() : 0; }
 
 private:
     Eigen::VectorXd uncoupled_self_(const Eigen::Vector4d& xnow,
@@ -165,6 +326,7 @@ private:
     std::map<EdgeKey, std::pair<Eigen::VectorXd, Eigen::VectorXd>> owned_z_;
     // warm start
     bool has_prev_ = false;
+    int hold_streak_ = 0;   // consecutive HOLDs; diagnostic only, never gates anything
     std::uint64_t cycle_ = 0;
     Eigen::VectorXd prev_xi_;
     std::map<EdgeKey, Eigen::VectorXd> prev_z_self_, prev_lam_self_;
