@@ -138,7 +138,11 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
             hr.xi = has_prev_ ? prev_xi_ : xibar_self;
             hr.hold = true;
             hr.n_timeouts = transport_->take_timeouts();
-            if (!self_cold) { has_prev_ = false; cycle_ = 0; }  // join the fleet reset
+            if (!self_cold) {  // join the fleet reset
+                has_prev_ = false;
+                cycle_ = 0;
+                hr.warm_cleared = StepResult::kWarmPeerReset;
+            }
             return hr;
         }
     }
@@ -159,6 +163,7 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
             node_->reset_solver();
             has_prev_ = false;
             cycle_ = 0;
+            sr.warm_cleared = StepResult::kWarmNaN;
         }
         sr.n_timeouts = transport_->take_timeouts();
         return sr;
@@ -300,6 +305,7 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
     }
     StepResult res;
     res.xi = xi_self;
+    if (!xi_self.allFinite()) res.warm_cleared = StepResult::kWarmNaN;
     // per-edge final primal residual (output only; same pairwise-sum as the in-loop metric).
     if (xi_self.allFinite()) {
         std::vector<double> sq(nz_);

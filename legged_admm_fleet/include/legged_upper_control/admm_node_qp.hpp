@@ -17,6 +17,16 @@ namespace admm {
 struct Obstacle {
     Eigen::Vector2d pos;
     double radius;
+    // Relax this obstacle's k=0 CBF row with a heavily-penalised slack. Needed ONLY for an
+    // obstacle that can appear AROUND a robot already standing there — a dead peer's keep-out.
+    // A hard row asks about the CURRENT MEASURED state ("are you outside?"), and a state that
+    // has already been measured cannot be made feasible by choosing a better action: the QP is
+    // infeasible, xi comes back non-finite, the dog stops, so it stays inside and every later
+    // cycle fails the same way. Measured 2026-07-28 (d_0728_034832): a survivor sat 1.137 m
+    // from a 1.30 m keep-out and burned 68 consecutive NaN cycles, frozen for the whole run.
+    // Arena posts and walls are built with the map and can never be born violated, so they keep
+    // the hard row and their QP is unchanged, extra variable and all.
+    bool soft_k0 = false;
 };
 
 struct Wall {
@@ -106,7 +116,10 @@ private:
                     bool drop_hard);
     Out out_from_res_(const OsqpProblem::Result& res) const;
 
-    int n_xi_, n_soft_per_, n_slack_, nvar_, nrow_;
+    // n_slack_ = n_soft_rows_ (the k=1..N-2 relaxations) + one per soft_k0 obstacle. Split out
+    // because r_snn_ sits after the SOFT ROWS, not after every slack: the k=0 relaxations borrow
+    // the existing hard rows instead of adding new ones.
+    int n_xi_, n_soft_per_, n_soft_rows_, n_slack_, nvar_, nrow_;
     int r_dyn_, r_vb_, r_ab_, r_hard_, r_soft_, r_snn_;
     std::vector<Obstacle> obstacles_;
     std::vector<Wall> walls_;

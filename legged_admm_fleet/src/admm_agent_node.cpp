@@ -221,9 +221,16 @@ private:
     bool ready() {
         // size guard: during the WBC activation race the observation can arrive with a
         // short/empty state vector; indexing it (BASE_PX=6, BASE_YAW=9) would be UB.
+        // Throttled, not silent: this branch stops the worker dead (no cycle, no broadcast) and
+        // used to leave no trace, so "the agent just went quiet" had no entry point in the log.
         if (!(has_obs_ && has_odom_ && has_goal_ && obs_.time != 0.0 &&
-              obs_.state.value.size() >= 24))
+              obs_.state.value.size() >= 24)) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "[agent%d] not ready: obs=%d odom=%d goal=%d t_obs=%.3f nstate=%zu",
+                                 self_id_, int(has_obs_), int(has_odom_), int(has_goal_),
+                                 obs_.time, obs_.state.value.size());
             return false;
+        }
         // FRESHNESS, not just "has arrived once". has_obs_/has_odom_ latch true forever, so a dog
         // whose controller dies (WBC deactivation, controller crash) would keep stepping on its
         // last frozen observation and keep broadcasting AgentState from a position it can no
@@ -347,21 +354,38 @@ private:
         // path_ (single worker thread), so no lock. Mirrors centralized waypoints()/goalCb.
         Eigen::MatrixX2d wp;
         if (planner_ && (goal - path_goal_).norm() > 1e-6) {
-            const auto rg = planner_->find_reachable_goal(P0, goal);
-            // Silent fallback to a straight line was the failure mode behind "the dog just
-            // freezes": the line crosses a keep-out, the CBF linearizes to l>u and the QP
-            // dies every cycle with nothing in the log pointing at the planner.
-            if (rg.path.empty())
-                RCLCPP_WARN(get_logger(),
-                            "[agent%d] A* found NO path to (%.2f,%.2f) from (%.2f,%.2f) — "
-                            "falling back to STRAIGHT LINE (may cross a keep-out)",
-                            self_id_, goal[0], goal[1], P0[0], P0[1]);
-            path_ = rg.path.empty() ? std::vector<Eigen::Vector2d>{P0, goal} : rg.path;
-            path_goal_ = goal;
+            // Ask the planner only about ground it has a map for. A goal outside the map lands
+            // on a grid cell outside the array, and nearest_free_candidates only spirals 20
+            // cells (3 m) around it, so anything further out returns NO candidates — measured
+            // live: a return goal at x=-5 against x_min=-2 produced 68 empty plans, a straight
+            // line through the corpse keep-out, and 0.513 m of separation (contact is 0.867).
+            const Eigen::Vector2d qgoal(clip(goal[0], planner_->x_min(), planner_->x_max()),
+                                        clip(goal[1], planner_->y_min(), planner_->y_max()));
+            const auto rg = planner_->find_reachable_goal(P0, qgoal);
+            if (rg.path.empty()) {
+                // FAIL-SAFE, not a straight line: the line is exactly what crosses a keep-out,
+                // linearizes the CBF to l>u and kills the QP. Keep the last valid route (still
+                // an obstacle-free corridor) and DON'T latch path_goal_, so the next cycle
+                // retries. A stopped dog is a safe failure; a dog steered blind is not.
+                RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+                                      "[agent%d] A* found NO path to (%.2f,%.2f) from (%.2f,%.2f)"
+                                      " — HOLDING (no straight-line fallback)",
+                                      self_id_, qgoal[0], qgoal[1], P0[0], P0[1]);
+            } else {
+                path_ = rg.path;
+                // Beyond the map edge there is nothing known to route around, so the final leg
+                // to a clamped-away goal is an honest straight line.
+                if ((qgoal - goal).squaredNorm() > 1e-12) path_.push_back(goal);
+                path_goal_ = goal;
+            }
         }
-        if (planner_ && !path_.empty()) {
-            wp.resize(static_cast<int>(path_.size()), 2);
-            for (int k = 0; k < wp.rows(); ++k) wp.row(k) = path_[k].transpose();
+        if (planner_) {
+            // No route yet (first goal unplannable) -> stand still. Degenerate two-point
+            // polylines are handled in build_reference (guarded 2026-07-25).
+            const std::vector<Eigen::Vector2d> hold{P0, P0};
+            const auto& src = path_.empty() ? hold : path_;
+            wp.resize(static_cast<int>(src.size()), 2);
+            for (int k = 0; k < wp.rows(); ++k) wp.row(k) = src[k].transpose();
         } else {
             wp.resize(2, 2);
             wp.row(0) = P0.transpose();
@@ -395,11 +419,27 @@ private:
                                  "QP not converged: %lu solve(s) this cycle accepted with "
                                  "osqp status_val=%d (no feasibility guarantee)",
                                  qh.n_nonconverged, qh.last_status_val);
+        // Warm start thrown away? Say so. has_prev() gates eviction arming, so a silent clear
+        // used to turn into "this agent never evicts anyone" with nothing in the log to explain it.
+        if (res.warm_cleared != admm::StepResult::kWarmKept)
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                                 "[agent%d] warm start dropped (%s) — cold-starting consensus",
+                                 self_id_,
+                                 res.warm_cleared == admm::StepResult::kWarmNaN
+                                     ? "non-finite xi" : "peer announced reset");
         if (res.hold || !res.xi.allFinite()) {
             if (res.hold) maybeEvict(slot);
             publishStats(slot, res, t_cycle_wall);
             return;
         }
+        // Bring-up grace is satisfied HERE — one cycle that actually solved — and never again.
+        // It used to be tested inside maybeEvict as has_prev(), which is reachable only on the
+        // HOLD path and is cleared by a NaN or a peer's reset announcement. Those clears are
+        // exactly what a dying peer causes, and once a peer is gone every later cycle is a
+        // barrier HOLD, so has_prev() can never come back: the fleet waits forever for the dead
+        // dog it is not allowed to evict. Measured 2026-07-28 (d_0728_045133): 51 straight
+        // "NOT ARMED", peer silent 370 slots, zero evictions, run dead.
+        evict_armed_ = true;
 
         // ADAPT: translate xi to estimator frame, build 24-D target, yaw latch, publish.
         Eigen::VectorXd xi_mpc = res.xi;
@@ -476,15 +516,27 @@ private:
     // pairwise CBF safety. Rejoin is NOT supported (a returning peer stays ignored).
     // Runs on the worker thread only (same thread as cycle()), so no locking needed.
     void maybeEvict(std::uint64_t slot) {
-        if (evict_after_ <= 0 || dogs_.size() < 2) return;
+        if (evict_after_ <= 0 || dogs_.size() < 2) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "[agent%d] evict OFF: evict_after=%d dogs=%zu",
+                                 self_id_, evict_after_, dogs_.size());
+            return;
+        }
         // Bring-up grace: don't evict anyone until this agent has completed one good cycle, so a
-        // slow discovery at startup is never mistaken for a death. LATCHED, because has_prev() is
-        // cleared by every rebuild — re-requiring it after an eviction deadlocks the fleet when a
-        // second peer dies inside the cold-start window: the barrier waits for the dead peer, HOLDs
-        // forever, and this guard blocks the very eviction that would end the wait.
-        if (agent_->has_prev()) evict_armed_ = true;
-        if (!evict_armed_) return;
+        // slow discovery at startup is never mistaken for a death. Armed in cycle() on the SOLVED
+        // path and latched there — never re-derived here from has_prev(), which a dying peer
+        // clears and a missing peer prevents from ever returning (see cycle()).
         const auto seen = transport_->last_seen();
+        if (!evict_armed_) {
+            std::string s;
+            for (const auto& kv : seen)
+                s += " " + std::to_string(kv.first) + ":" + std::to_string(kv.second);
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                                 "[agent%d] evict NOT ARMED (no solved cycle yet) at slot %lu; last_seen%s",
+                                 self_id_, static_cast<unsigned long>(slot),
+                                 s.empty() ? " (none)" : s.c_str());
+            return;
+        }
         std::vector<int> dead;
         std::map<int, std::uint64_t> silent;  // per-dead-peer missing-slot count (log)
         for (int j : dogs_) {
@@ -496,7 +548,20 @@ private:
                 silent[j] = slot - last;
             }
         }
-        if (dead.empty()) return;
+        if (dead.empty()) {  // holding, but nobody is silent long enough yet — show the counters
+            std::string s;
+            for (int j : dogs_) {
+                if (j == self_id_) continue;
+                const auto it = seen.find(j);
+                s += " " + std::to_string(j) + ":" +
+                     (it == seen.end() ? std::string("never")
+                                       : std::to_string(slot > it->second ? slot - it->second : 0));
+            }
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                                 "[agent%d] HOLD at slot %lu, nobody dead yet (need %d); silent%s",
+                                 self_id_, static_cast<unsigned long>(slot), evict_after_, s.c_str());
+            return;
+        }
         // corpse -> static CBF obstacle. NOT at the kill-time position: the dead dog's
         // lower layer keeps executing its last published trajectory and walks up to ~1 m
         // further before parking (verified live 2026-07-23: ghost at 3.48, body at 4.63,
@@ -528,6 +593,11 @@ private:
             admm::Obstacle o;
             o.pos = kp->pos;
             o.radius = kp->radius;
+            // The one obstacle kind that can be born already violated: it materialises around
+            // wherever the survivors happen to be standing, and the dead peer's body kept
+            // walking toward them during the silence window while their pairwise constraint was
+            // running on frozen data. Hard at k=0 would mean "infeasible, forever". See Obstacle.
+            o.soft_k0 = true;
             corpses_[j].push_back(o);
             RCLCPP_WARN(get_logger(),
                         "[agent%d] EVICT robot%d (silent %lu slots) — corpse CBF at predicted rest (%.2f,%.2f) r=%.2f (last seen (%.2f,%.2f))",

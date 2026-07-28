@@ -9,6 +9,7 @@
 #include <iostream>
 
 #include "legged_upper_control/admm_constants.hpp"
+#include "legged_upper_control/admm_node_qp.hpp"
 #include "legged_upper_control/fleet_config.hpp"
 
 using namespace admm;
@@ -61,6 +62,42 @@ int main() {
     {
         const auto k = corpse_keepout(Eigen::Vector4d(0, 0, 0, 0), plan_at(1, 1), /*margin=*/9.0);
         assert(k && k->radius >= 0.10);
+    }
+    // 7. THE QP, not just the geometry: a keep-out that is born around a robot already inside it.
+    //    Live numbers from d_0728_034832 — corpse anchor to survivor 1.137 m against an effective
+    //    1.30 m. That run produced 68 consecutive non-finite solves and never moved again.
+    {
+        const double r = std::max(0.10, D_MIN - kMargin);  // 0.70, what corpse_keepout hands over
+        const double d0 = 1.137;                           // inside: 1.137 < r + kMargin = 1.30
+        Eigen::VectorXd x_now(4);
+        x_now << d0, 0.0, 0.0, 0.0;
+        Eigen::MatrixXd x_des(N, 2);  // reference pulls ACROSS the corpse, as a route home does
+        for (int k = 0; k < N; ++k) {
+            x_des(k, 0) = d0 - 0.05 * (k + 1);
+            x_des(k, 1) = 0.0;
+        }
+        auto solve_with = [&](bool soft_k0) {
+            std::vector<Obstacle> obs(1);
+            obs[0].pos = Eigen::Vector2d::Zero();
+            obs[0].radius = r;
+            obs[0].soft_k0 = soft_k0;
+            NodeSubproblem p(obs, {}, kMargin);
+            return p.solve(x_now, x_des, nullptr, nullptr, nullptr);
+        };
+        const auto hard = solve_with(false);
+        const auto soft = solve_with(true);
+        // Pin the failure this flag exists to prevent, so it cannot quietly come back: with the
+        // row hard, this exact geometry has NO solution and the dog is frozen for good.
+        assert(!hard.finite);
+        // the escape must exist and stay finite — this is the whole point
+        assert(soft.finite);
+        // ...and it must push OUTWARD, not merely return numbers: the first predicted step has to
+        // gain ground on the keep-out it is standing in.
+        assert(soft.x_pred(0, 0) > d0);
+        // exactly one extra variable, and only when asked. Arena posts keep the old QP.
+        assert(soft.xi.size() == hard.xi.size() + 1);
+        std::cout << "  case 7: hard finite=" << hard.finite << " soft finite=" << soft.finite
+                  << " first step " << d0 << " -> " << soft.x_pred(0, 0) << "\n";
     }
     std::cout << "test_corpse_keepout: all cases passed\n";
     return 0;

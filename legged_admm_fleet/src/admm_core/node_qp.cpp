@@ -7,6 +7,13 @@ namespace admm {
 
 namespace {
 constexpr double kInf = std::numeric_limits<double>::infinity();
+// Price of relaxing a k=0 CBF row, as a multiple of the existing slack weight so it keeps its
+// meaning if the weights are ever retuned. It has to beat that row's dual price for the L1
+// penalty to be exact (see q_); with q_pos=10 over metre-scale errors the objective itself is
+// O(1e2), so 1e4 x w_pred is orders clear. It is a PRICE, not a guarantee — the check that it
+// is high enough is empirical: phys_gap_logger.py must show no run below the 0.867 m contact
+// line. Raise it if a run ever buys keep-out it did not have to.
+constexpr double K0_SLACK_SCALE = 1.0e4;
 }
 
 double h_obstacle(const Eigen::Vector2d& p, const Eigen::Vector2d& p_obs, double r_eff) {
@@ -37,7 +44,10 @@ NodeSubproblem::NodeSubproblem(std::vector<Obstacle> obstacles, std::vector<Wall
       n_neighbors_(n_neighbors) {
     const int n_feat = static_cast<int>(obstacles_.size() + walls_.size());
     n_soft_per_ = N_ - 2;
-    n_slack_ = n_feat * n_soft_per_;
+    n_soft_rows_ = n_feat * n_soft_per_;
+    int n_k0 = 0;
+    for (const Obstacle& o : obstacles_) n_k0 += o.soft_k0 ? 1 : 0;
+    n_slack_ = n_soft_rows_ + n_k0;
     nvar_ = n_xi_ + n_slack_;
 
     r_dyn_ = 0;
@@ -45,7 +55,7 @@ NodeSubproblem::NodeSubproblem(std::vector<Obstacle> obstacles, std::vector<Wall
     r_ab_ = r_vb_ + 2 * N_;
     r_hard_ = r_ab_ + 2 * N_;
     r_soft_ = r_hard_ + n_feat;
-    r_snn_ = r_soft_ + n_slack_;
+    r_snn_ = r_soft_ + n_soft_rows_;
     nrow_ = r_snn_ + n_slack_;
 
     build_fixed_();
@@ -104,8 +114,13 @@ void NodeSubproblem::build_fixed_() {
         put(r_snn_ + j, n_xi_ + j, 1.0);
         lo_base_[r_snn_ + j] = 0.0;
         up_base_[r_snn_ + j] = kInf;
-        put(r_soft_ + j, n_xi_ + j, -1.0);
+        if (j < n_soft_rows_) put(r_soft_ + j, n_xi_ + j, -1.0);
     }
+    // ... and into the HARD row of each soft_k0 obstacle. No new row: the k=0 constraint keeps
+    // its place in the layout and merely gains a way to be violated at a price.
+    int k0 = n_soft_rows_;
+    for (int f = 0; f < static_cast<int>(obstacles_.size()); ++f)
+        if (obstacles_[f].soft_k0) put(r_hard_ + f, n_xi_ + k0++, -1.0);
     n_fixed_trips_ = trips_.size();
 }
 
@@ -180,6 +195,12 @@ std::vector<double> NodeSubproblem::q_(const Eigen::MatrixXd& x_des,
             q[px_index(k, N)] += w_form_ * (*formation_grad)(k - 1, 0);
             q[py_index(k, N)] += w_form_ * (*formation_grad)(k - 1, 1);
         }
+    // L1 (exact) penalty on the k=0 relaxations, on purpose. A quadratic-only penalty always
+    // leaves s* = lambda/(2w) > 0 whenever the row is active, i.e. the solver would buy a sliver
+    // of keep-out every time it is worth anything at all. A linear term larger than the row's
+    // dual price makes s* EXACTLY 0 while the constraint is satisfiable, so this stays a
+    // last-resort escape from an already-violated state rather than a discount on safety.
+    for (int j = n_soft_rows_; j < n_slack_; ++j) q[n_xi_ + j] += w_pred_ * K0_SLACK_SCALE;
     return q;
 }
 

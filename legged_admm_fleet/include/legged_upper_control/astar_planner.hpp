@@ -75,6 +75,17 @@ public:
     int ny() const { return ny_; }
     const std::vector<uint8_t>& omap() const { return omap_; }
 
+    // Map extent, so a caller can clamp an out-of-map goal instead of getting an empty path.
+    // nearest_free_candidates only spirals 20 cells (3 m at res 0.15) around the goal cell, so
+    // a goal further outside than that finds nothing and every route silently became a straight
+    // line (measured: a return goal at x=-5 with x_min=-2 drove a survivor through a corpse
+    // keep-out at 0.513 m). Read-only; keeping the bounds here is what stops the node from
+    // caching a copy that drifts when the planner is rebuilt.
+    double x_min() const { return x_min_; }
+    double x_max() const { return x_max_; }
+    double y_min() const { return y_min_; }
+    double y_max() const { return y_max_; }
+
 private:
     std::pair<int, int> w2g(double x, double y) const;
     Eigen::Vector2d g2w(int ix, int iy) const;

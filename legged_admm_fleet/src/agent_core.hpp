@@ -75,6 +75,12 @@ struct StepResult {
     int n_timeouts = 0;              // per-hop recv deadline misses observed this cycle
     double t_node = 0.0;             // total node-QP solve time this cycle (s)
     double t_edge_solve = 0.0;       // total owned edge-QP solve time this cycle (s)
+    // Why the warm start was thrown away THIS cycle, so the node layer can say so out loud.
+    // Both clears used to be silent, which is what made the victim3 stall unexplainable from
+    // the log: has_prev() gates eviction arming, and nothing recorded that it had gone false.
+    // Output only; AgentCore stays ROS-free, the caller does the logging.
+    enum WarmCleared { kWarmKept = 0, kWarmNaN = 1, kWarmPeerReset = 2 };
+    int warm_cleared = kWarmKept;
 };
 
 // Transport: send is fire-and-forget; recv blocks until the matching message(s) arrive.
