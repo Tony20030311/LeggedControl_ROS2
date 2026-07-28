@@ -186,13 +186,30 @@ if [ -n "${LIE:-}" ]; then
   # the first scripted run of this scenario died at "inject_fake_offset failed").
   ros2 daemon stop >/dev/null 2>&1; sleep 2
   timeout 12 ros2 param set /admm_agent_$VICTIM detection_log_only false >/dev/null 2>&1
+  # DEAF as well as lying (LIE_DEAF=1, the default). A liar that still runs its own avoidance is
+  # a "cooperative liar": the separation that survives is then partly ITS doing, and the demo
+  # cannot claim the survivors kept themselves safe. Dropping all its incoming peer states makes
+  # it genuinely non-cooperative — it times out, evicts everyone, and walks solo to its goal.
+  if [ "${LIE_DEAF:-1}" = 1 ]; then
+    timeout 12 ros2 param set /admm_agent_$VICTIM inject_drop_p 1.0 >/dev/null 2>&1 \
+      || die "could not deafen the liar"
+  fi
   timeout 12 ros2 param set /admm_agent_$VICTIM inject_fake_offset "$LIE" \
     || die "inject_fake_offset failed (is the param declared?)"
   # arm the DETECTORS on the survivors, not on the liar
-  for j in $SURVIVORS; do
-    timeout 12 ros2 param set /admm_agent_$j detection_log_only false >/dev/null 2>&1 \
-      || die "could not arm Gate 2 on agent$j"
-  done
+  # LIE_LOGONLY=1 is the COUNTERFACTUAL arm: the survivors still compute the residual and log
+  # it, but they never block, so the lie reaches the consensus and the CBF. Both arms therefore
+  # have identical code, identical logging and one difference — whether the verdict is acted on.
+  # That is what separates "detection worked" from "the CBF would have avoided it anyway": with
+  # the lie accepted, the survivors keep 1.3 m from a GHOST and close on the real body.
+  if [ "${LIE_LOGONLY:-0}" = 1 ]; then
+    say "COUNTERFACTUAL arm: Gate 2 detects but does NOT block (detection_log_only stays true)"
+  else
+    for j in $SURVIVORS; do
+      timeout 12 ros2 param set /admm_agent_$j detection_log_only false >/dev/null 2>&1 \
+        || die "could not arm Gate 2 on agent$j"
+    done
+  fi
   # walk it at the survivors' centroid
   # transient_local + a short burst: same discovery-race lesson as send_formation_goal.
   timeout 8 ros2 topic pub -r 5 --qos-durability transient_local \
