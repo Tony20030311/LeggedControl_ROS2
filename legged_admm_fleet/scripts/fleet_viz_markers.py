@@ -8,15 +8,15 @@
 # when a robot starts broadcasting a position 2.8 m from where it stands, so Gazebo footage shows
 # only the survivors swerving for no visible reason. The three markers here are that missing half:
 #
-#   ghost      a translucent body at the position the robot BROADCASTS. While it is honest this
-#              sits exactly on the real one and reads as a tint; the moment it lies, the ghost
-#              detaches and walks away on its own. Nobody has to be told which robot is lying.
-#   evidence   a line from the real body to the ghost. Its LENGTH is literally the quantity
-#              Gate 2 thresholds on, so the detector's input is on screen, not just its verdict.
-#              Green under the gate, red over it.
-#   status     OK / SUSPECT / EVICTED, from the same majority-of-member-views rule the
-#              coordinator uses (admm::majority_excluded) — so the label cannot disagree with
-#              what the fleet actually did.
+#   ghost      a TRANSLUCENT COPY OF THE ROBOT ITSELF at the position it broadcasts. Same mesh,
+#              same yaw. While it is honest the copy sits on the real one and reads as a tint;
+#              the moment it lies, a second see-through dog walks away on its own. Two identical
+#              dogs in two places needs no caption — an abstract cylinder plus a line did (and
+#              was reported unreadable on 2026-07-29, which is why they are gone).
+#   status     OK / SUSPECT <residual> / EVICTED. The number lives here rather than in a line
+#              whose length the viewer has to estimate. EVICTED comes from the same
+#              majority-of-member-views rule the coordinator uses (admm::majority_excluded), so
+#              the label cannot disagree with what the fleet actually did.
 #
 # Deliberately NOT drawn: the keep-out circle. It only exists after an eviction and its anchor
 # differs by arm (odom when the lie was caught, the claim when the peer merely quit), so a naive
@@ -46,7 +46,11 @@ from gen_arena_world import ARENAS  # noqa: E402  single source of truth for are
 BASE_PX, BASE_PY = 6, 7   # admm_motion_adapter.hpp: 24-D state base position indices
 H = 1.0                   # obstacle height (matches gen_arena_world H)
 POST_R = 0.15             # door jamb posts -> hidden in RViz (kept everywhere else)
-BODY_R = 0.433            # half the 0.867 m contact distance; the ghost is drawn body-sized
+BODY_R = 0.433            # half the 0.867 m contact distance
+# The ghost is the robot's OWN base mesh — the same file the RobotModel display loads, so the
+# copy is pixel-identical to the real dog and reads as "that dog, over there" rather than as a
+# new object. package:// resolves because vision60_description is already on the search path.
+GHOST_MESH = "package://vision60_description/meshes/vision60/base.stl"
 GATE = 0.5                # odom_residual_gate default (admm_agent_node) — colours the evidence
 PALETTE = [(0.9, 0.1, 0.1), (0.1, 0.8, 0.1), (0.2, 0.4, 0.95),
            (0.1, 0.8, 0.8), (0.9, 0.2, 0.9), (0.9, 0.8, 0.1)]
@@ -74,7 +78,8 @@ class FleetViz(Node):
         # the decision. Redrawn on a timer rather than per message: three robots x two topics is
         # ~60 Hz of callbacks and RViz only needs to see the current state.
         self.truth_pub = self.create_publisher(MarkerArray, "/fleet_viz/truth", 10)
-        self.claim, self.body, self.views = {}, {}, {}
+        self.claim, self.body, self.views, self.yaw = {}, {}, {}, {}
+        self.n_pub = 0
         for r in robots:
             self.create_subscription(AgentState, f"/robot{r}/admm/state",
                                      lambda m, r=r: self.on_state(r, m), 10)
@@ -88,6 +93,9 @@ class FleetViz(Node):
 
     def on_odom(self, r, m):
         self.body[r] = (float(m.pose.pose.position.x), float(m.pose.pose.position.y))
+        # The ghost wears the real yaw: it is claiming to be THIS robot, so a copy facing a
+        # different way would read as a second, unrelated dog rather than as the same one.
+        self.yaw[r] = (float(m.pose.pose.orientation.z), float(m.pose.pose.orientation.w))
 
     def evicted(self, i):
         """Majority of the OTHER robots' rosters exclude i — the coordinator's rule verbatim.
@@ -122,35 +130,40 @@ class FleetViz(Node):
             resid = math.hypot(claim[0] - body[0], claim[1] - body[1])
             hot = resid > GATE
 
-            g = base("ghost", r, Marker.CYLINDER)
-            g.pose.position.x, g.pose.position.y, g.pose.position.z = claim[0], claim[1], 0.30
-            g.scale.x = g.scale.y = 2.0 * BODY_R; g.scale.z = 0.55
+            g = base("ghost", r, Marker.MESH_RESOURCE)
+            g.mesh_resource = GHOST_MESH
+            g.pose.position.x, g.pose.position.y, g.pose.position.z = claim[0], claim[1], 0.0
+            qz, qw = self.yaw.get(r, (0.0, 1.0))
+            g.pose.orientation.z, g.pose.orientation.w = qz, qw
+            g.scale.x = g.scale.y = g.scale.z = 1.0
             # Barely there while it coincides with the body, unmistakable once it detaches.
-            g.color.r, g.color.g, g.color.b = (0.95, 0.25, 0.25) if hot else (0.35, 0.55, 0.95)
-            g.color.a = 0.55 if hot else 0.22
+            g.color.r, g.color.g, g.color.b = (0.95, 0.25, 0.25) if hot else (0.4, 0.6, 0.95)
+            g.color.a = 0.60 if hot else 0.18
             arr.markers.append(g)
-
-            e = base("evidence", r, Marker.LINE_STRIP)
-            e.scale.x = 0.06 if hot else 0.03
-            e.color.r, e.color.g, e.color.b = (0.95, 0.15, 0.15) if hot else (0.3, 0.8, 0.3)
-            e.color.a = 0.95 if hot else 0.35
-            e.points = [Point(x=body[0], y=body[1], z=0.30),
-                        Point(x=claim[0], y=claim[1], z=0.30)]
-            arr.markers.append(e)
 
             t = base("status", r, Marker.TEXT_VIEW_FACING)
             t.pose.position.x, t.pose.position.y, t.pose.position.z = body[0], body[1], 1.05
             t.scale.z = 0.35
             if self.evicted(r):
-                t.text, rgb = f"robot{r} EVICTED", (0.95, 0.15, 0.15)
+                t.text, rgb = f"robot{r}  EVICTED", (0.95, 0.15, 0.15)
             elif hot:
-                t.text, rgb = f"robot{r} SUSPECT  r={resid:.2f} m", (0.98, 0.65, 0.1)
+                # The number that used to be a line length. A viewer can read 2.83 m; nobody can
+                # estimate it off a line seen at an angle in a 3D view.
+                t.text, rgb = f"robot{r}  LYING by {resid:.2f} m", (0.98, 0.6, 0.1)
             else:
-                t.text, rgb = f"robot{r} OK", (0.85, 0.85, 0.85)
+                t.text, rgb = f"robot{r}  OK", (0.85, 0.85, 0.85)
             t.color.r, t.color.g, t.color.b = rgb
             t.color.a = 1.0
             arr.markers.append(t)
         self.truth_pub.publish(arr)
+        # Heartbeat, because the failure this node had was SILENT: it ran, wrote an empty log,
+        # and RViz showed an empty scene with the display ticked. Anything that publishes must
+        # say how much, or "nothing appeared" is indistinguishable from "nothing was wrong".
+        self.n_pub += 1
+        if self.n_pub % 100 == 1:
+            self.get_logger().info(
+                f"truth: {len(arr.markers)} markers for {len(self.body)} bodies / "
+                f"{len(self.claim)} claims (arena {len(self.arena_markers.markers)})")
 
     def build_arena(self):
         a = ARENAS.get(self.arena, {"circles": [], "rects": []})
