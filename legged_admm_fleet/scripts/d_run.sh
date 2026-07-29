@@ -363,6 +363,20 @@ if ! walk_until "$GX" "$GY" "$SURVIVORS" 60; then
 fi
 say "survivors reached the outbound goal with robot$VICTIM down"
 
+# LIE_THEN_KILL=1 — the compound scenario. A compromised robot that is caught does not politely
+# stop existing: it keeps walking, and it may later fail for real. Silencing it HERE, after the
+# fleet has already identified and fenced it, is the case neither single experiment covers —
+# the survivors have to carry a keep-out from "alive, lying, moving" through to "actually dead"
+# without the transition looking like a new fault. The corpse anchor follows odom either way,
+# so a stopped body should simply stop dragging its circle.
+if [ -n "${LIE:-}" ] && [ "${LIE_THEN_KILL:-0}" = 1 ]; then
+  say "phase 6b: SIGSTOP admm_agent_$VICTIM — the liar now goes dark for real"
+  kill -STOP "$PIDV" 2>/dev/null || say "  WARNING: SIGSTOP failed (pid $PIDV gone?)"
+  sleep 6   # let its lower layer run out the last published trajectory and park
+  read LX LY <<< "$(fleet_centroid "$VICTIM")"
+  say "  robot$VICTIM parked near ($LX,$LY); survivors must now route home around a dead body"
+fi
+
 if [ "$REJOIN" = 1 ]; then
   # ---------- phase 7: victim comes back (scenario B, needs the Phase-2 view-change) ----------
   say "phase 7: SIGCONT admm_agent_$VICTIM — expecting rejoin"
@@ -411,6 +425,33 @@ stop_recording
 # clean-run verdict on ALL robots, which is the right gate when the victim is a corpse — and the
 # wrong one the moment the victim is alive. See below.
 python3 "$SCRIPTS/dist_summary.py" "$LOGD/dist.csv" || DIRTY=1
+
+# DID THEY TOUCH. Every other guard in this script works on centre-to-centre distance, which was
+# measured on 2026-07-29 to read ~0.68 m high: three dogs standing undisturbed are 1.40 m apart
+# by centre and 0.717 m by surface. A run whose centres never dropped below 0.90 can still have
+# had bodies 0.07 m apart. This is the check that actually answers the question, and it applies
+# to every scenario — a clean formation run has to clear it too.
+#
+# 0.15 m, not 0: phys_gap measures the 0.83 x 0.25 base BOX, and the legs swing outside it. A
+# positive box gap therefore cannot prove the legs missed; it can only prove the bodies did.
+# Anything under 0.15 is reported as unproven rather than passed.
+if [ -s "$LOGD/phys_gap.csv" ]; then
+  GAPV=$(python3 - "$LOGD/phys_gap.csv" <<'PY'
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+print('%.4f' % min(float(r['gap_min']) for r in rows) if rows else 'nan')
+PY
+)
+  case "$GAPV" in
+    nan) say "WARNING: no body-gap samples — 'did they touch' is UNANSWERED for this run" ;;
+    *)
+      [ "$(python3 -c "print(1 if $GAPV <= 0 else 0)")" = 1 ] \
+        && die "BODIES OVERLAPPED: true surface gap ${GAPV} m"
+      [ "$(python3 -c "print(1 if $GAPV < 0.15 else 0)")" = 1 ] \
+        && say "WARNING: closest body surfaces ${GAPV} m — boxes cleared, LEGS NOT PROVEN CLEAR"
+      ;;
+  esac
+fi
 if [ -n "${LIE:-}" ]; then
   # LIE scenario: the "victim" is alive, deaf, and deliberately steered INTO the fleet. How close
   # its body gets is a measure of how hard the ATTACKER pushed, not of whether the defence held,
