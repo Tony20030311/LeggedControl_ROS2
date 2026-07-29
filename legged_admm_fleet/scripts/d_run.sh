@@ -168,10 +168,21 @@ fi
 # fleet_viz_markers.py draws the missing half (ghost / evidence line / status) and RViz is the
 # only place those live. rviz2 gets its OWN Xvfb (:98, software GL) so it never fights the gz
 # GUI on :99; ffmpeg x11grabs :98.
+# TRUE body clearance, not centre distance. dist.csv logs centre-to-centre against an isotropic
+# 0.867 m "contact line" (2 x the corner envelope), which answers a different question from the
+# one everybody actually asks about this scenario — did the bodies touch. This uses each dog's
+# real yaw and the 0.83 x 0.25 m base box, so a near-miss is reported as the surface gap it is.
+# The empty third arg is load-bearing: argv[3] is the optional "x,y;x,y" pile list, so passing
+# --ros-args straight into that slot makes the logger die on startup parsing it as coordinates —
+# silently, because it is backgrounded and only the summary line at the end goes missing.
+setsid python3 $SCRIPTS/phys_gap_logger.py "$ROBOTS" "$LOGD/phys_gap.csv" "" \
+  --ros-args -p use_sim_time:=true >"$LOGD/phys_gap.log" 2>&1 &
+PHYSPID=$!
+
 RVIZPID=""; RVGRABPID=""; VIZPID=""
 # Without this, a `die` anywhere below leaves rviz2, the x11grab and the marker node running —
 # they outlive the script, hold :98, and the next run's capture fails for no visible reason.
-trap 'kill -9 $RVIZPID $RVGRABPID $VIZPID $RECPID $BRPID 2>/dev/null' EXIT
+trap 'kill -9 $RVIZPID $RVGRABPID $VIZPID $RECPID $BRPID $PHYSPID 2>/dev/null' EXIT
 if [ "${RVIZ:-0}" = 1 ]; then
   say "recording RViz -> rviz.mp4"
   RVIZ_CFG=$WS/src/legged_fleet/legged_admm_fleet/rviz/fleet.rviz
@@ -414,6 +425,25 @@ if [ -n "${LIE:-}" ]; then
   [ "$(python3 -c "print(1 if $SVMIN<$DMIN_ABORT else 0)")" = 1 ] \
     && die "survivors closed to $SVMIN < $DMIN_ABORT — survivors collided, a real failure"
   say "RESULT: survivors held ${SVMIN} m from each other; the compromised body reached $(pair_among $ROBOTS) m"
+  # Centre distance is a proxy. This is the number to quote when someone asks whether they
+  # touched: <= 0 means the base boxes overlapped, full stop.
+  if [ -s "$LOGD/phys_gap.csv" ]; then
+    say "TRUE BODY GAP (surface-to-surface, real yaw): $(python3 -c "
+import csv
+rows = list(csv.DictReader(open('$LOGD/phys_gap.csv')))
+if not rows:
+    print('no data')
+else:
+    # Per pair, not just the overall worst: 'they nearly touched' means something different when
+    # it is the liar closing on a survivor than when it is the two survivors squeezing past a peg.
+    pairs = [c for c in rows[0] if c.startswith('gap_') and c != 'gap_min']
+    parts = ['%s %.3f' % (p.replace('gap_', 'r').replace('_', '-r'), min(float(r[p]) for r in rows))
+             for p in pairs]
+    worst = min(float(r['gap_min']) for r in rows)
+    print('%.3f m worst  [%s]%s' % (worst, '  '.join(parts),
+                                    '  *** BODIES OVERLAPPED ***' if worst <= 0 else ''))
+" 2>/dev/null || echo "unreadable")"
+  fi
 elif [ -n "${DIRTY:-}" ]; then
   die "separation was not clean (see dist_summary above) — PASS not claimable"
 fi

@@ -56,7 +56,16 @@ struct CorpseKeepout {
 // node evicted for broadcasting lies keeps walking). 2 slots — one to see its new odom, one to
 // act on it. Lives here, not in admm_constants.hpp: it is failure-semantics geometry, and no
 // barrier, QP or oracle-pinned number depends on it.
-inline constexpr double TAU_REACT = 0.2;
+// 0.2 was the bare minimum — one slot to see the new odom, one to act — and it showed. Measured
+// 2026-07-29 in plum with detection ON: the liar's real body still closed to 0.920 m against a
+// 0.867 m contact line, and sat inside D_MIN for 15.6 s, because the survivors merely routed
+// politely around it while walking their own goal. This is a REACTION BUDGET, not a safety
+// margin: a peer that cooperates with nobody keeps moving while we notice and turn, so budgeting
+// 0.6 s of its travel (0.55 m/s -> 0.33 m of extra radius) buys the push that makes it back off.
+// Ceiling is geometric, not numerical: radius + robot_margin + post clearance must still fit a
+// corridor. At 0.6 that is 1.63 + 0.90 = 2.53 m, which closes plum's tightest 2.296 m diagonal
+// but leaves the 2.94 m in-row route the survivors already take.
+inline constexpr double TAU_REACT = 0.6;
 // mobile=true when the peer was evicted for LYING rather than for going silent: it is still
 // walking, and unlike a corpse it is not cooperating with anyone's CBF. The extra radius is the
 // distance it can cover while this agent reacts — the worst case is absorbed into the geometry

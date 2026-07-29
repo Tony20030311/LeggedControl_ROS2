@@ -51,6 +51,20 @@ int main() {
         const auto k = corpse_keepout(Eigen::Vector4d(1, 2, 0, 0), plan_at(3, 4), kMargin);
         assert(k && std::abs((k->radius + kMargin) - D_MIN) < 1e-12);
     }
+    // 2b. a MOBILE corpse is held further off, and by exactly one reaction budget. The mobile
+    //     branch had no test at all, so TAU_REACT could be retuned — it is the knob for how hard
+    //     the fleet backs away from a peer that cooperates with nobody — with nothing asserting
+    //     what it buys. Pin the relationship, not the number: the constant is meant to be tuned.
+    {
+        const auto still = corpse_keepout(Eigen::Vector4d(1, 2, 0, 0), plan_at(3, 4), kMargin);
+        const auto walking = corpse_keepout(Eigen::Vector4d(1, 2, 0, 0), plan_at(3, 4), kMargin,
+                                            /*mobile=*/true);
+        assert(still && walking);
+        assert(std::abs((walking->radius - still->radius) - MAX_VX * TAU_REACT) < 1e-12
+               && "a mobile corpse must be fenced by exactly MAX_VX * TAU_REACT more");
+        // And the budget has to be worth something, or the mobile case is decoration.
+        assert(walking->radius > still->radius + 0.05);
+    }
     // 3. NaN in the plan must NOT propagate: a NaN centre poisons every survivor's node QP and
     //    freezes the fleet. Fall back to the last reported state.
     {
