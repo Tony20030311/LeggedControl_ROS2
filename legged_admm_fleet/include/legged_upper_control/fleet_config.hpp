@@ -6,6 +6,7 @@
 // (test_cpp_parity.py test_c6_fleet_*).
 #include <Eigen/Dense>
 
+#include <algorithm>
 #include <cstddef>
 #include <map>
 #include <optional>
@@ -99,6 +100,32 @@ inline std::string shape_for(std::size_t n_live, std::size_t n_full,
     if (n_live == n_full) return full_shape;
     if (n_live == 2) return "COL2";  // column: minimal lateral footprint for narrow gaps
     return "";                       // 1 live robot has no shape; ditto anything unsupported
+}
+
+// Has a MAJORITY of the OTHER agents dropped robot `i` from their roster? `views` maps each
+// robot to the member list it last broadcast (AgentState.members).
+//
+// The coordinator needs this because heartbeat liveness cannot see an eviction: an agent the
+// fleet has blocked keeps broadcasting and reads as alive forever, so it goes on being handed
+// formation slots (measured 2026-07-28 — agents saw 2 dogs, the coordinator saw 3).
+//
+// MAJORITY, not one vote, and that is the security-relevant part: a compromised robot
+// broadcasting a roster of only itself excludes every honest dog at once, so a single-vote rule
+// would let one attacker delete the honest fleet from the coordinator's view and keep the
+// formation to itself. At n=3 the attacker musters one vote against each honest dog — never a
+// majority of the two remaining voters — while both honest dogs vote against it.
+//
+// A robot never votes on itself, and an EMPTY roster abstains rather than voting "everyone is
+// in": empty means a pre-members sender, and counting it as a voter would dilute the honest
+// majority with a robot that never had an opinion.
+inline bool majority_excluded(const std::map<int, std::vector<int>>& views, int i) {
+    int voters = 0, votes = 0;
+    for (const auto& kv : views) {
+        if (kv.first == i || kv.second.empty()) continue;
+        ++voters;
+        if (std::find(kv.second.begin(), kv.second.end(), i) == kv.second.end()) ++votes;
+    }
+    return voters > 0 && 2 * votes > voters;
 }
 
 // Permutation of slot indices minimising sum ||pos[k]-slot[perm[k]]||^2

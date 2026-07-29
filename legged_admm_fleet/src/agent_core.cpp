@@ -96,6 +96,7 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
     out.xnow = xnow_self;
     out.xibar = xibar_self;
     out.reset = (cycle_ == 0);
+    out.members = dogs_;  // who I still consider part of this fleet; see AgentState.msg
     transport_->send_state(out);
     // How far the plan we just broadcast is from where we actually are. Diagnostic only.
     const double chain_margin =

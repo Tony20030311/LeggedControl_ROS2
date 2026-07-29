@@ -22,6 +22,9 @@ GOAL_X=${GOAL_X:-3.0}
 # 0.90, not 0.95: a legitimate detour around the corpse was measured at 0.93 and 0.95 killed
 # the run. Contact is 0.867 (2x base half-diagonal 0.433).
 DMIN_ABORT=${DMIN_ABORT:-0.90}
+# Worst all-robot separation seen while LIE_LOGONLY=1 tolerated it. NOT `local` anywhere: it is
+# the counterfactual arm's headline number and has to survive walk_until returning.
+BREACH=99
 REJOIN=${REJOIN:-0}
 SURVIVORS=$(echo $ROBOTS | tr ' ' '\n' | grep -vx "$VICTIM" | tr '\n' ' ')
 
@@ -54,6 +57,41 @@ confirm_stall() {
   return "${PIPESTATUS[0]}"
 }
 
+# Worst centre distance among a SUBSET of robots, over EVERY row of dist.csv. Two departures
+# from min_pair (col 8), both deliberate:
+#   subset  — with a live, deaf attacker being steered into the fleet, the all-robot minimum
+#             measures how hard IT rammed, not whether the defence worked.
+#   history — min_pair is sampled once per ~8 s poll, so an excursion shorter than the poll
+#             slips past it; dist_summary.py carries the same warning after a plum run reached
+#             0.526 m for 4.3 s and still printed PASS. Every row, or the number is fiction.
+# `ros2 param set` is a round trip through the daemon's rebuilt node graph, and in the plum world
+# with the recorder attached it intermittently exceeds the timeout — which killed a 10-minute run
+# at the exact moment of injection (2026-07-29, "could not arm Gate 2 on agent2"). One slow
+# discovery must not decide whether the experiment happens, so retry before giving up.
+pset() {  # $1 = node, $2 = param, $3 = value
+  local i
+  for i in 1 2 3; do
+    timeout 20 ros2 param set "$1" "$2" "$3" >/dev/null 2>&1 && return 0
+    say "  param set $1 $2 failed (attempt $i/3) — retrying"
+    sleep 3
+  done
+  return 1
+}
+
+pair_among() {  # $@ = robot ids
+  python3 - "$LOGD/dist.csv" "$@" <<'PY' 2>/dev/null || echo 99
+import sys, csv, math, itertools
+rows = list(csv.DictReader(open(sys.argv[1])))
+ids = [int(a) for a in sys.argv[2:]]
+pairs = list(itertools.combinations(ids, 2))
+if not rows or not pairs:
+    print(99); sys.exit()
+print('%.4f' % min(math.hypot(float(r['x%d' % i]) - float(r['x%d' % j]),
+                              float(r['y%d' % i]) - float(r['y%d' % j]))
+                   for r in rows for i, j in pairs))
+PY
+}
+
 walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
   # `local` is load-bearing: without it this clobbered the caller's saved home coordinates and
   # the return leg became "walk to where you already are" — a PASS that tested nothing.
@@ -63,7 +101,24 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
     D=$(python3 -c "import math;print(f'{math.hypot($wx-$1, $wy-$2):.3f}')")
     M=$(min_pair)
     say "  centroid=($wx,$wy) dist=$D min_pair=$M"
-    [ "$(python3 -c "print(1 if $M<$DMIN_ABORT else 0)")" = 1 ] && die "pairwise $M < $DMIN_ABORT (collision guard)"
+    if [ "$(python3 -c "print(1 if $M<$DMIN_ABORT else 0)")" = 1 ]; then
+      if [ "${LIE_LOGONLY:-0}" = 1 ]; then
+        # THE COUNTERFACTUAL ARM IS SUPPOSED TO LOSE SEPARATION. Its survivors are fencing a
+        # ghost 2.83 m from the compromised robot's real body, so that body closing on them is
+        # the measurement this arm exists to produce (0.557 m, measured 2026-07-29) — aborting
+        # would throw away the result and leave the arm permanently reporting FAIL.
+        # What must still abort: the two SURVIVORS hitting each other. That is a real collision
+        # in any arm, and it is the exact shape of the false-positive failure this whole detector
+        # has to avoid, so it keeps the hard guard.
+        local S=$(pair_among $SURVIVORS)
+        [ "$(python3 -c "print(1 if $S<$DMIN_ABORT else 0)")" = 1 ] \
+          && die "survivor pair $S < $DMIN_ABORT — survivors collided, not the expected breach"
+        [ "$(python3 -c "print(1 if $M<$BREACH else 0)")" = 1 ] && BREACH=$M
+        say "  BREACH $M (expected: survivors hold the ghost, the real body closes in; survivors $S)"
+      else
+        die "pairwise $M < $DMIN_ABORT (collision guard)"
+      fi
+    fi
     gz_deactivated && die "WBC deactivated mid-walk"
     [ "$(python3 -c "print(1 if $D<0.45 else 0)")" = 1 ] && return 0
     # A SLOT can be inside the corpse keep-out, and then the centroid can never reach the goal.
@@ -107,7 +162,49 @@ if [ "${RECORD:-0}" = 1 ]; then
     RECPID=$!
   fi
 fi
+# ---------- optional RViz capture (RVIZ=1) ----------
+# Ported from arena_run.sh, and for this scenario it is not a nicety: a lie has no body, so the
+# overhead camera records survivors swerving away from empty ground with no visible cause.
+# fleet_viz_markers.py draws the missing half (ghost / evidence line / status) and RViz is the
+# only place those live. rviz2 gets its OWN Xvfb (:98, software GL) so it never fights the gz
+# GUI on :99; ffmpeg x11grabs :98.
+RVIZPID=""; RVGRABPID=""; VIZPID=""
+# Without this, a `die` anywhere below leaves rviz2, the x11grab and the marker node running —
+# they outlive the script, hold :98, and the next run's capture fails for no visible reason.
+trap 'kill -9 $RVIZPID $RVGRABPID $VIZPID $RECPID $BRPID 2>/dev/null' EXIT
+if [ "${RVIZ:-0}" = 1 ]; then
+  say "recording RViz -> rviz.mp4"
+  RVIZ_CFG=$WS/src/legged_fleet/legged_admm_fleet/rviz/fleet.rviz
+  # Recreate :98 at EXACTLY the grab size: a leftover :98 of another size makes x11grab fail
+  # "Invalid argument" and the whole capture silently produces nothing.
+  # A previous run's rviz2/grabber/marker node survive `die` (this script has no trap and the
+  # shared bringup cleanup does not know about them), and a stale grabber holds :98 open.
+  pkill -9 -x rviz2 2>/dev/null; pkill -9 -x ffmpeg 2>/dev/null
+  pkill -9 -f fleet_viz_markers 2>/dev/null   # comm is python3; -x cannot reach it, and this
+                                             # pattern cannot match our own `bash d_run.sh` line
+  pkill -9 -f "Xvfb :98" 2>/dev/null; sleep 1
+  Xvfb :98 -screen 0 1600x1000x24 >/tmp/xvfb98.log 2>&1 & sleep 2
+  setsid python3 $SCRIPTS/fleet_viz_markers.py "$ROBOTS" "${ARENA:-plum}" \
+    --ros-args -p use_sim_time:=true >"$LOGD/fleet_viz.log" 2>&1 &
+  VIZPID=$!
+  DISPLAY=:98 LIBGL_ALWAYS_SOFTWARE=1 QT_QPA_PLATFORM=xcb setsid \
+    rviz2 -d "$RVIZ_CFG" --ros-args -p use_sim_time:=true >"$LOGD/rviz2.log" 2>&1 &
+  RVIZPID=$!
+  sleep 15   # let rviz2 open and build the GL scene before grabbing
+  setsid ffmpeg -y -f x11grab -video_size 1600x1000 -framerate 20 -i :98 \
+    -c:v libx264 -pix_fmt yuv420p -movflags +faststart "$LOGD/rviz.mp4" \
+    >"$LOGD/rviz_grab.log" 2>&1 &
+  RVGRABPID=$!
+fi
+
 stop_recording() {
+  if [ -n "$RVGRABPID" ]; then
+    sleep 2
+    kill -INT "$RVGRABPID" 2>/dev/null; sleep 3   # SIGINT so ffmpeg writes the moov atom
+    kill -9 "$RVIZPID" "$VIZPID" 2>/dev/null
+    [ -s "$LOGD/rviz.mp4" ] && say "rviz: $LOGD/rviz.mp4 ($(du -h "$LOGD/rviz.mp4" | cut -f1))" \
+      || say "rviz: capture produced nothing — see rviz_grab.log"
+  fi
   [ -n "$RECPID" ] || return 0
   sleep 3                       # let the last few frames land
   kill -INT "$RECPID" 2>/dev/null; sleep 4   # SIGINT so cv2 VideoWriter.release() runs
@@ -184,19 +281,21 @@ if [ -n "${LIE:-}" ]; then
   # The daemon caches the node graph and goes stale across a fleet restart; a param set against
   # a stale daemon fails with no useful message. Bounce it first (measured: this is exactly why
   # the first scripted run of this scenario died at "inject_fake_offset failed").
-  ros2 daemon stop >/dev/null 2>&1; sleep 2
-  timeout 12 ros2 param set /admm_agent_$VICTIM detection_log_only false >/dev/null 2>&1
-  # DEAF as well as lying (LIE_DEAF=1, the default). A liar that still runs its own avoidance is
-  # a "cooperative liar": the separation that survives is then partly ITS doing, and the demo
-  # cannot claim the survivors kept themselves safe. Dropping all its incoming peer states makes
-  # it genuinely non-cooperative — it times out, evicts everyone, and walks solo to its goal.
-  if [ "${LIE_DEAF:-1}" = 1 ]; then
-    timeout 12 ros2 param set /admm_agent_$VICTIM inject_drop_p 1.0 >/dev/null 2>&1 \
-      || die "could not deafen the liar"
-  fi
-  timeout 12 ros2 param set /admm_agent_$VICTIM inject_fake_offset "$LIE" \
-    || die "inject_fake_offset failed (is the param declared?)"
-  # arm the DETECTORS on the survivors, not on the liar
+  ros2 daemon stop >/dev/null 2>&1; sleep 4
+  # ORDER MATTERS, and getting it wrong killed the whole scenario once. Each `ros2 param set` is
+  # a round trip and the three of them span ~4 s. Deafening FIRST gave the attacker those 4 s
+  # with no detector armed anywhere: it heard nobody, timed out, evicted both survivors, rebuilt
+  # itself solo, and a solo cold start broadcasts reset=true — which the survivors obeyed,
+  # dropping their warm start. From there nobody could ever solve again (they are cold and see a
+  # warm peer -> announce-only HOLD forever) and Gate 2, which used to run only on the solved
+  # path, never executed once (d_0728_095209: "GATE2 would" x0, run timed out).
+  #
+  # So: detectors first, then the lie, then deafness. The lie needs ~1-2 slots to cross the gate
+  # plus 3 slots to evict (~0.5 s), which comfortably beats the deafness clock (10 slots of
+  # silence, ~1 s). Winning that race is also what pins the keep-out circle to the liar's odom:
+  # the survivors block it for LYING, not for having gone quiet.
+  #
+  # arm the DETECTORS on the survivors, not on the liar.
   # LIE_LOGONLY=1 is the COUNTERFACTUAL arm: the survivors still compute the residual and log
   # it, but they never block, so the lie reaches the consensus and the CBF. Both arms therefore
   # have identical code, identical logging and one difference — whether the verdict is acted on.
@@ -206,10 +305,21 @@ if [ -n "${LIE:-}" ]; then
     say "COUNTERFACTUAL arm: Gate 2 detects but does NOT block (detection_log_only stays true)"
   else
     for j in $SURVIVORS; do
-      timeout 12 ros2 param set /admm_agent_$j detection_log_only false >/dev/null 2>&1 \
-        || die "could not arm Gate 2 on agent$j"
+      pset /admm_agent_$j detection_log_only false || die "could not arm Gate 2 on agent$j"
     done
   fi
+  pset /admm_agent_$VICTIM inject_fake_offset "$LIE" \
+    || die "inject_fake_offset failed (is the param declared?)"
+  # DEAF as well as lying (LIE_DEAF=1, the default). A liar that still runs its own avoidance is
+  # a "cooperative liar": the separation that survives is then partly ITS doing, and the demo
+  # cannot claim the survivors kept themselves safe. Dropping all its incoming peer states makes
+  # it genuinely non-cooperative — it times out, evicts everyone, and walks solo to its goal.
+  if [ "${LIE_DEAF:-1}" = 1 ]; then
+    pset /admm_agent_$VICTIM inject_drop_p 1.0 || die "could not deafen the liar"
+  fi
+  # Non-critical, and last for that reason: the victim's own detector changes nothing about the
+  # scenario (it is about to stop listening), it is here only so both arms share one config.
+  pset /admm_agent_$VICTIM detection_log_only false || true
   # walk it at the survivors' centroid
   # transient_local + a short burst: same discovery-race lesson as send_formation_goal.
   timeout 8 ros2 topic pub -r 5 --qos-durability transient_local \
@@ -286,6 +396,29 @@ NOPATH=$(count_agents "A\* found NO path")
 [ "$NOPATH" = 0 ] || say "WARNING: $NOPATH A* failure(s) — check $LOGD/admm.log"
 
 stop_recording
-python3 "$SCRIPTS/dist_summary.py" "$LOGD/dist.csv" \
-  || die "collision guard produced no data — PASS not claimable"
+# dist_summary reads every row and is the honest separation report. Its exit code is a
+# clean-run verdict on ALL robots, which is the right gate when the victim is a corpse — and the
+# wrong one the moment the victim is alive. See below.
+python3 "$SCRIPTS/dist_summary.py" "$LOGD/dist.csv" || DIRTY=1
+if [ -n "${LIE:-}" ]; then
+  # LIE scenario: the "victim" is alive, deaf, and deliberately steered INTO the fleet. How close
+  # its body gets is a measure of how hard the ATTACKER pushed, not of whether the defence held,
+  # so gating on it fails the run for the adversary's behaviour and would quietly reward a
+  # feebler attack. Measured 2026-07-29: detection ON let the real body reach 0.866 m, detection
+  # OFF 0.557 m — the defence is the 0.31 m, not an absolute floor.
+  #
+  # What the survivors DO owe us is not colliding with each other. That is the false-positive
+  # failure this whole detector exists to avoid (2026-07-28: mutual eviction, pairwise CBF gone,
+  # 0.832 m), so it stays a hard gate — over every row, not a sampled poll.
+  SVMIN=$(pair_among $SURVIVORS)
+  [ "$(python3 -c "print(1 if $SVMIN<$DMIN_ABORT else 0)")" = 1 ] \
+    && die "survivors closed to $SVMIN < $DMIN_ABORT — survivors collided, a real failure"
+  say "RESULT: survivors held ${SVMIN} m from each other; the compromised body reached $(pair_among $ROBOTS) m"
+elif [ -n "${DIRTY:-}" ]; then
+  die "separation was not clean (see dist_summary above) — PASS not claimable"
+fi
+if [ "${LIE_LOGONLY:-0}" = 1 ] && [ "$BREACH" != 99 ]; then
+  say "COUNTERFACTUAL RESULT: the accepted lie cost $BREACH m of true separation"
+  say "  (the survivors never breached D_MIN against the GHOST — only against the real body)"
+fi
 say "D PASS (rejoin=$REJOIN): victim=robot$VICTIM, evicted by $N_EVICT, home reached; logs $LOGD"

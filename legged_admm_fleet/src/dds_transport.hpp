@@ -11,6 +11,7 @@
 //
 // Keep the worker OFF the executor thread (a MultiThreadedExecutor or a dedicated spin
 // thread must service callbacks) or recv_*() will deadlock against its own subscriptions.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -119,6 +120,7 @@ public:
         for (int k = 0; k < 4; ++k) w.xnow[k] = s.xnow[k];
         w.xibar = to_std(s.xibar);
         w.reset = m.reset;
+        w.members.assign(s.members.begin(), s.members.end());
         w.tx_wall = wall_now_s();  // one-way latency stamp (same-host valid; real robots need NTP)
         bytes_tx_.fetch_add(wire_bytes(w), std::memory_order_relaxed);
         state_pub_->publish(w);
@@ -275,6 +277,22 @@ public:
         std::lock_guard<std::mutex> l(mu_);
         return blocked_.count(j) != 0;
     }
+    // Did this peer announce that it had dropped US, rather than get caught lying? The two
+    // verdicts block a peer for opposite reasons and the keep-out circle follows a different
+    // anchor for each, so the node has to be able to tell them apart. See corpseAnchor().
+    bool exited(int j) {
+        std::lock_guard<std::mutex> l(mu_);
+        return exited_.count(j) != 0;
+    }
+    // The most recent position this peer CLAIMED, recorded before any verdict is applied so it
+    // stays current even for a blocked peer. False when the peer has never been heard from.
+    bool latest_claim(int j, Eigen::Vector2d& out) {
+        std::lock_guard<std::mutex> l(mu_);
+        const auto it = last_claim_.find(j);
+        if (it == last_claim_.end()) return false;
+        out = it->second;
+        return true;
+    }
 
 private:
     void drop(int j, const char* why, double margin = 0.0) {
@@ -333,7 +351,8 @@ private:
     // CDR payload sizes (8 B per float64/uint64, 4 B per int32 + 4 B length prefix per
     // unbounded array, 1 B bool). Constant per type at fixed N; excludes RTPS/UDP framing.
     static std::size_t wire_bytes(const admm_fleet_msgs::msg::AgentState& w) {
-        return 8 + 4 + 8 + 4 + 4 * 8 + (4 + 8 * w.xibar.size()) + 1;
+        return 8 + 4 + 8 + 4 + 4 * 8 + (4 + 8 * w.xibar.size()) + 1
+               + (4 + 4 * w.members.size());
     }
     static std::size_t wire_bytes(const admm_fleet_msgs::msg::EdgeXi& w) {
         return 8 + 4 + 8 + 4 + 4 + 4 + (4 + 8 * w.xi.size()) + (4 + 8 * w.lam.size());
@@ -421,13 +440,43 @@ private:
         for (int k = 0; k < 4; ++k) m.xnow[k] = w.xnow[k];
         m.xibar = to_vec(w.xibar);
         m.reset = w.reset;
+        m.members.assign(w.members.begin(), w.members.end());
         // GATE 1. Returning HERE — before commitState — is the whole mechanism: last_seen_ is
         // not advanced, so the peer looks silent to maybeEvict and the EXISTING crash-failover
         // path takes over. Nothing else needs a concept of "liar". accountStale/pruneOld are
         // skipped too, on purpose: a rejected message must not steer the prune window either.
-        {   // Gate 2's latched verdict, applied on every message rather than once per cycle.
+        {
             std::lock_guard<std::mutex> l(mu_);
+            // Recorded BEFORE any verdict, so it keeps updating for a peer we have already
+            // blocked. The counterfactual arm fences what the peer SAYS — there, nothing has
+            // proved the claim wrong — so the claim must keep arriving even when the rest of
+            // the message is discarded.
+            //
+            // Finite-checked HERE rather than left to Gate 1 below, because this is the one
+            // field read before Gate 1 runs: corpseAnchor can turn it into an obstacle centre,
+            // and a dying peer's NaN broadcast would then poison the QP into the frozen-dog
+            // failure this file already carries scars from. An unvalidated number must never
+            // become geometry.
+            if (const Eigen::Vector2d c(m.xnow[0], m.xnow[1]); c.allFinite())
+                last_claim_[m.robot_id] = c;
+            // Gate 2's latched verdict, applied on every message rather than once per cycle.
             if (blocked_.count(m.robot_id)) { ++dropped_[m.robot_id]; return; }
+        }
+        // EXIT. A roster that excludes us says the sender has already dropped us from ITS fleet.
+        // A peer that quit while it keeps talking is precisely the deadlock: it stays warm, never
+        // joins a reset, and its reset=true announcements hold every survivor cold forever
+        // (measured 2026-07-28, d_0728_095209 — 0 solved cycles, so Gate 2 never ran either).
+        // Being excluded is positive evidence of the same class as a caught lie, so it takes the
+        // same route: block here, and maybeEvict's 3-slot lying threshold removes it. Blocking is
+        // also the fix — from now on its reset can never reach the mailbox.
+        //
+        // Forging this field is not worth gating: a fake roster only gets the SENDER evicted by
+        // whoever it omits, and it cannot touch a third party. The coordinator votes (T3).
+        if (!w.members.empty() &&
+            std::find(w.members.begin(), w.members.end(), self_id_) == w.members.end()) {
+            { std::lock_guard<std::mutex> l(mu_); exited_.insert(m.robot_id); }
+            block_peer(m.robot_id, "left the consensus (its roster excludes us)");
+            return;
         }
         double margin = 0.0;
         // now_slot_ comes from the RECEIVER's own sim clock (set by the worker each cycle), not
@@ -509,6 +558,8 @@ private:
     std::map<Key, std::map<int, EdgeXiMsg>> xi_;
     std::map<Key, EdgeZMsg> z_;
     std::map<int, std::uint64_t> last_seen_;  // per-peer newest state cycle_id (eviction)
+    std::map<int, Eigen::Vector2d> last_claim_;  // newest CLAIMED position, verdict-independent
+    std::set<int> exited_;                    // peers that announced a roster without us in it
 };
 
 }  // namespace admm

@@ -37,6 +37,9 @@ struct AgentStateMsg {
     Eigen::Vector4d xnow = Eigen::Vector4d::Zero();
     Eigen::VectorXd xibar;   // 6N operating-point plan
     bool reset = false;
+    // Sender's current roster. Empty means "not stated" and is read as "everyone still in", so
+    // the loopback transport used by the parity test may leave it unset without changing a bit.
+    std::vector<int> members;
 };
 
 // GATE 1 — the syntactic filter on the receive path, deliberately loose.

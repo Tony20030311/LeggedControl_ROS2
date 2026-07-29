@@ -169,6 +169,36 @@ int main() {
         assert(slots_to_detect(0.45) == -1 && "a residual under the gate must never fire");
         assert(slots_to_detect(0.60) > 0 && "a residual over the gate must eventually fire");
     }
+    // 8. THE MEMBERSHIP VOTE (T2/T3). Agents broadcast the roster they still believe in, and the
+    //    coordinator uses it to stop handing formation slots to a robot its peers have evicted.
+    //    The rule has to survive the attacker holding the pen: robot1 is compromised and says
+    //    the fleet is just itself, which excludes both honest dogs at once.
+    {
+        const std::map<int, std::vector<int>> after_eviction{
+            {1, {1}},        // compromised: claims a fleet of one
+            {2, {2, 3}},     // honest survivors, agreeing
+            {3, {2, 3}},
+        };
+        assert(majority_excluded(after_eviction, 1)
+               && "two honest survivors must be able to evict the liar");
+        // The attack this rule exists to stop: one vote must never be enough, or the liar
+        // deletes the honest fleet from the coordinator's view and keeps the formation.
+        assert(!majority_excluded(after_eviction, 2) && "one attacker must not evict an honest dog");
+        assert(!majority_excluded(after_eviction, 3) && "one attacker must not evict an honest dog");
+    }
+    {
+        // A tie is not a majority: with the fleet split 1-1 about robot3, nobody is evicted.
+        const std::map<int, std::vector<int>> split{{1, {1, 2}}, {2, {1, 2, 3}}};
+        assert(!majority_excluded(split, 3) && "a 1-1 split must not evict");
+        // Pre-members senders abstain rather than voting "everyone is in" — otherwise one old
+        // peer could dilute a real majority into a tie.
+        const std::map<int, std::vector<int>> with_silent{{1, {2, 3}}, {2, {2, 3}}, {3, {}}};
+        assert(majority_excluded(with_silent, 1) && "an empty roster must abstain, not vote");
+        // Nobody has said anything yet: the healthy startup state, and it must not evict.
+        const std::map<int, std::vector<int>> nothing_said{{1, {}}, {2, {}}, {3, {}}};
+        assert(!majority_excluded(nothing_said, 1) && "silence is not a vote");
+        assert(!majority_excluded({}, 1) && "no views at all is not a vote");
+    }
     std::cout << "test_false_signal: all cases passed\n";
     return 0;
 }

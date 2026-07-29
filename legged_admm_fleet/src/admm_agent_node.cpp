@@ -553,6 +553,15 @@ private:
                                  res.warm_cleared == admm::StepResult::kWarmNaN
                                      ? "non-finite xi" : "peer announced reset");
         if (res.hold || !res.xi.allFinite()) {
+            // Detection has to survive the fleet standing still. gate2 used to run only below, on
+            // the SOLVED path, so a liar that jams the barrier — announcing reset every slot, or
+            // quitting the consensus while it keeps talking — froze every survivor into a
+            // permanent HOLD in which the one mechanism that could catch it never executed
+            // (measured 2026-07-28, d_0728_095209: "GATE2 would" fired 0 times across a dead run).
+            // trackMobileCorpses() moves here for the same reason: a keep-out circle that stops
+            // following its body while we are held is fencing yesterday's position.
+            gate2(slot);
+            trackMobileCorpses();
             if (res.hold) maybeEvict(slot);
             publishStats(slot, res, t_cycle_wall);
             return;
@@ -652,19 +661,33 @@ private:
     // is refreshed only once the tracked peer has drifted far enough for the cached route to be
     // wrong, and that refresh forces a replan. ponytail: 0.5 m is 3 A* cells; tighten only if a
     // run shows the route stale enough to matter.
+    // Where a mobile corpse's keep-out circle is drawn. It follows what we BELIEVE about that
+    // peer, and the two ways a peer gets blocked support opposite beliefs:
+    //   caught lying (Gate 2)   -> its claim is the thing we disproved, so fence its odom (body)
+    //   announced it left (T2)  -> nothing has disproved its position, so fence what it claims
+    // Follow what you believe. onState's ordering makes the two exclusive: a peer Gate 2 blocked
+    // first can never enter exited_ afterwards, because a blocked message returns before the
+    // exit test runs. Returns false when we have no anchor at all — caller decides the fallback.
+    bool corpseAnchor(int j, Eigen::Vector2d* out) {
+        if (transport_->exited(j) && transport_->latest_claim(j, *out)) return true;
+        std::lock_guard<std::mutex> l(mu_);
+        const auto it = peer_odom_.find(j);
+        if (it == peer_odom_.end()) return false;
+        *out = it->second;
+        return true;
+    }
+
     void trackMobileCorpses() {
         if (mobile_corpse_.empty()) return;
-        std::map<int, Eigen::Vector2d> od;
-        { std::lock_guard<std::mutex> l(mu_); od = peer_odom_; }
         bool astar_stale = false;
         for (int j : mobile_corpse_) {
-            const auto it = od.find(j);
             auto cit = corpses_.find(j);
-            if (it == od.end() || cit == corpses_.end() || cit->second.empty()) continue;
-            cit->second[0].pos = it->second;
-            agent_->set_obstacle_pos(corpseIndex(j), it->second);
+            Eigen::Vector2d anchor;
+            if (cit == corpses_.end() || cit->second.empty() || !corpseAnchor(j, &anchor)) continue;
+            cit->second[0].pos = anchor;
+            agent_->set_obstacle_pos(corpseIndex(j), anchor);
             auto& last = astar_corpse_[j];
-            if ((last - it->second).norm() > 0.5) { last = it->second; astar_stale = true; }
+            if ((last - anchor).norm() > 0.5) { last = anchor; astar_stale = true; }
         }
         if (astar_stale && planner_) {
             std::vector<admm::AStarCircle> circles;
@@ -698,11 +721,20 @@ private:
         if (!evict_armed_) return;
         std::map<int, Eigen::Vector2d> od;
         { std::lock_guard<std::mutex> l(mu_); od = peer_odom_; }
+        const auto seen = transport_->last_seen();
         for (const auto& kv : agent_->peer_xnow()) {
             const int j = kv.first;
             if (j == self_id_) continue;
             const auto it = od.find(j);
             if (it == od.end()) continue;  // no independent channel yet -> no opinion
+            // FRESHNESS. peer_xnow() holds the last COMMITTED claim, which during a barrier-miss
+            // HOLD is a frozen copy while that peer's body keeps walking. Differencing a stale
+            // claim against live odom manufactures a residual that grows with the silence and
+            // would evict an honest dog for being briefly unheard — the same false-positive
+            // shape that cost two survivors their pairwise CBF on 2026-07-28. Being quiet is
+            // maybeEvict's business; Gate 2 only judges peers that are currently talking.
+            const auto sit = seen.find(j);
+            if (sit == seen.end() || slot > sit->second + 2) continue;
             const double r = (it->second - kv.second.head<2>()).norm();
             double& R = resid_[j];
             R = (1.0 - resid_alpha_) * R + resid_alpha_ * r;
@@ -723,7 +755,6 @@ private:
                 transport_->block_peer(j, "gate2 odom residual");
             }
         }
-        (void)slot;
     }
 
     void maybeEvict(std::uint64_t slot) {
@@ -795,10 +826,6 @@ private:
         // core (a dangling reference here segfaulted both survivors, 2026-07-23 08:36)
         const auto pxnow = agent_->peer_xnow();
         const auto pxibar = agent_->peer_xibar();
-        // Snapshot under the lock: peer_odom_ is written by the odom callbacks (cmd_cbg_) while
-        // this runs on the worker thread. Same copy-don't-reference rule as pxnow above.
-        std::map<int, Eigen::Vector2d> odom_snap;
-        { std::lock_guard<std::mutex> l(mu_); odom_snap = peer_odom_; }
         for (int j : dead) {
             const auto itn = pxnow.find(j);
             const auto itb = pxibar.find(j);
@@ -825,12 +852,14 @@ private:
                 continue;
             }
             admm::Obstacle o;
-            // A liar's own broadcast is exactly what we stopped believing, and corpse_keepout
-            // anchors on its xibar terminal knot — so for a mobile peer the anchor comes from
-            // odom instead. Believing the plan here would let the attacker choose where its own
-            // keep-out is drawn, which is the attack, not the defence.
-            const auto oit = mobile ? odom_snap.find(j) : odom_snap.end();
-            o.pos = (mobile && oit != odom_snap.end()) ? oit->second : kp->pos;
+            // corpse_keepout anchors on the peer's xibar terminal knot, which for a peer that is
+            // still walking and no longer trusted would let the attacker choose where its own
+            // keep-out gets drawn — that is the attack, not the defence. corpseAnchor picks the
+            // channel that matches WHY we stopped believing it (odom if caught lying, its own
+            // claim if it merely announced it left); kp->pos remains the fallback for a corpse
+            // that is genuinely silent.
+            Eigen::Vector2d anchor;
+            o.pos = (mobile && corpseAnchor(j, &anchor)) ? anchor : kp->pos;
             o.radius = kp->radius;
             // The one obstacle kind that can be born already violated: it materialises around
             // wherever the survivors happen to be standing, and the dead peer's body kept

@@ -8,6 +8,7 @@
 // stays fully distributed. Because /formation/plan is latched (transient_local), a coordinator
 // crash leaves the last plan standing: the fleet holds its assignment and keeps running; only
 // NEW goals and rescue reassignment pause until it restarts.
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <memory>
@@ -68,9 +69,13 @@ public:
         for (int j : dogs_)
             state_subs_.push_back(create_subscription<admm_fleet_msgs::msg::AgentState>(
                 "/" + prefix_ + std::to_string(j) + "/admm/state", rclcpp::QoS(10).reliable(),
-                [this, j](admm_fleet_msgs::msg::AgentState::SharedPtr) {
+                [this, j](admm_fleet_msgs::msg::AgentState::SharedPtr m) {
                     std::lock_guard<std::mutex> l(fl_mu_);
                     fl_alive_[j] = now();
+                    // Same field the agents judge each other on, so both layers agree on who is
+                    // in the fleet. Heartbeat alone cannot: a peer the agents have blocked keeps
+                    // broadcasting and would look alive here forever.
+                    fl_members_[j].assign(m->members.begin(), m->members.end());
                 }));
         fgoal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
             "/formation/goal", 1, [this](geometry_msgs::msg::PoseStamped::SharedPtr m) {
@@ -78,6 +83,23 @@ public:
             });
         if (declare_parameter<bool>("rescue", true))
             rescue_timer_ = create_wall_timer(1s, [this] { rescueTick_(); });
+        // liveSetTick_ — the timer publishPlan_ and last_goal_ have referred to since before it
+        // existed. The live set changes without any new goal (an eviction is the whole point), and
+        // until it is replayed fl_assign_ still indexes the old roster, so publishPlan_ bails out
+        // (fl_live_ != liveDogs()) and the survivors keep the dead robot's slot assignment.
+        // Replaying the last goal re-runs slot allocation over the survivors and drops the
+        // evicted robot out of /formation/plan.
+        live_set_timer_ = create_wall_timer(1s, [this] {
+            std::lock_guard<std::mutex> l(fl_mu_);
+            if (!has_goal_ || notReady_() >= 0 || !fl_have_slots_) return;
+            const std::vector<int> live = liveDogs();
+            if (live == fl_live_) return;
+            RCLCPP_WARN(get_logger(),
+                        "[fleet_coordinator] live set %zu -> %zu dog(s); replaying goal "
+                        "(%.2f,%.2f) to re-assign slots",
+                        fl_live_.size(), live.size(), last_goal_[0], last_goal_[1]);
+            onFormationGoalLocked_(last_goal_);
+        });
         RCLCPP_INFO(get_logger(), "[fleet_coordinator] dogs=%zu formation=%s prefix=%s",
                     dogs_.size(), formation_name_.c_str(), prefix_.c_str());
     }
@@ -92,6 +114,10 @@ private:
         const auto t = now();
         for (int i : dogs_) {
             if (!fl_pos_.count(i)) continue;  // see notReady_: caller must refuse first
+            // Voted out by its peers, however loudly it is still talking. Majority rule, so one
+            // compromised robot cannot reverse this and evict the honest fleet — see
+            // admm::majority_excluded (unit-tested in test_false_signal).
+            if (admm::majority_excluded(fl_members_, i)) continue;
             const auto it = fl_alive_.find(i);
             // NEVER heard from = still starting up, not dead. Controllers come up a phase
             // before the agents, so there is a window where odom exists but /admm/state does
@@ -253,13 +279,14 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr fgoal_sub_;
     std::vector<rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr> odom_subs_;
     std::vector<rclcpp::Subscription<admm_fleet_msgs::msg::AgentState>::SharedPtr> state_subs_;
-    rclcpp::TimerBase::SharedPtr plan_republish_timer_, rescue_timer_;
+    rclcpp::TimerBase::SharedPtr plan_republish_timer_, rescue_timer_, live_set_timer_;
 
     std::mutex fl_mu_, plan_mu_;
     std::map<int, Eigen::Vector2d> fl_pos_, fl_vel_;
     admm_fleet_msgs::msg::FleetPlan last_plan_;
     bool has_plan_ = false;
     std::map<int, rclcpp::Time> fl_alive_;   // last /robotN/admm/state arrival, per robot
+    std::map<int, std::vector<int>> fl_members_;  // each robot's last broadcast roster (T2 field)
     double alive_timeout_ = 2.0;             // must exceed the agents' evict_after_misses * TS
     std::vector<int> fl_live_;               // robots the CURRENT fl_slots_/fl_assign_ cover
     std::vector<Eigen::Vector2d> fl_slots_;
