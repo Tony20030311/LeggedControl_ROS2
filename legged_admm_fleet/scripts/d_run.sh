@@ -73,7 +73,7 @@ pset() {  # $1 = node, $2 = param, $3 = value
   for i in 1 2 3; do
     timeout 20 ros2 param set "$1" "$2" "$3" >/dev/null 2>&1 && return 0
     say "  param set $1 $2 failed (attempt $i/3) — retrying"
-    sleep 3
+    sleep 1
   done
   return 1
 }
@@ -102,7 +102,11 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
     M=$(min_pair)
     say "  centroid=($wx,$wy) dist=$D min_pair=$M"
     if [ "$(python3 -c "print(1 if $M<$DMIN_ABORT else 0)")" = 1 ]; then
-      if [ "${LIE_LOGONLY:-0}" = 1 ]; then
+      # LIE_CHASE joins LIE_LOGONLY here for the same reason: with a hostile robot deliberately
+      # driven into the fleet, the all-robot minimum measures how hard IT rammed, and failing the
+      # run on it fails the experiment for the ATTACKER doing its job (measured 0.64 m, aborted a
+      # complete take). The survivors hitting EACH OTHER is still a hard stop, below.
+      if [ "${LIE_LOGONLY:-0}" = 1 ] || [ "${LIE_CHASE:-0}" = 1 ]; then
         # THE COUNTERFACTUAL ARM IS SUPPOSED TO LOSE SEPARATION. Its survivors are fencing a
         # ghost 2.83 m from the compromised robot's real body, so that body closing on them is
         # the measurement this arm exists to produce (0.557 m, measured 2026-07-29) — aborting
@@ -156,7 +160,7 @@ if [ "${RECORD:-0}" = 1 ]; then
     setsid ros2 run ros_gz_bridge parameter_bridge \
       /arena_cam/image@sensor_msgs/msg/Image@gz.msgs.Image >"$LOGD/bridge.log" 2>&1 &
     BRPID=$!
-    sleep 3
+    sleep 3   # let the bridge advertise before the recorder subscribes (discovery margin)
     setsid python3 $SCRIPTS/g5_video.py /arena_cam/image "$LOGD/demo.mp4" 30 \
       >"$LOGD/g5_video.log" 2>&1 &
     RECPID=$!
@@ -179,10 +183,10 @@ setsid python3 $SCRIPTS/phys_gap_logger.py "$ROBOTS" "$LOGD/phys_gap.csv" "" \
   --ros-args -p use_sim_time:=true >"$LOGD/phys_gap.log" 2>&1 &
 PHYSPID=$!
 
-RVIZPID=""; RVGRABPID=""; VIZPID=""
+RVIZPID=""; RVGRABPID=""; VIZPID=""; CHASEPID=""
 # Without this, a `die` anywhere below leaves rviz2, the x11grab and the marker node running —
 # they outlive the script, hold :98, and the next run's capture fails for no visible reason.
-trap 'kill -9 $RVIZPID $RVGRABPID $VIZPID $RECPID $BRPID $PHYSPID 2>/dev/null' EXIT
+trap 'kill -9 $RVIZPID $RVGRABPID $VIZPID $RECPID $BRPID $PHYSPID $CHASEPID 2>/dev/null' EXIT
 if [ "${RVIZ:-0}" = 1 ]; then
   say "recording RViz -> rviz.mp4"
   RVIZ_CFG=$WS/src/legged_fleet/legged_admm_fleet/rviz/fleet.rviz
@@ -244,6 +248,24 @@ send_formation_goal "$GX" "$GY"
 # fixed sleep depends on RTF and made the first run kill next to the goal, so nothing had to
 # route around anything. KILL_AT_X=0 falls back to the timer.
 KILL_AT_X=${KILL_AT_X:-0}
+# PRE-ARM, while the fleet is still walking up to the trigger point. Everything here is a slow
+# `ros2 param set` round trip that does NOT change behaviour until the lie fires, and doing it at
+# the trigger instead cost 20+ s — 8 m of walking — so the attack kept landing two peg rows past
+# where it was staged. After this block the trigger costs exactly one param set.
+if [ -n "${LIE:-}" ]; then
+  ros2 daemon stop >/dev/null 2>&1; sleep 4
+  PIDV=$(pgrep -f "admm_agent_$VICTIM" | head -1)
+  if [ "${LIE_CHASE:-0}" = 1 ]; then
+    pset /admm_agent_$VICTIM inject_ignore_corpses true \
+      || say "  (inject_ignore_corpses unavailable — the attacker will swerve around them)"
+  fi
+  if [ "${LIE_LOGONLY:-0}" = 1 ]; then
+    for j in $SURVIVORS; do
+      pset /admm_agent_$j detection_log_only true || die "could not disarm Gate 2 on agent$j"
+    done
+  fi
+  say "pre-armed: the lie now costs one param set at the trigger"
+fi
 if [ "$(python3 -c "print(1 if $KILL_AT_X>0 else 0)")" = 1 ]; then
   say "waiting for fleet centroid to reach x=$KILL_AT_X before silencing robot$VICTIM"
   KX_OK=0
@@ -251,7 +273,7 @@ if [ "$(python3 -c "print(1 if $KILL_AT_X>0 else 0)")" = 1 ]; then
     read kx ky <<< "$(fleet_centroid "$ROBOTS")"
     [ "$(python3 -c "print(1 if $kx>=$KILL_AT_X else 0)")" = 1 ] && { KX_OK=1; break; }
     gz_deactivated && die "WBC deactivated before the kill point"
-    sleep 3
+    sleep 1
   done
   [ "$KX_OK" = 1 ] || die "fleet never reached x=$KILL_AT_X (last centroid x=$kx)"
   say "fleet centroid at x=$kx — killing now"
@@ -289,10 +311,6 @@ PIDV=$(pgrep -f "admm_agent_$VICTIM" | head -1)
 if [ -n "${LIE:-}" ]; then
   say "phase 5: COMPROMISE admm_agent_$VICTIM — lie=${LIE}m, steering it into the fleet"
   read CX CY <<< "$(fleet_centroid "$SURVIVORS")"
-  # The daemon caches the node graph and goes stale across a fleet restart; a param set against
-  # a stale daemon fails with no useful message. Bounce it first (measured: this is exactly why
-  # the first scripted run of this scenario died at "inject_fake_offset failed").
-  ros2 daemon stop >/dev/null 2>&1; sleep 4
   # ORDER MATTERS, and getting it wrong killed the whole scenario once. Each `ros2 param set` is
   # a round trip and the three of them span ~4 s. Deafening FIRST gave the attacker those 4 s
   # with no detector armed anywhere: it heard nobody, timed out, evicted both survivors, rebuilt
@@ -312,15 +330,99 @@ if [ -n "${LIE:-}" ]; then
   # have identical code, identical logging and one difference — whether the verdict is acted on.
   # That is what separates "detection worked" from "the CBF would have avoided it anyway": with
   # the lie accepted, the survivors keep 1.3 m from a GHOST and close on the real body.
-  if [ "${LIE_LOGONLY:-0}" = 1 ]; then
-    say "COUNTERFACTUAL arm: Gate 2 detects but does NOT block (detection_log_only stays true)"
-  else
-    for j in $SURVIVORS; do
-      pset /admm_agent_$j detection_log_only false || die "could not arm Gate 2 on agent$j"
-    done
-  fi
+  # EVERY `ros2 param set` here is ~3 s of round trip and the fleet KEEPS WALKING through all of
+  # them: the handshake used to run 32 s, i.e. 13 m of ground, which put the attack two peg rows
+  # downfield of where it was staged (d_0729_100815 — aimed at obs7, fired at obs12). So set only
+  # what actually differs from the running configuration.
+  # Detector arming and the hostile-mode knobs were PRE-ARMED before the trigger wait, so the lie
+  # is the only round trip left here. Everything below happens while the fleet is where it was
+  # staged instead of 8 m downfield.
   pset /admm_agent_$VICTIM inject_fake_offset "$LIE" \
     || die "inject_fake_offset failed (is the param declared?)"
+  # CHARGE NOW, not after the eviction is logged. Waiting for that cost ~10 s, and at 0.4 m/s the
+  # attacker walks 4 m in it — past the very peg it was supposed to round, which is why three
+  # takes filmed a stroll instead of an attack. The eviction lands ~1 s after the lie regardless.
+  if [ "${LIE_CHASE:-0}" = 1 ]; then
+    CHASE_TARGET=${CHASE_TARGET:-${SURVIVORS%% *}}
+    say "phase 5b: robot$VICTIM charges robot$CHASE_TARGET (rounding whatever peg is in the way)"
+    # The whole attacker arc — charge, break off, take station, go dark — runs HERE, on its own
+    # clock. It used to be spliced into phase 6/6a/6b, which meant the charge lasted until the
+    # SURVIVORS finished their outbound leg: ~2 minutes of chasing instead of a brief rush, and
+    # the attacker was dragged right out of the peg field. What the attacker does must not depend
+    # on how far the fleet still has to walk.
+    (
+      CHASE_END=$((SECONDS + ${CHASE_T:-20}))
+      while [ "$SECONDS" -lt "$CHASE_END" ]; do
+        # Aim 2.5 m PAST the quarry: a goal ON it makes the planner decelerate to arrive, which
+        # reads as politely stopping alongside. Overshooting keeps it at speed THROUGH the
+        # quarry's position, so the survivor's own keep-out is what has to move it.
+        TXY=$(python3 - "$LOGD/dist.csv" "$VICTIM" "$CHASE_TARGET" <<'PY' 2>/dev/null
+import csv, math, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+if not rows:
+    print(); sys.exit()
+r = rows[-1]
+v, t = int(sys.argv[2]), int(sys.argv[3])
+vx, vy = float(r['x%d' % v]), float(r['y%d' % v])
+tx, ty = float(r['x%d' % t]), float(r['y%d' % t])
+# Aim AT the quarry, overshooting so the planner never decelerates to arrive. Leading the target
+# was tried and is worse, not better: aiming 2 m ahead of it plus a 1.5 m overshoot put the goal
+# 3.5 m up the quarry's own track, so the attacker walked a parallel course and never turned in —
+# closest approach 1.75 m and opening (measured d_0729_105720). Straight at the body, always.
+d = math.hypot(tx - vx, ty - vy)
+if d > 0.05:
+    tx += (tx - vx) / d * 2.5
+    ty += (ty - vy) / d * 2.5
+print('%.3f %.3f' % (tx, ty))
+PY
+)
+        read CX2 CY2 <<< "$TXY"
+        case "$CX2" in ''|nan) sleep 1; continue;; esac
+        timeout 2 ros2 topic pub -r 5 --qos-durability transient_local \
+          /robot$VICTIM/goal geometry_msgs/msg/PoseStamped \
+          "{header: {frame_id: world}, pose: {position: {x: $CX2, y: $CY2, z: 0.5}}}" >/dev/null 2>&1
+        sleep 0.5
+      done
+      # BREAK OFF and take station. A brief rush then a roadblock is the scenario; an endless
+      # pursuit is not, and it also drags the attacker out of the arena.
+      RB=${ROADBLOCK:-"14.0 1.2"}
+      say "  robot$VICTIM breaks off after ${CHASE_T:-20}s — walking to ($RB) to park"
+      timeout 4 ros2 topic pub -r 5 --qos-durability transient_local \
+        /robot$VICTIM/goal geometry_msgs/msg/PoseStamped \
+        "{header: {frame_id: world}, pose: {position: {x: ${RB% *}, y: ${RB#* }, z: 0.5}}}" \
+        >/dev/null 2>&1
+      # Freeze it only once it ARRIVES: a timed guess froze it mid-stride, which reads as a crash
+      # rather than as a robot taking up station.
+      for _i in $(seq 1 "${PARK_T:-40}"); do
+        RD=$(python3 - "$LOGD/dist.csv" "$VICTIM" ${RB% *} ${RB#* } <<'PY' 2>/dev/null
+import csv, math, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+r = rows[-1] if rows else None
+v = int(sys.argv[2])
+print('%.2f' % math.hypot(float(r['x%d' % v]) - float(sys.argv[3]),
+                          float(r['y%d' % v]) - float(sys.argv[4])) if r else 99)
+PY
+)
+        [ "$(python3 -c "print(1 if ${RD:-99} < 0.7 else 0)")" = 1 ] && break
+        sleep 2
+      done
+      say "  robot$VICTIM on station (${RD:-?} m) — going dark"
+      kill -STOP "$PIDV" 2>/dev/null
+    ) &
+    CHASEPID=$!
+  else
+    # walk it at the survivors' centroid
+    # transient_local + a short burst: same discovery-race lesson as send_formation_goal.
+    timeout 3 ros2 topic pub -r 5 --qos-durability transient_local \
+      /robot$VICTIM/goal geometry_msgs/msg/PoseStamped \
+      "{header: {frame_id: world}, pose: {position: {x: $CX, y: $CY, z: 0.5}}}" >/dev/null 2>&1
+  fi
+  # Attacker speed: OFF by default. Running the hunter at 0.55 against survivors capped at 0.4
+  # meant they could not out-accelerate the closing rate — the keep-out was violated faster than
+  # a step could answer it, so the film showed a hit and no dodge. Same speed for everyone makes
+  # the evasion legible. Set CHASE_V explicitly to bring the speed advantage back.
+  [ -n "${CHASE_V:-}" ] && { pset /admm_agent_$VICTIM v "$CHASE_V" \
+    || say "  (v not settable — charging at the fleet speed)"; }
   # DEAF as well as lying (LIE_DEAF=1, the default). A liar that still runs its own avoidance is
   # a "cooperative liar": the separation that survives is then partly ITS doing, and the demo
   # cannot claim the survivors kept themselves safe. Dropping all its incoming peer states makes
@@ -328,14 +430,6 @@ if [ -n "${LIE:-}" ]; then
   if [ "${LIE_DEAF:-1}" = 1 ]; then
     pset /admm_agent_$VICTIM inject_drop_p 1.0 || die "could not deafen the liar"
   fi
-  # Non-critical, and last for that reason: the victim's own detector changes nothing about the
-  # scenario (it is about to stop listening), it is here only so both arms share one config.
-  pset /admm_agent_$VICTIM detection_log_only false || true
-  # walk it at the survivors' centroid
-  # transient_local + a short burst: same discovery-race lesson as send_formation_goal.
-  timeout 8 ros2 topic pub -r 5 --qos-durability transient_local \
-    /robot$VICTIM/goal geometry_msgs/msg/PoseStamped \
-    "{header: {frame_id: world}, pose: {position: {x: $CX, y: $CY, z: 0.5}}}" >/dev/null 2>&1
 else
 say "phase 5: SIGSTOP admm_agent_$VICTIM (pid $PIDV)"
 kill -STOP "$PIDV" || die "SIGSTOP failed"
@@ -346,6 +440,7 @@ N_EVICT=$(wait_for_log "EVICT robot$VICTIM" 2 60)
 say "EVICT seen on $N_EVICT survivor(s)"
 grep_agents "EVICT robot$VICTIM" | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
 grep_agents "REBUILD" | tail -2 | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
+
 
 # survivors must keep going to the ORIGINAL goal, routing around the corpse
 say "phase 6: survivors continue to ($GX,$GY)"
@@ -369,7 +464,42 @@ say "survivors reached the outbound goal with robot$VICTIM down"
 # the survivors have to carry a keep-out from "alive, lying, moving" through to "actually dead"
 # without the transition looking like a new fault. The corpse anchor follows odom either way,
 # so a stopped body should simply stop dragging its circle.
-if [ -n "${LIE:-}" ] && [ "${LIE_THEN_KILL:-0}" = 1 ]; then
+# With LIE_CHASE the attacker arc (charge -> break off -> park -> dark) already ran on its own
+# clock in phase 5b; this older beat would SIGSTOP a second time and re-send the block goal.
+if [ -n "${LIE:-}" ] && [ "${LIE_THEN_KILL:-0}" = 1 ] && [ "${LIE_CHASE:-0}" != 1 ]; then
+  # With LIE_CHASE the outbound leg is over almost as soon as eviction lands (the survivors
+  # kept walking through the whole inject/evict handshake), so darking the liar here amputates
+  # the hunt at ~17 s (measured d_0729_093445). Hold the blackout so the chase actually plays:
+  # robot1 keeps charging the parked survivors and they keep slipping the circle.
+  if [ "${LIE_CHASE:-0}" = 1 ]; then
+    say "phase 6b-hold: letting the hunt play ${CHASE_T:-45}s before the blackout"
+    sleep "${CHASE_T:-45}"
+    # Then it stops hunting and parks INSIDE the pegs, on the survivors' way home: the attacker
+    # becomes the obstacle. ROADBLOCK defaults to a spot on the return line through the field.
+    kill -9 $CHASEPID 2>/dev/null; CHASEPID=""
+    RB=${ROADBLOCK:-"13.6 0.3"}
+    say "phase 6a: robot$VICTIM walks into the pegs to park as a roadblock at ($RB)"
+    timeout 8 ros2 topic pub -r 5 --qos-durability transient_local \
+      /robot$VICTIM/goal geometry_msgs/msg/PoseStamped \
+      "{header: {frame_id: world}, pose: {position: {x: ${RB% *}, y: ${RB#* }, z: 0.5}}}" \
+      >/dev/null 2>&1
+    # WAIT for it to actually get there. A fixed sleep cut the walk short and the attacker was
+    # frozen mid-stride, which reads as a crash rather than as it taking up station.
+    for _i in $(seq 1 "${PARK_T:-40}"); do
+      RD=$(python3 - "$LOGD/dist.csv" "$VICTIM" ${RB% *} ${RB#* } <<'PY' 2>/dev/null
+import csv, math, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+r = rows[-1] if rows else None
+v = int(sys.argv[2])
+print('%.2f' % math.hypot(float(r['x%d' % v]) - float(sys.argv[3]),
+                          float(r['y%d' % v]) - float(sys.argv[4])) if r else 99)
+PY
+)
+      [ "$(python3 -c "print(1 if ${RD:-99} < 0.7 else 0)")" = 1 ] \
+        && { say "  robot$VICTIM is on station (${RD} m from the block point)"; break; }
+      sleep 2
+    done
+  fi
   say "phase 6b: SIGSTOP admm_agent_$VICTIM — the liar now goes dark for real"
   kill -STOP "$PIDV" 2>/dev/null || say "  WARNING: SIGSTOP failed (pid $PIDV gone?)"
   sleep 6   # let its lower layer run out the last published trajectory and park

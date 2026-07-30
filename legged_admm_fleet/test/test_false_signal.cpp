@@ -49,7 +49,12 @@ GateLimits limits() {
 
 // Gate 2 as the node runs it: low-pass the |odom - claimed| residual and report how many slots
 // it took to cross the gate. -1 if it never does.
-int slots_to_detect(double lie, double alpha = 0.2, double gate = 0.5, int max_slots = 40) {
+// Must track admm_agent_node's odom_residual_gate default.
+constexpr double kGate = 0.30;
+// D_MIN minus the contact line: the distance a lie can be spent on before bodies touch.
+constexpr double kSafetyBuffer = 1.3 - 0.867;   // 0.433 m
+
+int slots_to_detect(double lie, double alpha = 0.2, double gate = kGate, int max_slots = 40) {
     double R = 0.0;
     for (int s = 1; s <= max_slots; ++s) {
         R = (1.0 - alpha) * R + alpha * lie;
@@ -166,8 +171,16 @@ int main() {
     //    disagreement (well past anything measured on flat ground) must never cross the gate.
     {
         assert(slots_to_detect(0.10) == -1 && "0.10 m of drift would be treated as a lie");
-        assert(slots_to_detect(0.45) == -1 && "a residual under the gate must never fire");
         assert(slots_to_detect(0.60) > 0 && "a residual over the gate must eventually fire");
+        // THE INVARIANT THAT WAS MISSING. This assertion used to read
+        //     slots_to_detect(0.45) == -1  // "a residual under the gate must never fire"
+        // which pinned the hole in place: 0.45 > kSafetyBuffer, so it demanded silence for a lie
+        // that can reach contact on its own. A gate is only sound while it sits below the buffer.
+        static_assert(kGate < kSafetyBuffer,
+                      "gate >= safety buffer leaves lies that are undetectable AND sufficient "
+                      "to close the whole margin (measured: 0.424 m residual, 0 detections, "
+                      "0.038 m body gap, 2026-07-30)");
+        assert(slots_to_detect(kSafetyBuffer) > 0 && "a lie that can reach contact must fire");
     }
     // 8. THE MEMBERSHIP VOTE (T2/T3). Agents broadcast the roster they still believe in, and the
     //    coordinator uses it to stop handing formation slots to a robot its peers have evicted.

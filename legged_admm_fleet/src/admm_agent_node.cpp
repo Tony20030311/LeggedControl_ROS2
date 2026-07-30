@@ -80,8 +80,24 @@ public:
                         "leaving 0.92 m of real clearance against a 0.867 m contact line.",
                         self_id_, corpse_anchor_knot_, admm::K_SEND);
         resid_alpha_ = declare_parameter<double>("odom_residual_alpha", 0.2);
-        resid_gate_ = declare_parameter<double>("odom_residual_gate", 0.5);
-        log_only_ = declare_parameter<bool>("detection_log_only", true);
+        // 0.30, and it MUST stay under the safety buffer. D_MIN 1.3 minus the 0.867 contact line
+        // leaves 0.433 m of slack, so a gate at or above that tolerates a lie big enough to spend
+        // the whole buffer — undetectable and sufficient to reach contact at the same time. The
+        // old 0.5 was exactly that: measured 2026-07-30 with a 0.424 m residual (LIE=0.30, peer
+        // cooperating normally, not deaf) the detector fired ZERO times while the liar closed to
+        // 0.038 m of body gap. The floor is odom noise, not the gate: clean flight residual is
+        // 0.006 m, so 0.30 still clears it 50x.
+        resid_gate_ = declare_parameter<double>("odom_residual_gate", 0.30);
+        // ARMED BY DEFAULT. This was true — measure first, block later — and that was right while
+        // the gate was being calibrated. It is not right to ship: a fleet that only starts
+        // checking when somebody flips a parameter is a fleet that runs unprotected every time
+        // nobody remembers, and nothing warns an operator about it. Worse, the demo script only
+        // armed it as part of injecting the attack, which quietly handed the fleet advance notice
+        // no real deployment gets.
+        // The calibration that justified the old default is done: clean residual measured at
+        // 0.006 m against a 0.5 m gate, ~80x margin (2026-07-29). Set it true to DISARM — that
+        // is the counterfactual arm, and it should be the deliberate act.
+        log_only_ = declare_parameter<bool>("detection_log_only", false);
         // Stop broadcasting if our own obs/odom go stale (see ready()). Must be generous
         // enough that an RTF dip is not mistaken for a dead controller.
         input_stale_s_ = declare_parameter<double>("input_stale_s", 1.0);
@@ -92,6 +108,10 @@ public:
         follow_desired_ = declare_parameter<double>("follow_desired", 0.72);
         follow_range_ = declare_parameter<double>("follow_range", 1.5);
         follow_floor_ = declare_parameter<double>("follow_floor", 0.05);
+        // Evasion boost (see followSpeed): ask for MAX_VX while inside evade_range_ of an
+        // untrusted peer's keep-out. Off restores the pre-2026-07-30 constant-reference behaviour.
+        evade_boost_ = declare_parameter<bool>("evade_boost", true);
+        evade_range_ = declare_parameter<double>("evade_range", 0.5);
         follow_cone_cos_ = std::cos(declare_parameter<double>("follow_cone_deg", 60.0) * M_PI / 180.0);
         // Direction-aware body footprint (Vision60 base box 0.83 x 0.25 -> half 0.415 x 0.125).
         // The inter-agent clearance the node-layer safety enforces depends on how the two long
@@ -129,6 +149,11 @@ public:
         // Experiment C, a DIFFERENT injection: this one corrupts what we SEND, so one lie is
         // broadcast once and every receiver judges the same bytes independently.
         declare_parameter<double>("inject_fake_offset", 0.0);
+        // Attacker characterization: a Byzantine robot does not run our safety layer for OUR
+        // benefit. With this set, peers this agent evicts get NO corpse keep-out in its own
+        // QP/A* (eviction and the solo rebuild still happen), so it will genuinely drive at
+        // them. Demo/threat-model knob; the fleet's own defence is untouched.
+        inj_ignore_corpses_ = declare_parameter<bool>("inject_ignore_corpses", false);
         transport_->set_inject(inj_drop_p_, inj_delay_ms_, inj_jitter_ms_);
         // (the on-set callback is registered at the END of this constructor; see there)
         // Arena obstacle-CBF + A* (mirrors fleet_centralized_node; "" -> empty world). Every
@@ -266,6 +291,19 @@ public:
                     if (n == "inject_drop_p") inj_drop_p_ = p.as_double();
                     else if (n == "inject_delay_ms") inj_delay_ms_ = p.as_double();
                     else if (n == "inject_jitter_ms") inj_jitter_ms_ = p.as_double();
+                    // Runtime speed. Exists for the compromised-robot demo (a hostile peer that
+                    // closes at walking pace films as a stroll); MAX_VX 0.55 is the model's own
+                    // ceiling, so a set above it buys nothing the state clip won't take back.
+                    else if (n == "v") {
+                        v_ = p.as_double();
+                        RCLCPP_WARN(get_logger(), "[agent%d] reference speed v -> %.2f m/s",
+                                    self_id_, v_);
+                    }
+                    else if (n == "inject_ignore_corpses") {
+                        inj_ignore_corpses_ = p.as_bool();
+                        RCLCPP_WARN(get_logger(), "[agent%d] corpse keep-outs %s", self_id_,
+                                    inj_ignore_corpses_ ? "SUPPRESSED (hostile mode)" : "active");
+                    }
                     else if (n == "inject_fake_offset") {
                         transport_->set_fake_offset(p.as_double());
                         RCLCPP_WARN(get_logger(), "[agent%d] COMPROMISED: broadcasting a %.2f m "
@@ -423,6 +461,21 @@ private:
             const double v_ahead = std::max(0.0, kv.second.segment<2>(2).dot(dir));
             const double v_allow = v_ahead + follow_gain_ * (dist - desired);
             v_eff = std::min(v_eff, std::max(v_allow, follow_floor_));
+        }
+        // EVASION BOOST. The keep-out around an untrusted peer is sized on the THREAT's top speed
+        // (corpse_keepout: + MAX_VX * TAU_REACT) while the reference only ever asks this dog for
+        // v_ = 0.4. MAX_VX is a box bound, not a cap on us — the QP would allow 0.55 — but the
+        // tracking cost pins us to the reference, so a hostile peer running at MAX_VX closes the
+        // margin faster than we open it. Measured 2026-07-29/30: attacker 0.55 vs fleet 0.4 drove
+        // the QP to OSQP max-iter 179 times, poisoned the dual to NaN, and ended in a fleet-wide
+        // freeze; the same attack with the gap removed produced 6. Ask for the speed the margin
+        // was designed against, and only while a keep-out is actually near — cruising the whole
+        // fleet at MAX_VX instead was tried and overlapped bodies in 1 run of 3.
+        if (!corpses_.empty() && evade_boost_) {
+            for (const auto& kv : corpses_)
+                for (const auto& o : kv.second)
+                    if ((o.pos - pi).norm() < o.radius + evade_range_)
+                        return std::max(v_eff, admm::MAX_VX);
         }
         return v_eff;
     }
@@ -839,6 +892,14 @@ private:
             // Gate 2's latched verdict, for the same reason as `need` above: a peer that emitted
             // one NaN is dying, not lying, and a dying dog's body does stop.
             const bool mobile = transport_->blocked(j);
+            // Hostile mode: evict (graph rebuild below, keyed on `dead`) but place no keep-out —
+            // structurally the same skip as the !kp path underneath.
+            if (inj_ignore_corpses_) {
+                RCLCPP_WARN(get_logger(),
+                            "[agent%d] EVICT robot%d — keep-out SUPPRESSED (inject_ignore_corpses)",
+                            self_id_, j);
+                continue;
+            }
             // Geometry lives in admm::corpse_keepout (fleet_config) so it is unit-testable:
             // where to fence, how wide, and when NOT to fence at all. See test_corpse_keepout.
             const auto kp = admm::corpse_keepout(
@@ -983,6 +1044,9 @@ private:
     double fp_half_len_, fp_half_wid_, fp_drift_;   // Vision60 body footprint (direction-aware safety)
     int k_send_;
     double inj_drop_p_ = 0.0, inj_delay_ms_ = 0.0, inj_jitter_ms_ = 0.0;  // C-experiment injection
+    bool inj_ignore_corpses_ = false;  // hostile mode: evict without fencing (demo/threat model)
+    bool evade_boost_ = true;          // ask for MAX_VX while evading a keep-out (followSpeed)
+    double evade_range_ = 0.5;
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
 
     std::unique_ptr<admm::LaplacianFormation> formation_;
