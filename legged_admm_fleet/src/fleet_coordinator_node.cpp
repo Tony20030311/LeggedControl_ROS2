@@ -156,7 +156,29 @@ private:
         }
         const std::vector<int> live = liveDogs();
         if (live.empty()) {
-            RCLCPP_WARN(get_logger(), "[fleet_coordinator] /formation/goal ignored: no live dogs");
+            // WEDGED, and say so loudly. Refusing is correct — a dog whose peers are all evicted
+            // has 0 edges and therefore no pairwise CBF at all (rti.cpp: the D_MIN row lives in
+            // the EDGE QP), so walking it would be walking blind. What is NOT correct is how
+            // quietly this used to fail: one WARN, then every later goal dropped forever, with
+            // healthy dogs standing still. Measured 2026-07-29 (d_0729_114617): two honest
+            // survivors evicted each other, every roster shrank to {self}, majority_excluded
+            // then excluded both, and the fleet stood at x=17.9 for 14 minutes while the log
+            // said nothing new. Eviction is permanent by design (no rejoin until Phase 2), so
+            // this state does not clear itself — an operator has to know it happened.
+            std::string who;
+            for (const auto& kv : fl_members_) {
+                who += " " + std::to_string(kv.first) + ":{";
+                for (std::size_t n = 0; n < kv.second.size(); ++n)
+                    who += (n ? "," : "") + std::to_string(kv.second[n]);
+                who += "}";
+            }
+            RCLCPP_ERROR_THROTTLE(
+                get_logger(), *get_clock(), 5000,
+                "[fleet_coordinator] FLEET WEDGED: goal (%.2f,%.2f) DROPPED — every dog is "
+                "majority-excluded, so nobody is live. Rosters:%s. The dogs are safe (no peers "
+                "means no pairwise CBF, so standing still is correct) but they will NOT recover "
+                "on their own: eviction is permanent until rejoin exists. Restart the agents.",
+                goal_c[0], goal_c[1], who.empty() ? " (none)" : who.c_str());
             return;
         }
         // A single survivor has no formation to hold — send it straight at the commanded
