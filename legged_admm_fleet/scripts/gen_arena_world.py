@@ -101,9 +101,12 @@ def main():
 <sdf version="1.9">
   <world name="{name}">
     <physics name="default_physics" type="dart">
-      <max_step_size>0.001</max_step_size>
+      <!-- 2 ms / 500 Hz, halved from 1 ms / 1000 Hz: three Vision60s plus the ADMM agents ran
+           the sim well under real time and every experiment paid for it in wall clock. The WBC
+           is 250 Hz, so 500 Hz still leaves two physics steps per control update. -->
+      <max_step_size>0.002</max_step_size>
       <real_time_factor>1.0</real_time_factor>
-      <real_time_update_rate>1000</real_time_update_rate>
+      <real_time_update_rate>500</real_time_update_rate>
       <dart>
         <solver><solver_type>pgs</solver_type></solver>
         <collision_detector>bullet</collision_detector>
