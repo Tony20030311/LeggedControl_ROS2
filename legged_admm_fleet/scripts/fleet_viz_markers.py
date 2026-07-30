@@ -8,11 +8,14 @@
 # when a robot starts broadcasting a position 2.8 m from where it stands, so Gazebo footage shows
 # only the survivors swerving for no visible reason. The three markers here are that missing half:
 #
-#   ghost      a TRANSLUCENT COPY OF THE ROBOT ITSELF at the position it broadcasts. Same mesh,
-#              same yaw. While it is honest the copy sits on the real one and reads as a tint;
-#              the moment it lies, a second see-through dog walks away on its own. Two identical
-#              dogs in two places needs no caption — an abstract cylinder plus a line did (and
-#              was reported unreadable on 2026-07-29, which is why they are gone).
+#   ghost      a TRANSLUCENT SECOND RobotModel at the position the robot BROADCASTS. Not a
+#              marker: a Vision60 is 13 link meshes, so no single MESH_RESOURCE file is "the
+#              dog" (base.stl renders as a sliver) and a stand-in box was reported unreadable.
+#              This node instead mirrors robot1's live TF tree under a ghost/ prefix with the
+#              root displaced by (claim - odom); fleet.rviz points a RobotModel display
+#              (alpha 0.4) at the mirrored frames. The copy is the real URDF, walking, joints
+#              in sync. Honest => offset ~0 and the copy hides inside the real dog; the moment
+#              it lies, a second see-through dog detaches and walks away on its own.
 #   status     OK / SUSPECT <residual> / EVICTED. The number lives here rather than in a line
 #              whose length the viewer has to estimate. EVICTED comes from the same
 #              majority-of-member-views rule the coordinator uses (admm::majority_excluded), so
@@ -35,9 +38,10 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from admm_fleet_msgs.msg import AgentState
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, TransformStamped
 from nav_msgs.msg import Odometry
 from ocs2_msgs.msg import MpcTargetTrajectories
+from tf2_msgs.msg import TFMessage
 from visualization_msgs.msg import Marker, MarkerArray
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -46,12 +50,7 @@ from gen_arena_world import ARENAS  # noqa: E402  single source of truth for are
 BASE_PX, BASE_PY = 6, 7   # admm_motion_adapter.hpp: 24-D state base position indices
 H = 1.0                   # obstacle height (matches gen_arena_world H)
 POST_R = 0.15             # door jamb posts -> hidden in RViz (kept everywhere else)
-BODY_R = 0.433            # half the 0.867 m contact distance
-# The ghost is the robot's OWN base mesh — the same file the RobotModel display loads, so the
-# copy is pixel-identical to the real dog and reads as "that dog, over there" rather than as a
-# new object. package:// resolves because vision60_description is already on the search path.
-GHOST_MESH = "package://vision60_description/meshes/vision60/base.stl"
-GATE = 0.5                # odom_residual_gate default (admm_agent_node) — colours the evidence
+GATE = 0.30               # odom_residual_gate default (admm_agent_node) — colours the evidence
 PALETTE = [(0.9, 0.1, 0.1), (0.1, 0.8, 0.1), (0.2, 0.4, 0.95),
            (0.1, 0.8, 0.8), (0.9, 0.2, 0.9), (0.9, 0.8, 0.1)]
 
@@ -78,7 +77,7 @@ class FleetViz(Node):
         # the decision. Redrawn on a timer rather than per message: three robots x two topics is
         # ~60 Hz of callbacks and RViz only needs to see the current state.
         self.truth_pub = self.create_publisher(MarkerArray, "/fleet_viz/truth", 10)
-        self.claim, self.body, self.views, self.yaw = {}, {}, {}, {}
+        self.claim, self.body, self.views = {}, {}, {}
         self.n_pub = 0
         for r in robots:
             self.create_subscription(AgentState, f"/robot{r}/admm/state",
@@ -87,15 +86,68 @@ class FleetViz(Node):
                                      lambda m, r=r: self.on_odom(r, m), 1)
         self.create_timer(0.1, self.publish_truth)
 
+        # Ghost TF mirror — the second RobotModel's data source (see header). Every transform
+        # whose PARENT lives under robot1/ is re-broadcast under ghost/ (odom->base from the
+        # estimator, base->links from robot_state_publisher), and the one frame nobody else
+        # publishes, world->ghost/robot1/odom, is synthesized at (claim - odom) so the whole
+        # articulated dog stands wherever robot1 SAYS it is. The parent filter also keeps our
+        # own ghost/* output from feeding back in. Dynamic frames are stashed and re-stamped on
+        # a 20 Hz timer instead of forwarded per message: the estimator ticks at hundreds of Hz
+        # and RViz needs none of that.
+        self.ghost_of = int(self.declare_parameter("ghost_of", 1).value)
+        self.gpre = f"robot{self.ghost_of}/"
+        self.dyn_mirror = {}     # ghost child frame -> latest renamed transform
+        self.static_mirror = []  # all renamed static transforms, latched as one message
+        self.tf_pub = self.create_publisher(TFMessage, "/tf", 10)
+        self.tf_static_pub = self.create_publisher(TFMessage, "/tf_static", latched)
+        # depth 100 mirrors tf2's own static listener: /tf_static is keyless, so a shallow
+        # reader history can silently drop the latched message of an earlier publisher.
+        deep_latched = QoSProfile(depth=100, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(TFMessage, "/tf", self.on_tf, 50)
+        self.create_subscription(TFMessage, "/tf_static", self.on_tf_static, deep_latched)
+        self.create_timer(0.05, self.publish_ghost_tf)
+
     def on_state(self, r, m):
         self.claim[r] = (float(m.xnow[0]), float(m.xnow[1]))
         self.views[r] = list(m.members)
 
     def on_odom(self, r, m):
         self.body[r] = (float(m.pose.pose.position.x), float(m.pose.pose.position.y))
-        # The ghost wears the real yaw: it is claiming to be THIS robot, so a copy facing a
-        # different way would read as a second, unrelated dog rather than as the same one.
-        self.yaw[r] = (float(m.pose.pose.orientation.z), float(m.pose.pose.orientation.w))
+
+    def on_tf(self, msg):
+        # rclpy hands each subscription its own deserialized copies — renaming in place is safe.
+        for t in msg.transforms:
+            if t.header.frame_id.startswith(self.gpre):
+                t.header.frame_id = "ghost/" + t.header.frame_id
+                t.child_frame_id = "ghost/" + t.child_frame_id
+                self.dyn_mirror[t.child_frame_id] = t
+
+    def on_tf_static(self, msg):
+        known = {s.child_frame_id for s in self.static_mirror}
+        grew = False
+        for t in msg.transforms:
+            if t.header.frame_id.startswith(self.gpre) and "ghost/" + t.child_frame_id not in known:
+                t.header.frame_id = "ghost/" + t.header.frame_id
+                t.child_frame_id = "ghost/" + t.child_frame_id
+                self.static_mirror.append(t)
+                grew = True
+        if grew:
+            self.tf_static_pub.publish(TFMessage(transforms=self.static_mirror))
+
+    def publish_ghost_tf(self):
+        claim, body = self.claim.get(self.ghost_of), self.body.get(self.ghost_of)
+        now = self.get_clock().now().to_msg()
+        root = TransformStamped()
+        root.header.stamp = now
+        root.header.frame_id = "world"
+        root.child_frame_id = f"ghost/{self.gpre}odom"
+        if claim and body:  # until both flow, a zero offset parks the ghost inside the real dog
+            root.transform.translation.x = claim[0] - body[0]
+            root.transform.translation.y = claim[1] - body[1]
+        root.transform.rotation.w = 1.0
+        for t in self.dyn_mirror.values():
+            t.header.stamp = now
+        self.tf_pub.publish(TFMessage(transforms=[root] + list(self.dyn_mirror.values())))
 
     def evicted(self, i):
         """Majority of the OTHER robots' rosters exclude i — the coordinator's rule verbatim.
@@ -129,17 +181,6 @@ class FleetViz(Node):
                 continue
             resid = math.hypot(claim[0] - body[0], claim[1] - body[1])
             hot = resid > GATE
-
-            g = base("ghost", r, Marker.MESH_RESOURCE)
-            g.mesh_resource = GHOST_MESH
-            g.pose.position.x, g.pose.position.y, g.pose.position.z = claim[0], claim[1], 0.0
-            qz, qw = self.yaw.get(r, (0.0, 1.0))
-            g.pose.orientation.z, g.pose.orientation.w = qz, qw
-            g.scale.x = g.scale.y = g.scale.z = 1.0
-            # Barely there while it coincides with the body, unmistakable once it detaches.
-            g.color.r, g.color.g, g.color.b = (0.95, 0.25, 0.25) if hot else (0.4, 0.6, 0.95)
-            g.color.a = 0.60 if hot else 0.18
-            arr.markers.append(g)
 
             t = base("status", r, Marker.TEXT_VIEW_FACING)
             t.pose.position.x, t.pose.position.y, t.pose.position.z = body[0], body[1], 1.05
