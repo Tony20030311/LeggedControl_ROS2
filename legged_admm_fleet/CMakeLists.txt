@@ -98,6 +98,15 @@ target_link_libraries(test_false_signal admm_core)
 add_executable(test_trust test/test_trust.cpp)
 target_link_libraries(test_trust admm_core)
 
+# RelWithDebInfo carries -DNDEBUG, which expands every assert() in these gates to nothing:
+# they printed their PASS line and exited 0 whether or not the assertions held. Scoped to
+# the test targets on purpose — admm_core is shared with the robot binaries and keeps its
+# release semantics.
+foreach(t test_distributed_parity test_agent_timeout test_agent_failover
+          test_corpse_keepout test_false_signal test_trust)
+  target_compile_options(${t} PRIVATE -UNDEBUG)
+endforeach()
+
 # register the gates with ctest so `colcon test` actually runs them (they used to be
 # build-only; the D_MIN 1.0->1.3 change shipped with nothing re-running them)
 enable_testing()
