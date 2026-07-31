@@ -7,7 +7,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <deque>
 #include <map>
+#include <optional>
 #include <vector>
 
 #include "legged_upper_control/admm_constants.hpp"  // N, XI_DIM, px_index, MAX_VX, TS
@@ -37,6 +40,80 @@ inline bool visible(const Eigen::Vector2d& pi, const Eigen::Vector2d& pj,
         if ((w - t * d).norm() < o.radius) return false;
     }
     return true;
+}
+
+// --- observation channel (spec section 5.1): the input a compromised peer cannot author ---
+//
+// The node subscribes each peer's stand-in sensor topic and stores raw, un-noised world-frame
+// samples here in time order; noise and time-alignment are applied at the point of USE (see
+// obs_noise below and admm_agent_node.cpp's per-cycle offset computation), not at the point of
+// storage, so the same buffer serves both a clean re-query and a noisy one without duplicating
+// samples.
+struct ObsSample {
+    double t;              // sim time, seconds, when this sample was taken
+    Eigen::Vector2d pos;
+};
+
+// Linear interpolation of a peer's observed position onto `t_query`, using the pair of samples
+// in `buf` (assumed time-ordered, as the node's subscription callback appends them) that bracket
+// it. `nullopt` when `t_query` falls outside [buf.front().t, buf.back().t] in EITHER direction --
+// not only before the oldest sample but ALSO past the newest one.
+//
+// The "past the newest sample" case is the one worth spelling out: an earlier draft of this
+// design returned the newest sample there, which INVENTS an observation. If the sensor stream
+// stalls (dropped topic, an occlusion that never lifts, a crossed range gate) while the peer's
+// claim keeps advancing, extrapolating the last-known truth forward makes the residual against
+// that claim grow with the silence -- and convicts an honest, merely-unobserved peer exactly the
+// way a frozen HOLD claim compared against live odom does elsewhere in this file. Before the
+// window is symmetrically wrong for the same reason: absence of evidence must read as absence of
+// evidence, not as "yes, still there."
+inline std::optional<Eigen::Vector2d> interp_at(const std::deque<ObsSample>& buf, double t_query) {
+    if (buf.empty()) return std::nullopt;
+    if (t_query < buf.front().t || t_query > buf.back().t) return std::nullopt;
+    for (std::size_t i = 1; i < buf.size(); ++i) {
+        if (t_query <= buf[i].t) {
+            const double span = buf[i].t - buf[i - 1].t;
+            const double a = span > 1e-9 ? (t_query - buf[i - 1].t) / span : 0.0;
+            return buf[i - 1].pos + a * (buf[i].pos - buf[i - 1].pos);
+        }
+    }
+    return buf.back().pos;   // buf.size() == 1: front == back == t_query, already bounds-checked
+}
+
+// Hash-mix a 64-bit state (splitmix64), used below to turn (slot, observer, target, seed) into
+// two independent-looking uniform draws without a stateful generator.
+inline std::uint64_t obs_noise_mix(std::uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+// Sensor noise as a DETERMINISTIC function of (slot, observer, target, seed) -- not a sequential
+// PRNG draw. A stateful generator advanced once per visible peer would consume a different
+// number of samples depending on how many peers happen to be visible this slot, so two runs of
+// the identical script would diverge for a reason that has nothing to do with what changed
+// between them (the same determinism discipline that pins the OSQP version for this project).
+//
+// `seed` must vary PER RUN (the node's obs_noise_seed_ parameter): a seed fixed at compile time
+// would give every run of one experiment arm the same noise realisation, making a measured
+// false-positive rate n=1 in the one dimension a repeated-run measurement is supposed to cover.
+inline Eigen::Vector2d obs_noise(std::uint64_t slot, int observer, int target, double sigma,
+                                 int seed) {
+    std::uint64_t h = obs_noise_mix(static_cast<std::uint64_t>(seed));
+    h = obs_noise_mix(h ^ slot);
+    h = obs_noise_mix(h ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(observer)) << 32 |
+                          static_cast<std::uint32_t>(target)));
+    const std::uint64_t h1 = obs_noise_mix(h);
+    const std::uint64_t h2 = obs_noise_mix(h1);
+    // top 53 bits -> uniform in (0, 1], never exactly 0 (Box-Muller needs log(u1))
+    auto to_unit = [](std::uint64_t v) {
+        return (static_cast<double>(v >> 11) + 1.0) / (static_cast<double>(1ULL << 53) + 1.0);
+    };
+    const double u1 = to_unit(h1), u2 = to_unit(h2);
+    const double r = sigma * std::sqrt(-2.0 * std::log(u1));
+    const double theta = 2.0 * M_PI * u2;
+    return Eigen::Vector2d(r * std::cos(theta), r * std::sin(theta));
 }
 
 // --- conservative anchoring (spec section 4.1) ---

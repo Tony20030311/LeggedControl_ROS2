@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <deque>
 #include <iostream>
 #include <map>
 #include <vector>
@@ -62,6 +63,79 @@ void test_visible_nan_obstacle_radius_abstains() {
     const std::vector<Obstacle> bad_obs{{Eigen::Vector2d(6.58, 0.0), nan}};
     // A non-finite radius forces abstention.
     assert(!visible({5.0, 0.0}, {8.0, 0.0}, bad_obs, 4.0));
+}
+
+// --- observation channel: interp_at, obs_noise (spec 5.1) ---
+
+void test_interp_brackets_correctly() {
+    const std::deque<ObsSample> buf{{0.0, {0.0, 0.0}}, {1.0, {2.0, 4.0}}};
+    const auto v = interp_at(buf, 0.5);
+    assert(v.has_value());
+    assert(std::abs((*v)[0] - 1.0) < 1e-12);
+    assert(std::abs((*v)[1] - 2.0) < 1e-12);
+}
+
+void test_interp_hits_a_sample_exactly() {
+    const std::deque<ObsSample> buf{{1.0, {3.0, 4.0}}, {2.0, {5.0, 6.0}}};
+    const auto v = interp_at(buf, 2.0);
+    assert(v.has_value());
+    assert(std::abs((*v)[0] - 5.0) < 1e-12);
+    assert(std::abs((*v)[1] - 6.0) < 1e-12);
+}
+
+void test_interp_returns_nullopt_below_the_window() {
+    const std::deque<ObsSample> buf{{1.0, {0.0, 0.0}}, {2.0, {1.0, 1.0}}};
+    assert(!interp_at(buf, 0.5).has_value());
+}
+
+void test_interp_returns_nullopt_above_the_window() {
+    // The property the rev-2 audit added: an earlier draft of this plan returned the newest
+    // sample here, which INVENTS an observation. If the sensor stream stalls (dropped topic,
+    // occlusion, network hiccup) while the peer's claim keeps moving, extrapolating the last
+    // truth forward makes the residual against that claim grow with the silence and would
+    // convict an honest, merely-unobserved peer.
+    const std::deque<ObsSample> buf{{1.0, {0.0, 0.0}}, {2.0, {1.0, 1.0}}};
+    assert(!interp_at(buf, 2.5).has_value());
+}
+
+void test_interp_empty_buffer_is_no_evidence() {
+    const std::deque<ObsSample> buf;
+    assert(!interp_at(buf, 0.0).has_value());
+}
+
+void test_interp_single_sample_is_only_valid_at_its_own_time() {
+    const std::deque<ObsSample> buf{{3.0, {7.0, 8.0}}};
+    const auto v = interp_at(buf, 3.0);
+    assert(v.has_value());
+    assert(std::abs((*v)[0] - 7.0) < 1e-12);
+    assert(!interp_at(buf, 3.1).has_value());
+    assert(!interp_at(buf, 2.9).has_value());
+}
+
+void test_obs_noise_is_deterministic_in_its_inputs() {
+    const Eigen::Vector2d a = obs_noise(5, 1, 2, 0.02, 7);
+    const Eigen::Vector2d b = obs_noise(5, 1, 2, 0.02, 7);
+    assert((a - b).norm() < 1e-15);   // same (slot, observer, target, seed) -> same draw
+}
+
+void test_obs_noise_changes_with_seed() {
+    // The seed must vary per run (obs_noise_seed_ parameter). A seed fixed at compile time would
+    // give every run of one experiment arm the same noise realisation, making a measured
+    // false-positive rate n=1 in the one dimension the measurement is supposed to cover.
+    const Eigen::Vector2d a = obs_noise(5, 1, 2, 0.02, 7);
+    const Eigen::Vector2d b = obs_noise(5, 1, 2, 0.02, 8);
+    assert((a - b).norm() > 1e-9);
+}
+
+void test_obs_noise_changes_with_slot_and_target() {
+    // Not a sequential PRNG draw: a real generator advanced once per visible peer would consume a
+    // different number of samples depending on how many peers happen to be visible this slot, so
+    // two runs of the identical script would diverge for a reason unrelated to what changed. A
+    // pure function of the identifying tuple cannot do that -- checked here by varying each of
+    // slot and target independently and confirming the draw actually moves.
+    const Eigen::Vector2d base = obs_noise(5, 1, 2, 0.02, 7);
+    assert((obs_noise(6, 1, 2, 0.02, 7) - base).norm() > 1e-9);
+    assert((obs_noise(5, 1, 3, 0.02, 7) - base).norm() > 1e-9);
 }
 
 TrustParams params() {
@@ -451,6 +525,15 @@ int main() {
     test_visible_nan_is_not_visible();
     test_visible_nan_obstacle_pos_abstains();
     test_visible_nan_obstacle_radius_abstains();
+    test_interp_brackets_correctly();
+    test_interp_hits_a_sample_exactly();
+    test_interp_returns_nullopt_below_the_window();
+    test_interp_returns_nullopt_above_the_window();
+    test_interp_empty_buffer_is_no_evidence();
+    test_interp_single_sample_is_only_valid_at_its_own_time();
+    test_obs_noise_is_deterministic_in_its_inputs();
+    test_obs_noise_changes_with_seed();
+    test_obs_noise_changes_with_slot_and_target();
     test_llr_zero_crossing_at_half_the_lie();
     test_llr_is_clamped();
     test_trust_has_a_ceiling();

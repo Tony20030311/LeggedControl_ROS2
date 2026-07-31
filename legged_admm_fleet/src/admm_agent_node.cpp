@@ -13,9 +13,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <vector>
@@ -23,6 +26,7 @@
 #include <ocs2_core/misc/LoadData.h>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rmw/types.h>  // rmw_gid_t, RMW_GID_STORAGE_SIZE (observation-channel publisher pin)
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -282,6 +286,48 @@ public:
                                                     m->pose.pose.position.y);
                 }, cmd_opts));
         }
+        // OBSERVATION CHANNEL — the input a compromised peer cannot author (spec section 5.1).
+        // The channel above is still the PEER'S OWN report; an attacker that owns its estimator as
+        // well as its planner makes both agree and a detector built only on that channel goes
+        // blind (measured 2026-07-30). This one is what THIS robot's sensor sees of the peer.
+        // /robotJ/hardware/odom is published by the Gazebo plugin from the model's world pose, not
+        // by robot J's estimator or planner, so in simulation it is the closest available stand-in
+        // for "my sensor looking at you" (spec section 7: a zero-fidelity stand-in — ground truth
+        // + noise + range/occlusion; the noise is added where the sample is USED, in
+        // updatePeerOffsets, not here, so the stored buffer stays a clean re-queryable history).
+        //
+        // Subscribed under a LOCAL name ("observed/robotJ") and remapped at launch to the global
+        // topic — a useful seam for swapping in real perception later, but a remap grants no
+        // security by itself: the resolved DDS topic is still one global name, and any process on
+        // the domain may publish to it regardless of what this node calls it. What actually cannot
+        // be forged is the DDS WRITER GUID that arrives with every sample
+        // (rclcpp::MessageInfo::get_rmw_message_info().publisher_gid), so the first writer seen on
+        // each peer's observation topic is latched and every other writer is dropped — the same
+        // idea as the transport's from-topic check (dds_transport.hpp onState), stronger because
+        // it does not trust the topic name at all.
+        obs_window_ = declare_parameter<int>("obs_window", 30);  // samples/peer kept; bounds memory (~3s), not precision
+        for (int j : dogs_) {
+            if (j == self_id_) continue;
+            peer_truth_subs_.push_back(create_subscription<nav_msgs::msg::Odometry>(
+                "observed/robot" + std::to_string(j), 1,
+                [this, j](nav_msgs::msg::Odometry::SharedPtr m, const rclcpp::MessageInfo& info) {
+                    const auto& gid = info.get_rmw_message_info().publisher_gid;
+                    std::lock_guard<std::mutex> l(mu_);
+                    auto& pinned = obs_gid_[j];
+                    if (!pinned) {
+                        pinned = gid;
+                    } else if (std::memcmp(pinned->data, gid.data, RMW_GID_STORAGE_SIZE) != 0) {
+                        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                            "[agent%d] second publisher on robot%d's observation topic — dropped",
+                            self_id_, j);
+                        return;
+                    }
+                    auto& buf = peer_truth_[j];
+                    buf.push_back({now().seconds(), Eigen::Vector2d(m->pose.pose.position.x,
+                                                                    m->pose.pose.position.y)});
+                    while (static_cast<int>(buf.size()) > obs_window_) buf.pop_front();
+                }, cmd_opts));
+        }
         // Latch the per-dog goal (transient_local), same discovery-race reason as plan_sub_ below:
         // a short-lived `ros2 topic pub` goal burst can match one agent late and drop its goal for
         // that dog -> it parks at spawn while the others walk. Latching lets a late-matching agent
@@ -507,6 +553,46 @@ private:
         }
         return v_eff;
     }
+    // CONSERVATIVE ANCHORING'S OFFSET SOURCE (spec 4.1). Turns this cycle's observation of each
+    // peer into the correction AgentCore::step will apply to that peer's WHOLE broadcast before
+    // building the barrier (agent_core.cpp, section 2a). Must run BEFORE agent_->step() for this
+    // cycle: AgentCore reads peer_offset_ synchronously inside step(), so an offset set after the
+    // call would land one cycle late.
+    //
+    // `claimed` comes from agent_->peer_xnow(), which after the LAST completed step() holds
+    // exactly what peer j broadcast in the cycle transport_->last_seen()[j] names (the same
+    // one-cycle lag followSpeed already reads peer state under). The observation is interpolated
+    // to THAT slot, not to "now": comparing a peer's claim against an observation taken at a
+    // different time manufactures a correction nobody's claim asked for, the same reasoning that
+    // keeps Gate 2 from differencing a frozen HOLD claim against live odom.
+    //
+    // No observation for a peer this cycle (never subscribed, stream stalled, or the query lands
+    // outside interp_at's window) -> that peer is simply ABSENT from the map handed to
+    // set_peer_offsets, and AgentCore applies zero correction to it -- structurally the same "no
+    // observation -> no correction" contract agent_core.cpp already implements for an empty map.
+    void updatePeerOffsets(std::uint64_t slot, const Eigen::Vector2d& self_p) {
+        std::map<int, std::deque<admm::ObsSample>> truth;
+        { std::lock_guard<std::mutex> l(mu_); truth = peer_truth_; }
+        const auto seen = transport_->last_seen();
+        std::map<int, Eigen::Vector2d> off;
+        for (const auto& kv : agent_->peer_xnow()) {
+            const int j = kv.first;
+            if (j == self_id_) continue;
+            const auto tb = truth.find(j);
+            if (tb == truth.end()) continue;   // no observation channel heard from j at all
+            const auto sit = seen.find(j);
+            if (sit == seen.end()) continue;   // no claim to anchor
+            const auto obs = admm::interp_at(tb->second, static_cast<double>(sit->second) * ts_);
+            if (!obs) continue;   // stream stalled or hasn't started yet: no evidence, no correction
+            const Eigen::Vector2d noisy =
+                *obs + admm::obs_noise(slot, self_id_, j, trust_.sigma, obs_noise_seed_);
+            auto& prev = peer_offset_prev_[j];
+            off[j] = admm::conservative_offset(self_p, kv.second.head<2>(), noisy,
+                                               3.0 * trust_.sigma, admm::MAX_VX * ts_, prev);
+            prev = off[j];
+        }
+        agent_->set_peer_offsets(off);
+    }
     // THE CONTRACT: goals live inside the A* map. The planner already clamps an outside goal
     // and walks the last leg straight, but leaving the contract implicit is what let a demo
     // send the fleet to x=-5 against x_min=-2 and then produced a class of failures nobody was
@@ -588,6 +674,8 @@ private:
         // last cycle's (empty on cycle 0 -> returns v_). Ported from the centralized node.
         const double v_cruise = followSpeed(P0, goal, s[admm::BASE_YAW]);
         Eigen::MatrixXd xdes = admm::build_reference(P0, wp, admm::N, admm::TS, v_cruise, 0.80);
+
+        updatePeerOffsets(slot, P0);  // conservative anchoring's offsets for THIS cycle's step()
 
         admm::StepResult res;
         const auto t_wall0 = std::chrono::steady_clock::now();
@@ -1101,6 +1189,13 @@ private:
     // factor of two. Worst danger window = 2 + 3 = 5 slots = 0.5 s = 0.28 m closed, inside 0.433.
     admm::GateLimits gate_;                         // map bounds + Gate 1 thresholds
     std::map<int, Eigen::Vector2d> peer_odom_;      // guarded by mu_ (written from cmd_cbg_)
+    // OBSERVATION CHANNEL (spec 5.1): raw, un-noised, time-ordered samples per peer, guarded by
+    // mu_ (written from cmd_cbg_, the subscription's callback group). Noise is added at the point
+    // of use (updatePeerOffsets), not here, so this buffer stays a clean, re-queryable history.
+    std::map<int, std::deque<admm::ObsSample>> peer_truth_;
+    std::map<int, std::optional<rmw_gid_t>> obs_gid_;  // first writer GID/peer topic (latched); guarded by mu_
+    int obs_window_ = 30;                            // samples kept per peer (declared with the subscription)
+    std::map<int, Eigen::Vector2d> peer_offset_prev_;  // conservative_offset rate-limit state; cycle()-thread only
     std::map<int, double> resid_;                   // low-passed |odom - claimed|, cycle() only
     double resid_alpha_ = 0.2, resid_gate_ = 0.5;
     bool log_only_ = true;                          // measure before you block; see calibration
@@ -1109,7 +1204,7 @@ private:
     admm::TrustParams trust_;
     std::map<int, double> l_self_;                  // first-hand log-odds per peer (trust_step_self)
     std::map<int, std::map<int, double>> l_relay_;  // l_relay_[i][j]: i's relayed belief about j
-    int obs_noise_seed_ = 0;
+    int obs_noise_seed_ = 0;                        // must vary per run -- see admm::obs_noise
     double input_stale_s_ = 1.0;                    // own obs/odom age that self-fences us
     std::vector<admm::ArenaRect> arena_rects_;      // A*-only wall boxes (door)
     std::vector<Eigen::Vector2d> path_;             // cached A* route; cycle()-thread only
@@ -1120,6 +1215,7 @@ private:
     rclcpp::Subscription<ocs2_msgs::msg::MpcObservation>::SharedPtr obs_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     std::vector<rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr> peer_odom_subs_;
+    std::vector<rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr> peer_truth_subs_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
     rclcpp::Subscription<admm_fleet_msgs::msg::FleetPlan>::SharedPtr plan_sub_;  // gets this dog's goal
     // reentrant group for this agent's own command/state callbacks (obs/odom/goal/plan) so the

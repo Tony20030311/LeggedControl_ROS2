@@ -62,6 +62,15 @@ def _distributed_agents(context, *_a, **_k):
                 'astar_y_min': float(LaunchConfiguration('astar_y_min').perform(context)),
                 'astar_y_max': float(LaunchConfiguration('astar_y_max').perform(context)),
             }],
+            remappings=[
+                # The observation channel is the observer's own sensor, subscribed under a LOCAL
+                # name so a real perception source can be swapped in later without touching the
+                # node. The remap itself grants no security -- the resolved DDS topic is still one
+                # global name -- the publisher-GID pin in admm_agent_node.cpp is what actually
+                # rejects an impostor writer (see the subscription's comment).
+                (f'observed/robot{int(j)}', f'/robot{int(j)}/hardware/odom')
+                for j in ids if int(j) != int(i)
+            ],
         ))
     return nodes
 
