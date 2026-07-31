@@ -11,9 +11,11 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <exception>
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -295,8 +297,70 @@ int main() {
                   << " full-round cycles)\n";
     }
 
+    // ---------- E. task 4b: peer keep-out obstacle slots survive an eviction rebuild ----------
+    // Eviction never mutates an AgentCore in place (see D above) -- it always constructs a fresh
+    // one over the survivors. peer_keepout_idx_ is per-instance, so "survives" means: the new
+    // instance gets the right slot COUNT for its new roster, and set_peer_keepout doesn't crash
+    // on a valid neighbor id or on one that no longer exists (self, or an evicted peer).
+    {
+        const std::vector<int> dogs3 = {1, 2, 3};
+        const std::vector<EdgeKey> edges3 = {{1, 2}, {1, 3}, {2, 3}};
+        LaplacianFormation form(formations());
+        form.set_formation("V");
+        DeadlineLoopback tp(200ms);
+
+        AgentCore a1(1, dogs3, edges3, &form, 0.3, no_obs, no_walls, 1, &tp, 0.30,
+                    /*enable_peer_keepout=*/true);
+        CHECK(a1.n_obstacles() == 2,
+              "E: 3-dog core should carry 2 peer keep-out slots, got " << a1.n_obstacles());
+        a1.set_peer_keepout({{2, Eigen::Vector2d(5.0, 5.0)}, {3, Eigen::Vector2d(-5.0, -5.0)}});
+        a1.set_peer_keepout({{1, Eigen::Vector2d(0.0, 0.0)}, {99, Eigen::Vector2d(0.0, 0.0)}});
+
+        // eviction rebuild: robot3 dropped, formation gone -- exactly admm_agent_node::rebuild().
+        const std::vector<int> dogs2 = {1, 2};
+        const std::vector<EdgeKey> edges2 = {{1, 2}};
+        AgentCore a1b(1, dogs2, edges2, /*formation=*/nullptr, 0.3, no_obs, no_walls, 1, &tp,
+                     0.30, /*enable_peer_keepout=*/true);
+        CHECK(a1b.n_obstacles() == 1,
+              "E: rebuilt 2-dog core should carry 1 peer keep-out slot, got " << a1b.n_obstacles());
+        a1b.set_peer_keepout({{2, Eigen::Vector2d(1.0, 1.0)}});  // still a neighbor
+        a1b.set_peer_keepout({{3, Eigen::Vector2d(1.0, 1.0)}});  // evicted id: silently ignored
+        std::cout << "E: peer keep-out obstacle slots track eviction/rebuild OK\n";
+    }
+
+    // ---------- F. task 4b: born-violated construction guard ----------
+    // The static radius (D_MIN, not corpse_keepout's mobile D_MIN+MAX_VX*TAU_REACT) is only
+    // safe because it clears the V formation's 1.40 m spacing (see agent_core.cpp). Pin BOTH
+    // directions: the real formation must not trip the guard, and a formation deliberately
+    // tighter than the keep-out radius must -- loudly, at construction, not as a silent
+    // born-violated lock discovered later.
+    {
+        LaplacianFormation form_v(formations());
+        form_v.set_formation("V");
+        DeadlineLoopback tp(200ms);
+        bool threw = false;
+        try {
+            AgentCore a(1, {1, 2, 3}, {{1, 2}, {1, 3}, {2, 3}}, &form_v, 0.3, no_obs, no_walls, 1,
+                       &tp, 0.30, /*enable_peer_keepout=*/true);
+        } catch (const std::exception&) { threw = true; }
+        CHECK(!threw, "F: V formation (1.40 m spacing) must not trip the born-violated guard");
+
+        std::map<std::string, std::vector<Eigen::Vector2d>> tight_cfg = {
+            {"TIGHT", {{0.0, 0.0}, {0.5, 0.0}, {0.25, 0.4}}}};  // min spacing 0.47 m < D_MIN
+        LaplacianFormation form_tight(tight_cfg);
+        form_tight.set_formation("TIGHT");
+        threw = false;
+        try {
+            AgentCore a(1, {1, 2, 3}, {{1, 2}, {1, 3}, {2, 3}}, &form_tight, 0.3, no_obs, no_walls,
+                       1, &tp, 0.30, /*enable_peer_keepout=*/true);
+        } catch (const std::exception&) { threw = true; }
+        CHECK(threw, "F: a formation tighter than the keep-out radius must throw at construction");
+        std::cout << "F: born-violated construction guard OK\n";
+    }
+
     if (failures == 0) {
-        std::cout << "D-failover PASS: reset broadcast + solo + survivor pair + rejoin\n";
+        std::cout << "D-failover PASS: reset broadcast + solo + survivor pair + rejoin + "
+                     "peer keep-out rebuild + born-violated guard\n";
         return 0;
     }
     std::cout << "D-failover FAIL (" << failures << " checks)\n";

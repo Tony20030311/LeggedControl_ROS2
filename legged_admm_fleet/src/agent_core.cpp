@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace admm {
@@ -51,13 +54,43 @@ AgentCore::AgentCore(int self_id, std::vector<int> dogs, std::vector<EdgeKey> ed
         }
     // LOCAL PAIRWISE SAFETY NET (task 4b spike, see agent_core.hpp). One fixed obstacle slot
     // per peer, parked far outside any arena until an observation moves it — never binds, the
-    // same inactivity idiom an out-of-range arena obstacle already relies on. radius mirrors
-    // corpse_keepout's static case exactly (r_eff = radius + robot_margin == D_MIN); soft_k0
-    // for the same reason a corpse gets it — this can be observed already violated (a noisy
-    // first sample right after spawn) and a hard k=0 row would mean infeasible, forever.
+    // same inactivity idiom an out-of-range arena obstacle already relies on. soft_k0 for the
+    // same reason a corpse gets it — this can be observed already violated (a noisy first
+    // sample right after spawn) and a hard k=0 row would mean infeasible, forever.
+    //
+    // RADIUS: deliberately the STATIC corpse_keepout form (r_eff = radius + robot_margin ==
+    // D_MIN), NOT the mobile form (+ MAX_VX*TAU_REACT), even though a live peer never stops
+    // moving the way a corpse doesn't. corpse_keepout's mobile margin is correct THERE because
+    // eviction rebuilds the fleet onto a formation that no longer flies at the old spacing (a
+    // 2-dog column survives the wider circle fine). This constraint runs on the LIVE, still-in-
+    // formation fleet: mobile would be D_MIN + MAX_VX*TAU_REACT = 1.3 + 0.55*0.6 = 1.63 m, and
+    // the V formation's own side length is 1.40 m < 1.63 m — every agent would start this
+    // constraint already violated against its own spawn pose (the born-violated self-lock this
+    // project has already been bitten by once). Static (r_eff == D_MIN == 1.30 m < 1.40 m) is
+    // the only choice that isn't born-violated here. The guard below turns a future formation
+    // or D_MIN change that closes that 0.10 m of headroom into a loud construction-time throw
+    // instead of a silent repeat of that self-lock.
     if (enable_peer_keepout) {
-        constexpr double kParkFar = 1000.0;
+        // Outside the ~20x14 m arena (astar_x/y bounds) but not 1000 -- a sentinel that far out
+        // makes this CBF row's coefficients ~100-300x an in-range row's, which can skew OSQP's
+        // equilibration. 75 clears the arena with room to spare while keeping the row ordinary.
+        constexpr double kParkFar = 75.0;
         const double r = std::max(0.10, D_MIN - robot_margin);
+        const double r_eff = r + robot_margin;  // == D_MIN unless the 0.10 floor binds
+        if (formation_) {
+            if (const auto* off = formation_->current_offsets(); off && off->size() == dogs_.size()) {
+                double min_spacing = std::numeric_limits<double>::infinity();
+                for (std::size_t a = 0; a < off->size(); ++a)
+                    for (std::size_t b = a + 1; b < off->size(); ++b)
+                        min_spacing = std::min(min_spacing, ((*off)[a] - (*off)[b]).norm());
+                if (std::isfinite(min_spacing) && r_eff >= min_spacing)
+                    throw std::runtime_error(
+                        "enable_peer_keepout: effective radius " + std::to_string(r_eff) +
+                        " m >= formation '" + formation_->current_formation() + "' spacing " +
+                        std::to_string(min_spacing) + " m -- every agent would start born-"
+                        "violated against its own spawn pose (see agent_core.cpp)");
+            }
+        }
         for (const int j : neighbors_) {
             peer_keepout_idx_[j] = obstacles.size();
             obstacles.push_back({Eigen::Vector2d(kParkFar, kParkFar), r, /*soft_k0=*/true});
