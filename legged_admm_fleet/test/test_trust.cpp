@@ -20,6 +20,12 @@ namespace {
 // One plum pile on the x axis at 6.58 m, CBF radius 0.30 (fleet_config.cpp).
 std::vector<Obstacle> pegs() { return {{Eigen::Vector2d(6.58, 0.0), 0.30}}; }
 
+TrustParams params() {
+    TrustParams p;              // defaults are the derived values; see trust.hpp
+    p.sigma = 0.02;
+    return p;
+}
+
 void test_visible_clear_line() {
     assert(visible({4.0, 0.0}, {5.0, 0.0}, {}, 4.0));
 }
@@ -63,6 +69,62 @@ void test_visible_nan_obstacle_radius_abstains() {
     const std::vector<Obstacle> bad_obs{{Eigen::Vector2d(6.58, 0.0), nan}};
     // A non-finite radius forces abstention.
     assert(!visible({5.0, 0.0}, {8.0, 0.0}, bad_obs, 4.0));
+}
+
+// --- evidence_plausible / refuted_llr / smear_llr (task 7 items 5-6) ---
+
+void test_evidence_plausible_grazing_sightline_is_not_refuted() {
+    const TrustParams p = params();
+    const double margin = evidence_margin(p.sigma);
+    // Strict visible() blocks this sightline (perpendicular offset 0.20 m < CBF radius 0.30 m).
+    // The margin-widened check must NOT refute it: refuting a sightline this close to the edge
+    // convicts an honest reporter whose own claimed vantage point is only approximately where it
+    // actually was. This is the case that discriminates a shrunk-radius implementation from an
+    // "inflate the radius" one -- inflating would refute this even harder, not less.
+    assert(!visible({5.0, 0.20}, {8.0, 0.20}, pegs(), 4.0));
+    assert(evidence_plausible({5.0, 0.20}, {8.0, 0.20}, pegs(), 4.0, margin));
+}
+
+void test_evidence_plausible_still_refutes_straight_through_the_pile() {
+    const TrustParams p = params();
+    const double margin = evidence_margin(p.sigma);
+    // Dead center: no plausible margin should ever rescue a sightline straight through a post.
+    assert(!evidence_plausible({5.0, 0.0}, {8.0, 0.0}, pegs(), 4.0, margin));
+}
+
+void test_evidence_plausible_range_margin_forgives_the_boundary() {
+    const TrustParams p = params();
+    const double margin = evidence_margin(p.sigma);
+    assert(!visible({0.0, 0.0}, {4.1, 0.0}, {}, 4.0));
+    assert(evidence_plausible({0.0, 0.0}, {4.1, 0.0}, {}, 4.0, margin));
+    // Far outside even the widened range must still be refuted.
+    assert(!evidence_plausible({0.0, 0.0}, {10.0, 0.0}, {}, 4.0, margin));
+}
+
+void test_refuted_llr_is_small_negative_and_below_full_step() {
+    const TrustParams p = params();
+    const double l = refuted_llr(p);
+    assert(l < 0.0);
+    // Well below a full evidence step: geometry alone is a categorical signal, not a
+    // measurement, and must not by itself approach what one real residual can do.
+    assert(std::abs(l) < p.clamp_step * 0.5);
+}
+
+void test_smear_llr_no_check_contributes_nothing() {
+    const TrustParams p = params();
+    assert(smear_llr(/*have_check=*/false, {5.0, 0.0}, {0.0, 0.0}, p) == 0.0);
+}
+
+void test_smear_llr_uses_the_receivers_own_observation_not_the_targets_claim() {
+    const TrustParams p = params();
+    // Item 5: the residual is between the RELAYED report and what *I* (the receiver) saw of the
+    // target myself -- not against the target's own claim. A big disagreement here is evidence
+    // the REPORTER fabricated the sighting, computed with the exact same trust_llr used for
+    // first-hand evidence (same rule, different operands).
+    const double l = smear_llr(true, Eigen::Vector2d(1.0, 0.0), Eigen::Vector2d(0.0, 0.0), p);
+    const double expect = trust_llr(1.0, p.sigma, p.d_lie, p.clamp_step, p.credit_ratio);
+    assert(std::abs(l - expect) < 1e-12);
+    assert(l < 0.0);   // 1.0 m residual is well past d_lie/2 = 0.15: this is a smear, not noise
 }
 
 // --- observation channel: interp_at, obs_noise (spec 5.1) ---
@@ -138,12 +200,6 @@ void test_obs_noise_changes_with_slot_and_target() {
     assert((obs_noise(5, 1, 3, 0.02, 7) - base).norm() > 1e-9);
 }
 
-TrustParams params() {
-    TrustParams p;              // defaults are the derived values; see trust.hpp
-    p.sigma = 0.02;
-    return p;
-}
-
 void test_llr_zero_crossing_at_half_the_lie() {
     const TrustParams p = params();
     // A residual of exactly d_lie/2 is neutral: below it evidence supports honesty, above it
@@ -184,7 +240,7 @@ void test_one_relayer_alone_can_never_evict() {
     double C = 0.0;
     for (int i = 0; i < 1000; ++i) C = trust_step_relay(C, -p.clamp_step, p.l_max, p);
     std::map<int, double> relay{{2, C}};
-    assert(!trust_fences_peer(trust_total(0.0, relay), p));   // hearsay alone is not a verdict
+    assert(!trust_fences_peer(trust_total(0.0, relay, p), p));   // hearsay alone is not a verdict
 }
 
 void test_hearsay_cannot_reach_the_eviction_threshold() {
@@ -196,6 +252,32 @@ void test_hearsay_cannot_reach_the_eviction_threshold() {
     assert(p.l_max < -p.l_evict);
 }
 
+void test_relay_sum_capped_not_per_source_at_n5() {
+    const TrustParams p = params();
+    // Task 7 item 4 / step 3: at N=5, THREE peers can each independently corroborate a lie about
+    // one target. Each relayer alone converges to (near) l_max via trust_step_relay's own
+    // per-source cap -- exactly the "one relayer alone can never evict" property proven above.
+    // The bug this test pins: summing three such per-source-capped contributions WITHOUT capping
+    // the TOTAL puts roughly 3*l_max of pure hearsay behind one verdict, which clears l_evict
+    // with no first-hand evidence at all and breaks "relayed evidence alone never evicts".
+    std::map<int, double> relay;
+    for (int src : {2, 3, 4}) {
+        double C = 0.0;
+        for (int i = 0; i < 1000; ++i) C = trust_step_relay(C, -p.clamp_step, p.l_max, p);
+        relay[src] = C;
+    }
+    double raw_sum = 0.0;
+    for (const auto& kv : relay) raw_sum += kv.second;
+    printf("test_relay_sum_capped_not_per_source_at_n5: raw_sum=%.2f l_evict=%.2f capped_total=%.2f\n",
+           raw_sum, p.l_evict, trust_total(0.0, relay, p));
+    // Pins that this scenario actually exercises the failure mode it claims to: the UNCLAMPED
+    // sum of 3 relayers crosses the eviction threshold on its own, so a test that passed here
+    // even under the old (per-source-only) code would be too weak to mean anything.
+    assert(raw_sum < p.l_evict);
+    assert(!trust_fences_peer(trust_total(0.0, relay, p), p)
+           && "hearsay from 3 relayers alone must not evict, even at N=5");
+}
+
 void test_first_hand_evidence_still_convicts_with_a_relayer_agreeing() {
     const TrustParams p = params();
     double C = 0.0;
@@ -205,7 +287,7 @@ void test_first_hand_evidence_still_convicts_with_a_relayer_agreeing() {
     int solo = 0, with_help = 0;
     for (double L = 0.0; !trust_fences_peer(L, p) && solo < 200; ++solo)
         L = trust_step_self(L, -p.clamp_step, p);
-    for (double L = 0.0; !trust_fences_peer(trust_total(L, relay), p) && with_help < 200; ++with_help)
+    for (double L = 0.0; !trust_fences_peer(trust_total(L, relay, p), p) && with_help < 200; ++with_help)
         L = trust_step_self(L, -p.clamp_step, p);
     printf("test_first_hand_evidence_still_convicts_with_a_relayer_agreeing: solo=%d with_help=%d ratio=%.1f\n", solo, with_help, solo > 0 ? (double)solo / with_help : 0);
     assert(with_help <= solo);
@@ -614,6 +696,7 @@ void test_trust_step_observed_blocked_peer_is_untouched() {
     // not decaying at all. A blocked peer's L must not move, no matter how damning the evidence.
     const double L = -20.0;   // already deep in convicted territory
     const double got = trust_step_observed(L, /*blocked=*/true, /*claim_fresh=*/true,
+                                           /*visible=*/true,
                                            Eigen::Vector2d(5.0, 0.0), Eigen::Vector2d(0.0, 0.0), p);
     assert(got == L);
 }
@@ -628,6 +711,21 @@ void test_trust_step_observed_no_fresh_claim_decays_only() {
     // that would otherwise scream "lying".
     const double L = -3.0;
     const double got = trust_step_observed(L, /*blocked=*/false, /*claim_fresh=*/false,
+                                           /*visible=*/true,
+                                           Eigen::Vector2d(5.0, 0.0), Eigen::Vector2d(0.0, 0.0), p);
+    assert(std::abs(got - trust_step_self(L, 0.0, p)) < 1e-12);
+}
+
+void test_trust_step_observed_not_visible_decays_only() {
+    const TrustParams p = params();
+    // Task 7 item 1: a peer this agent cannot see right now -- out of range, or behind an
+    // obstacle -- must produce NO evidence even with a fresh claim and a damning observed/claimed
+    // pair. Abstaining only costs latency; crediting an impossible sightline would let an
+    // attacker hide behind a pillar and still be judged, which the design's acceptance criteria
+    // (§9.4) explicitly forbid.
+    const double L = -3.0;
+    const double got = trust_step_observed(L, /*blocked=*/false, /*claim_fresh=*/true,
+                                           /*visible=*/false,
                                            Eigen::Vector2d(5.0, 0.0), Eigen::Vector2d(0.0, 0.0), p);
     assert(std::abs(got - trust_step_self(L, 0.0, p)) < 1e-12);
 }
@@ -636,7 +734,8 @@ void test_trust_step_observed_fresh_claim_uses_the_residual() {
     const TrustParams p = params();
     const Eigen::Vector2d observed(0.30, 0.0), claimed(0.0, 0.0);   // r = d_lie exactly
     const double L = 0.0;
-    const double got = trust_step_observed(L, /*blocked=*/false, /*claim_fresh=*/true, observed, claimed, p);
+    const double got = trust_step_observed(L, /*blocked=*/false, /*claim_fresh=*/true,
+                                           /*visible=*/true, observed, claimed, p);
     const double expect = trust_step_self(
         L, trust_llr((observed - claimed).norm(), p.sigma, p.d_lie, p.clamp_step, p.credit_ratio), p);
     assert(std::abs(got - expect) < 1e-12);
@@ -679,6 +778,12 @@ int main() {
     test_visible_nan_is_not_visible();
     test_visible_nan_obstacle_pos_abstains();
     test_visible_nan_obstacle_radius_abstains();
+    test_evidence_plausible_grazing_sightline_is_not_refuted();
+    test_evidence_plausible_still_refutes_straight_through_the_pile();
+    test_evidence_plausible_range_margin_forgives_the_boundary();
+    test_refuted_llr_is_small_negative_and_below_full_step();
+    test_smear_llr_no_check_contributes_nothing();
+    test_smear_llr_uses_the_receivers_own_observation_not_the_targets_claim();
     test_interp_brackets_correctly();
     test_interp_hits_a_sample_exactly();
     test_interp_returns_nullopt_below_the_window();
@@ -694,6 +799,7 @@ int main() {
     test_first_hand_evidence_can_evict();
     test_one_relayer_alone_can_never_evict();
     test_hearsay_cannot_reach_the_eviction_threshold();
+    test_relay_sum_capped_not_per_source_at_n5();
     test_first_hand_evidence_still_convicts_with_a_relayer_agreeing();
     test_an_untrusted_relayer_carries_no_weight();
     test_belief_decays_toward_neutral();
@@ -715,6 +821,7 @@ int main() {
     test_peer_xnow_fresh_survives_an_edge_round_timeout();
     test_trust_step_observed_blocked_peer_is_untouched();
     test_trust_step_observed_no_fresh_claim_decays_only();
+    test_trust_step_observed_not_visible_decays_only();
     test_trust_step_observed_fresh_claim_uses_the_residual();
     test_evict_patience_belief_block_gets_the_short_patience();
     test_evict_patience_roster_exclusion_or_gate2_keeps_the_long_patience();

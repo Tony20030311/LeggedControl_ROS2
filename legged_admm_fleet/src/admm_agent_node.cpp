@@ -127,7 +127,13 @@ public:
         trust_.l_evict       = declare_parameter<double>("trust_l_evict", trust_.l_evict);
         trust_.sigma         = declare_parameter<double>("obs_sigma", trust_.sigma);
         trust_.d_lie         = declare_parameter<double>("trust_d_lie", trust_.d_lie);
+        trust_.refute_ratio  = declare_parameter<double>("trust_refute_ratio", trust_.refute_ratio);
         obs_noise_seed_      = declare_parameter<int>("obs_noise_seed", 0);
+        // Task 7 item 1: the range visible() gates first-hand evidence (and, widened, item 6's
+        // geometric refutation of relayed reports) on. Same order of magnitude as the arena's own
+        // scale (plum piles 2.2-2.3 m apart); 4.0 clears the fleet's own follow_range (1.5) and
+        // evade_range (0.5) with room for an honest reporter to actually see its neighbour.
+        obs_range_ = declare_parameter<double>("obs_range", 4.0);
         // The decision boundary is d_lie/2, not d_lie: that is where the log-likelihood crosses
         // zero. It must stay well under the 0.433 m buffer AND well above the measured residual,
         // or the detector either misses damage or convicts honest robots.
@@ -715,6 +721,10 @@ private:
         Eigen::MatrixXd xdes = admm::build_reference(P0, wp, admm::N, admm::TS, v_cruise, 0.80);
 
         updatePeerOffsets(slot, P0);  // conservative anchoring's offsets for THIS cycle's step()
+        // Task 7 / spec 5.2: hand over LAST cycle's beliefStep observations so THIS cycle's
+        // step() broadcasts them (send_state runs at the top of step(), before this cycle's own
+        // beliefStep has produced anything yet) -- see AgentCore::set_evidence.
+        agent_->set_evidence(ev_out_peer_, ev_out_pos_, ev_out_slot_);
 
         admm::StepResult res;
         const auto t_wall0 = std::chrono::steady_clock::now();
@@ -772,7 +782,7 @@ private:
             // refreshed this slot (see beliefStep's comment) -- gate2 ignores the flag entirely.
             // NOT res.n_timeouts==0: an EdgeXi/EdgeZ timeout deep in the ADMM loop also bumps
             // n_timeouts on an otherwise-solved cycle where peer_xnow_ is perfectly fresh.
-            detect(slot, res.peer_xnow_fresh);
+            detect(slot, res.peer_xnow_fresh, P0);
             trackMobileCorpses();
             if (res.hold) maybeEvict(slot);
             publishStats(slot, res, t_cycle_wall);
@@ -786,7 +796,7 @@ private:
         // dog it is not allowed to evict. Measured 2026-07-28 (d_0728_045133): 51 straight
         // "NOT ARMED", peer silent 370 slots, zero evictions, run dead.
         evict_armed_ = true;
-        detect(slot, res.peer_xnow_fresh);
+        detect(slot, res.peer_xnow_fresh, P0);
         trackMobileCorpses();
 
         // ADAPT: translate xi to estimator frame, build 24-D target, yaw latch, publish.
@@ -993,16 +1003,19 @@ private:
     // whether OUR OWN barrier for the current slot ever completed, so a peer talking exactly on
     // time can still show a frozen, stale claim here — differencing that against a live
     // observation fabricates up to 0.11 m of residual against a 0.15 m decision boundary.
-    void beliefStep(std::uint64_t slot, bool claims_fresh) {
+    void beliefStep(std::uint64_t slot, bool claims_fresh, const Eigen::Vector2d& self_p) {
         if (!evict_armed_) return;
         std::map<int, std::deque<admm::ObsSample>> truth;
         { std::lock_guard<std::mutex> l(mu_); truth = peer_truth_; }
         const auto seen = transport_->last_seen();
+        ev_out_peer_.clear();
+        ev_out_pos_.clear();
         for (const auto& kv : agent_->peer_xnow()) {
             const int j = kv.first;
             if (j == self_id_) continue;
             const bool blocked = transport_->blocked(j);
             bool fresh = false;
+            bool vis = false;
             Eigen::Vector2d observed = Eigen::Vector2d::Zero();
             if (!blocked && claims_fresh) {
                 const auto sit = seen.find(j);
@@ -1013,25 +1026,36 @@ private:
                     // manufactures a discrepancy nobody's claim produced.
                     if (const auto obs =
                             admm::interp_at(tb->second, static_cast<double>(sit->second) * ts_)) {
-                        observed = *obs + admm::obs_noise(slot, self_id_, j, trust_.sigma, obs_noise_seed_);
-                        fresh = true;
+                        // TASK 7 ITEM 1: visibility on the RAW ground-truth position, before
+                        // noise -- occlusion/range are properties of where the body actually is.
+                        // Not visible -> no evidence at all, and nothing to share either: the
+                        // attacker hiding behind a pillar must not appear in ev_peer/ev_pos.
+                        vis = admm::visible(self_p, *obs, arena_obs_, obs_range_);
+                        if (vis) {
+                            observed = *obs + admm::obs_noise(slot, self_id_, j, trust_.sigma, obs_noise_seed_);
+                            fresh = true;
+                            ev_out_peer_.push_back(j);
+                            ev_out_pos_.push_back(observed[0]);
+                            ev_out_pos_.push_back(observed[1]);
+                        }
                     }
                 }
             }
             double& L = l_self_[j];
-            L = admm::trust_step_observed(L, blocked, fresh, observed, kv.second.head<2>(), trust_);
+            L = admm::trust_step_observed(L, blocked, fresh, vis, observed, kv.second.head<2>(), trust_);
             if (blocked) continue;   // already latched off; nothing left to decide
+            const double total = admm::trust_total(L, l_relay_[j], trust_);
             // Logged unconditionally, same discipline as gate2's residual line: this IS the
             // calibration procedure for trust_.sigma / trust_.d_lie.
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-                                 "[agent%d] belief robot%d L=%.3f fresh=%d evict<%.2f",
-                                 self_id_, j, L, int(fresh), trust_.l_evict);
-            if (!admm::trust_fences_peer(L, trust_)) continue;
+                                 "[agent%d] belief robot%d L_self=%.3f total=%.3f fresh=%d vis=%d evict<%.2f",
+                                 self_id_, j, L, total, int(fresh), int(vis), trust_.l_evict);
+            if (!admm::trust_fences_peer(total, trust_)) continue;
             if (log_only_) {
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                                      "[agent%d] BELIEF would reject robot%d (L=%.3f < %.2f) — "
                                      "log_only, message still accepted",
-                                     self_id_, j, L, trust_.l_evict);
+                                     self_id_, j, total, trust_.l_evict);
             } else {
                 transport_->block_peer(j, "belief threshold");
                 // Tag WHY this peer is blocked so maybeEvict can give it the shorter, belief-
@@ -1041,13 +1065,79 @@ private:
                 belief_blocked_.insert(j);
             }
         }
+        ev_out_slot_ = slot;   // stamp for the NEXT broadcast (agent_->set_evidence in cycle())
+
+        // SECOND-HAND EVIDENCE (task 7 items 4-6, spec 5.2/5.3): what OTHER peers say they saw.
+        // One reporter's whole message is accumulated into a SINGLE llr contribution before it
+        // touches l_self_[reporter] -- see trust.hpp's refuted_llr/smear_llr comment for why one
+        // call per SLOT, not one per reported target, matters at N > 3.
+        //
+        // Gated on claims_fresh for the exact same reason the first-hand loop above is:
+        // peer_evidence() (like peer_xnow()) is only assigned when THIS agent's own AgentState
+        // barrier actually completes this cycle and stays frozen on a barrier-miss HOLD. Without
+        // this gate, a HOLD would replay the SAME frozen (i, j, z) through trust_step_self /
+        // trust_step_relay every silent slot -- decaying and re-crediting on data that never
+        // changed, which is not new evidence and must not be treated as if it were.
+        if (!claims_fresh) return;
+        const double margin = admm::evidence_margin(trust_.sigma);
+        for (const auto& kv : agent_->peer_evidence()) {
+            const int i = kv.first;
+            if (i == self_id_ || transport_->blocked(i)) continue;   // a fenced peer's word is nothing
+            const auto& ev = kv.second;                              // {peer, pos, slot} as received
+            const auto xi = agent_->peer_xnow().find(i);
+            if (xi == agent_->peer_xnow().end()) continue;            // i itself is gone (evicted)
+            double contrib = 0.0;
+            for (std::size_t k = 0; k < ev.peer.size(); ++k) {
+                const int j = ev.peer[k];
+                if (j == self_id_ || j == i) continue;
+                const Eigen::Vector2d z(ev.pos[2 * k], ev.pos[2 * k + 1]);
+                if (!z.allFinite()) continue;
+                // ITEM 6: geometry i itself is bound by, using i's OWN CLAIMED position as its
+                // vantage point -- we do not need to have observed i to run this check, which is
+                // the whole point of broadcasting positions instead of residuals. Refuted -> the
+                // report cannot be about anything real; nothing further is extracted from it.
+                if (!admm::evidence_plausible(xi->second.head<2>(), z, arena_obs_, obs_range_, margin)) {
+                    contrib += admm::refuted_llr(trust_);
+                    continue;
+                }
+                // ITEM 5: the smear check. If THIS agent independently observed j at the exact
+                // slot the report is about, compare directly -- j's true position at that instant
+                // is exactly what was just measured, so a disagreement is evidence the REPORTER
+                // fabricated its sighting, not evidence against j.
+                bool have_check = false;
+                Eigen::Vector2d self_obs_j = Eigen::Vector2d::Zero();
+                if (const auto tb = truth.find(j); tb != truth.end()) {
+                    if (const auto obs = admm::interp_at(tb->second, static_cast<double>(ev.slot) * ts_)) {
+                        if (admm::visible(self_p, *obs, arena_obs_, obs_range_)) {
+                            self_obs_j = *obs;
+                            have_check = true;
+                        }
+                    }
+                }
+                contrib += admm::smear_llr(have_check, z, self_obs_j, trust_);
+                if (transport_->blocked(j)) continue;   // j already fenced; nothing left to decide
+                const auto cj = agent_->peer_xnow().find(j);
+                if (cj == agent_->peer_xnow().end()) continue;
+                // Hearsay about j itself: corroborated against j's OWN claim, weighted and capped
+                // by how much WE trust i (trust_step_relay's own invariant).
+                const double r = (z - cj->second.head<2>()).norm();
+                double& C = l_relay_[j][i];
+                C = admm::trust_step_relay(C, admm::trust_llr(r, trust_.sigma, trust_.d_lie,
+                                                              trust_.clamp_step, trust_.credit_ratio),
+                                           l_self_[i], trust_);
+            }
+            if (contrib != 0.0) {
+                contrib = std::clamp(contrib, -trust_.clamp_step, trust_.clamp_step);
+                l_self_[i] = admm::trust_step_self(l_self_[i], contrib, trust_);
+            }
+        }
     }
 
     // Single dispatch point for both of gate2()'s call sites (HOLD path and SOLVED path), so the
     // selector lives in exactly one place instead of being duplicated at each call site. See the
     // constructor's startup log for which detector a given run actually armed.
-    void detect(std::uint64_t slot, bool claims_fresh) {
-        if (obs_gate2_) beliefStep(slot, claims_fresh);
+    void detect(std::uint64_t slot, bool claims_fresh, const Eigen::Vector2d& self_p) {
+        if (obs_gate2_) beliefStep(slot, claims_fresh, self_p);
         else gate2(slot);
     }
 
@@ -1337,13 +1427,22 @@ private:
     bool log_only_ = true;                          // measure before you block; see calibration
     // Belief layer (trust.hpp). Every default is derived. obs_gate2_ selects gate2() vs
     // beliefStep() at every call site (see detect()); l_self_ is beliefStep()'s per-peer state.
-    // l_relay_ is wired by a later task (evidence sharing, second-hand terms) -- declared here,
-    // unused until then.
     admm::TrustParams trust_;
     bool obs_gate2_ = false;                        // false=gate2() (A1), true=beliefStep() (A2)
     std::map<int, double> l_self_;                  // first-hand log-odds per peer (trust_step_self)
-    std::map<int, std::map<int, double>> l_relay_;  // l_relay_[i][j]: i's relayed belief about j
+    // l_relay_[j][i]: peer i's relayed contribution to OUR belief about peer j (trust_step_relay),
+    // so "all hearsay about j" is the single map l_relay_[j] that trust_total consumes directly.
+    std::map<int, std::map<int, double>> l_relay_;
     int obs_noise_seed_ = 0;                        // must vary per run -- see admm::obs_noise
+    // Task 7 item 1: sensing range visible() gates first-hand evidence on, and (widened) the
+    // geometric refutation of relayed reports (item 6).
+    double obs_range_ = 4.0;
+    // Task 7 / spec 5.2: this agent's own evidence, produced by the LAST beliefStep call and
+    // broadcast at the TOP of the NEXT step() (see cycle()'s set_evidence call and AgentState.msg
+    // for why ev_slot must accompany it). cycle()-thread only, same as ev_out_slot_.
+    std::vector<int> ev_out_peer_;
+    std::vector<double> ev_out_pos_;
+    std::uint64_t ev_out_slot_ = 0;
     double input_stale_s_ = 1.0;                    // own obs/odom age that self-fences us
     std::vector<admm::ArenaRect> arena_rects_;      // A*-only wall boxes (door)
     std::vector<Eigen::Vector2d> path_;             // cached A* route; cycle()-thread only

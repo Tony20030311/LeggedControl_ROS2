@@ -147,6 +147,12 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
     out.xibar = xibar_self;
     out.reset = (cycle_ == 0);
     out.members = dogs_;  // who I still consider part of this fleet; see AgentState.msg
+    // Task 7 / spec 5.2: this broadcast necessarily carries the PREVIOUS cycle's evidence (the
+    // node's beliefStep runs after step() returns, see set_evidence), so ev_slot names which
+    // slot it actually describes -- never `slot` itself.
+    out.ev_peer = ev_out_peer_;
+    out.ev_pos = ev_out_pos_;
+    out.ev_slot = ev_out_slot_;
     transport_->send_state(out);
     // How far the plan we just broadcast is from where we actually are. Diagnostic only.
     const double chain_margin =
@@ -177,6 +183,7 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
     for (auto& kv : states) {
         xibar[kv.first] = kv.second.xibar;
         xnow[kv.first] = kv.second.xnow;
+        peer_ev_[kv.first] = {kv.second.ev_peer, kv.second.ev_pos, kv.second.ev_slot};
     }
     // Exposed BEFORE anchoring, i.e. exactly what each peer claimed. The belief layer's evidence
     // is |claim - observation|; handing it the corrected claim would drive that residual to ~0 and

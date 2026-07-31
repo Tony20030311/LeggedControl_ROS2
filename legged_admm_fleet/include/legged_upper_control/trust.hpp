@@ -210,6 +210,12 @@ struct TrustParams {
     // that is undetectable and still spends the whole margin — the arithmetic that made the old
     // 0.50 gate useless.
     double d_lie = 0.30;
+    // Weight for a geometrically-refuted relayed report (task 7 item 6): "this sightline cannot
+    // exist" is a categorical signal, not a measurement, so it must move the REPORTER's belief
+    // far less than a real residual would. Smaller than credit_ratio (0.25) on purpose -- no
+    // calibration run has measured how often the margin-widened check still misfires against an
+    // honest reporter, so this stays conservative until one does.
+    double refute_ratio = 0.1;
 };
 
 // Log-likelihood ratio of HONEST over LYING for one residual, 2D Gaussian noise both sides:
@@ -253,10 +259,70 @@ inline double trust_step_relay(double C, double llr, double l_src, const TrustPa
     return std::clamp(p.lambda * C + w * llr, -cap, cap);
 }
 
-inline double trust_total(double L_self, const std::map<int, double>& relay) {
-    double L = L_self;
-    for (const auto& kv : relay) L += kv.second;
-    return L;
+// Total belief: first-hand plus hearsay, the SUM capped (task 7 item 4), not each source.
+// trust_step_relay already caps each entry at our own belief in THAT relayer, but summing
+// several such per-source-capped entries unclamped lets N-1 independent accusers each
+// contribute up to l_max -- at N >= 4 that alone crosses l_evict on pure hearsay, breaking
+// "relayed evidence alone never evicts" for any fleet larger than 3. Clamping the TOTAL
+// preserves the invariant for every N.
+inline double trust_total(double L_self, const std::map<int, double>& relay, const TrustParams& p) {
+    double s = 0.0;
+    for (const auto& kv : relay) s += kv.second;
+    return L_self + std::clamp(s, -p.l_max, p.l_max);
+}
+
+// --- second-hand evidence (spec 5.2/5.3, task 7): agents share what they SAW ---
+
+// How far outside strict geometry a relayed report may still be believed (task 7 item 6). The
+// arena is common knowledge -- its posts need no slack -- but the REPORTER's own claimed
+// position, used below as its assumed vantage point, carries up to two slots of lag (its own
+// broadcast delay plus the one-slot evidence-collection lag ev_slot exists to name), plus
+// ordinary observation noise. Refuting tighter than this convicts an honest reporter whose
+// sightline merely grazes an obstacle's edge.
+inline double evidence_margin(double sigma) { return MAX_VX * 2.0 * TS + 3.0 * sigma; }
+
+// Can this report even be true? `src` is the REPORTER's own claimed position -- never a real
+// observation of the reporter, which is the whole point: broadcasting positions instead of
+// residuals lets a receiver refute a fabricated report WITHOUT seeing either party. Margin-
+// widened on both checks, but in OPPOSITE directions: range is relaxed outward (a report just
+// past the nominal edge is not automatically impossible) while the occlusion radius is relaxed
+// INWARD -- shrunk, not grown -- because refuting on the bare CBF radius means a sightline that
+// merely grazes a pillar's edge is refutable by every honest bystander, on every slot, and a
+// handful of those fence an honest robot into mutual evasion (the input that once produced 179
+// solver failures and a frozen fleet).
+inline bool evidence_plausible(const Eigen::Vector2d& src, const Eigen::Vector2d& obs_pos,
+                               const std::vector<Obstacle>& obs, double range, double margin) {
+    std::vector<Obstacle> lenient;
+    lenient.reserve(obs.size());
+    for (const auto& o : obs) lenient.push_back({o.pos, std::max(0.0, o.radius - margin)});
+    return visible(src, obs_pos, lenient, range + margin);
+}
+
+// llr CONTRIBUTIONS for second-hand evidence, returned rather than applied: one reporter's
+// single broadcast can carry evidence about several targets (any N > 3), and each is a separate
+// contribution toward the SAME belief update for that reporter. Applying trust_step_self once
+// per contribution would decay L by lambda once per TARGET instead of once per SLOT; the caller
+// accumulates every contribution for one reporter across its whole message, clamps the sum
+// exactly like a first-hand llr, and calls trust_step_self exactly once.
+
+// A relayed report geometry rules out (task 7 item 6). A categorical "this cannot be true"
+// signal, not a residual, so it is weighted far below a full evidence step (see
+// TrustParams::refute_ratio).
+inline double refuted_llr(const TrustParams& p) { return -p.clamp_step * p.refute_ratio; }
+
+// task 7 item 5: the smear check. `have_check` is whether THIS agent independently observed the
+// TARGET at the exact slot the report describes (visible, and the observation buffer actually
+// covers that instant) -- without one there is nothing to compare against, and this must read
+// exactly like every other "no evidence" gate in this file: decay, no term, no exception. With
+// one, j's true position at that instant is exactly what was just measured, so disagreement with
+// the relayed report is evidence the REPORTER fabricated or misjudged its sighting -- not
+// evidence against j. This is the only mechanism that makes a false report about an innocent
+// peer cost the liar anything; without it the target's belief drops and the reporter pays
+// nothing.
+inline double smear_llr(bool have_check, const Eigen::Vector2d& reported,
+                        const Eigen::Vector2d& self_observed, const TrustParams& p) {
+    if (!have_check) return 0.0;
+    return trust_llr((reported - self_observed).norm(), p.sigma, p.d_lie, p.clamp_step, p.credit_ratio);
 }
 
 // One peer, one slot: the belief accumulator that replaces gate2's single-shot verdict (task 6).
@@ -279,12 +345,18 @@ inline double trust_total(double L_self, const std::map<int, double>& relay) {
 // `observed`/`claimed` must both be the RAW, un-anchored values (AgentCore::peer_xnow(), never
 // the conservative-anchoring-corrected position) -- see test_belief_residual_ignores_the_
 // anchoring_offset for the property this depends on.
-inline double trust_step_observed(double L, bool blocked, bool claim_fresh,
+//
+// `visible_peer` (task 7 item 1): admm::visible() computed by the caller on the RAW ground-truth
+// observation, before noise -- occlusion and range are properties of where the body actually is,
+// not of the noisy sample. A peer we cannot see produces NO evidence, exactly like a stale claim:
+// abstaining costs latency, crediting an impossible sightline would let an attacker hide behind a
+// pillar and still be judged, which the design's acceptance criteria explicitly forbid.
+inline double trust_step_observed(double L, bool blocked, bool claim_fresh, bool visible_peer,
                                   const Eigen::Vector2d& observed, const Eigen::Vector2d& claimed,
                                   const TrustParams& p) {
     if (blocked) return L;
     double llr = 0.0;
-    if (claim_fresh)
+    if (claim_fresh && visible_peer)
         llr = trust_llr((observed - claimed).norm(), p.sigma, p.d_lie, p.clamp_step, p.credit_ratio);
     return trust_step_self(L, llr, p);
 }

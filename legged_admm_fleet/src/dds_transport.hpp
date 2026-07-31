@@ -121,6 +121,11 @@ public:
         w.xibar = to_std(s.xibar);
         w.reset = m.reset;
         w.members.assign(s.members.begin(), s.members.end());
+        // Task 7 / spec 5.2: not touched by the sender-side fake_offset above, which lies about
+        // THIS agent's own position -- ev_peer/ev_pos describe what it saw of OTHERS.
+        w.ev_peer.assign(s.ev_peer.begin(), s.ev_peer.end());
+        w.ev_pos.assign(s.ev_pos.begin(), s.ev_pos.end());
+        w.ev_slot = s.ev_slot;
         w.tx_wall = wall_now_s();  // one-way latency stamp (same-host valid; real robots need NTP)
         bytes_tx_.fetch_add(wire_bytes(w), std::memory_order_relaxed);
         state_pub_->publish(w);
@@ -352,7 +357,8 @@ private:
     // unbounded array, 1 B bool). Constant per type at fixed N; excludes RTPS/UDP framing.
     static std::size_t wire_bytes(const admm_fleet_msgs::msg::AgentState& w) {
         return 8 + 4 + 8 + 4 + 4 * 8 + (4 + 8 * w.xibar.size()) + 1
-               + (4 + 4 * w.members.size());
+               + (4 + 4 * w.members.size())
+               + (4 + 4 * w.ev_peer.size()) + (4 + 8 * w.ev_pos.size()) + 8;
     }
     static std::size_t wire_bytes(const admm_fleet_msgs::msg::EdgeXi& w) {
         return 8 + 4 + 8 + 4 + 4 + 4 + (4 + 8 * w.xi.size()) + (4 + 8 * w.lam.size());
@@ -441,6 +447,9 @@ private:
         m.xibar = to_vec(w.xibar);
         m.reset = w.reset;
         m.members.assign(w.members.begin(), w.members.end());
+        m.ev_peer.assign(w.ev_peer.begin(), w.ev_peer.end());
+        m.ev_pos.assign(w.ev_pos.begin(), w.ev_pos.end());
+        m.ev_slot = w.ev_slot;
         // GATE 1. Returning HERE — before commitState — is the whole mechanism: last_seen_ is
         // not advanced, so the peer looks silent to maybeEvict and the EXISTING crash-failover
         // path takes over. Nothing else needs a concept of "liar". accountStale/pruneOld are

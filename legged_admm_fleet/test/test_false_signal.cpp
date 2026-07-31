@@ -148,6 +148,43 @@ int main() {
         assert(gateCheck(crawl, kRoster, g) == GateReason::kVel
                && "an impossible claimed velocity was accepted");
     }
+    // 5c. TASK 7 ITEM 3: the shared-evidence arrays. Attacker-controlled and deserialised on the
+    //     thread that services the consensus barrier -- an impossible payload here must drop the
+    //     whole message, the same as every other structural check above.
+    {
+        // A well-formed evidence array must still pass everything else.
+        AgentStateMsg ok = healthy(2, 3.0, 0.0);
+        ok.ev_peer = {1, 3};
+        ok.ev_pos = {1.0, 0.0, 3.0, 0.0};
+        assert(wellFormed(ok, kRoster, g) && "a well-formed evidence array was rejected");
+
+        AgentStateMsg mismatch = healthy(2, 3.0, 0.0);
+        mismatch.ev_peer = {1, 3};
+        mismatch.ev_pos = {1.0, 0.0};   // one entry short of 2*len(ev_peer)
+        assert(gateCheck(mismatch, kRoster, g) == GateReason::kEvidence
+               && "ev_pos/ev_peer length mismatch was accepted");
+
+        // More entries than the roster could ever produce (roster is {1,2,3}, sender is 2, so at
+        // most 2 OTHER peers -- but the gate itself only bounds against roster SIZE, not against
+        // "peers other than the sender", so this pins the coarser, cheap-to-check invariant).
+        AgentStateMsg oversized = healthy(2, 3.0, 0.0);
+        oversized.ev_peer = {1, 2, 3, 4};
+        oversized.ev_pos = std::vector<double>(8, 0.0);
+        assert(gateCheck(oversized, kRoster, g) == GateReason::kEvidence
+               && "an evidence array larger than the roster was accepted");
+
+        AgentStateMsg off_roster = healthy(2, 3.0, 0.0);
+        off_roster.ev_peer = {9};                     // not in kRoster {1,2,3}
+        off_roster.ev_pos = {0.0, 0.0};
+        assert(gateCheck(off_roster, kRoster, g) == GateReason::kEvidence
+               && "an off-roster observed id was accepted");
+
+        AgentStateMsg dup = healthy(2, 3.0, 0.0);
+        dup.ev_peer = {1, 1};                          // same peer reported twice
+        dup.ev_pos = {1.0, 0.0, 1.5, 0.0};
+        assert(gateCheck(dup, kRoster, g) == GateReason::kEvidence
+               && "a duplicate observed id was accepted");
+    }
     // 6. AND THE POINT OF GATE 2: a consistent lie sails through Gate 1. Shifting the whole
     //    message keeps it well-formed — only an independent observation can catch it.
     {

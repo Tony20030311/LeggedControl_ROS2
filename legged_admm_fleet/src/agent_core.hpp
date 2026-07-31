@@ -40,6 +40,20 @@ struct AgentStateMsg {
     // Sender's current roster. Empty means "not stated" and is read as "everyone still in", so
     // the loopback transport used by the parity test may leave it unset without changing a bit.
     std::vector<int> members;
+    // Observation-belief-trust (spec 5.2, task 7): what the sender SAW, not what it concluded.
+    // Empty ev_peer means "saw nobody this slot", which is also what a pre-evidence sender means,
+    // so the loopback parity harness (which never sets these) is unaffected.
+    std::vector<int> ev_peer;      // peer ids observed during the slot named by ev_slot
+    std::vector<double> ev_pos;    // observed (x,y) per entry, length exactly 2 * ev_peer.size()
+    std::uint64_t ev_slot = 0;     // which slot this evidence describes (see AgentState.msg)
+};
+
+// A peer's evidence as received (task 7, spec 5.2): copied straight out of AgentStateMsg once
+// Gate 1 has already validated it, so the receiver never has to re-check size/roster/duplicates.
+struct PeerEvidence {
+    std::vector<int> peer;
+    std::vector<double> pos;
+    std::uint64_t slot = 0;
 };
 
 // GATE 1 — the syntactic filter on the receive path, deliberately loose.
@@ -83,7 +97,7 @@ struct GateLimits {
 // pairwise CBF disappearing entirely. Twice on 2026-07-28 the only evidence was a throttled
 // "REJECTED" line that named no reason, which is not enough to tell a bug from an attack.
 enum class GateReason { kOk = 0, kRoster, kLength, kNonFinite, kArena, kStep,
-                        kVel, kAccel, kSlot };
+                        kVel, kAccel, kSlot, kEvidence };
 inline const char* gateReasonName(GateReason r) {
     switch (r) {
         case GateReason::kOk: return "ok";
@@ -95,6 +109,7 @@ inline const char* gateReasonName(GateReason r) {
         case GateReason::kVel: return "claimed velocity";
         case GateReason::kAccel: return "plan acceleration";
         case GateReason::kSlot: return "cycle_id window";
+        case GateReason::kEvidence: return "evidence array";
     }
     return "?";
 }
@@ -110,6 +125,18 @@ inline GateReason gateCheck(const AgentStateMsg& m, const std::vector<int>& rost
         return GateReason::kRoster;
     if (m.xibar.size() != XI_DIM) return GateReason::kLength;
     if (!m.xibar.allFinite() || !m.xnow.allFinite()) return GateReason::kNonFinite;
+    // EVIDENCE ARRAYS (task 7 item 3, spec 5.2). ev_peer/ev_pos are attacker-controlled and
+    // deserialise on the thread that services the consensus barrier, on a host also running a
+    // 250 Hz whole-body controller, so a malformed pair is dropped the same way any other
+    // impossible payload is: the whole message, not a best-effort partial read.
+    if (m.ev_pos.size() != 2 * m.ev_peer.size()) return GateReason::kEvidence;
+    if (m.ev_peer.size() > roster.size()) return GateReason::kEvidence;
+    for (std::size_t a = 0; a < m.ev_peer.size(); ++a) {
+        if (std::find(roster.begin(), roster.end(), m.ev_peer[a]) == roster.end())
+            return GateReason::kEvidence;
+        for (std::size_t b = a + 1; b < m.ev_peer.size(); ++b)
+            if (m.ev_peer[a] == m.ev_peer[b]) return GateReason::kEvidence;   // no duplicates
+    }
     // cycle_id must name a slot near NOW. It is not just a label: it keys the mailbox, it
     // advances last_seen_ (so a peer claiming slot+1000 can never be judged silent again), and
     // it drives the prune window (so one such message erases the honest peers' mail as well).
@@ -319,6 +346,20 @@ public:
     // the arithmetic is untouched. That is why the loopback parity harness, which has no
     // observation channel at all, stays bit-identical.
     void set_peer_offsets(const std::map<int, Eigen::Vector2d>& d) { peer_offset_ = d; }
+    // Relayed observations received over the LAST step()'s consensus barrier (task 7, spec 5.2),
+    // keyed by the reporting peer's id. The loopback parity harness never populates a peer's
+    // ev_peer, so this stays empty under it -- one more reason G1 parity is unaffected.
+    const std::map<int, PeerEvidence>& peer_evidence() const { return peer_ev_; }
+    // THIS agent's own evidence for the broadcast step() is about to send (spec 5.2's ev_slot):
+    // observations collected in the PREVIOUS beliefStep call, since send_state happens at the TOP
+    // of step() -- before this cycle's own evidence is produced. Must be called before step() for
+    // the same timing reason set_peer_offsets is. Default (never called) sends empty/0, matching
+    // an old peer and leaving the loopback parity harness untouched.
+    void set_evidence(std::vector<int> peer, std::vector<double> pos, std::uint64_t slot) {
+        ev_out_peer_ = std::move(peer);
+        ev_out_pos_ = std::move(pos);
+        ev_out_slot_ = slot;
+    }
     // LOCAL PAIRWISE SAFETY NET (task 4b spike): move peer j's dedicated keep-out circle to
     // where THIS agent's own sensor currently believes it is — the same observed, noised
     // position updatePeerOffsets already computes for conservative anchoring (no second
@@ -355,6 +396,12 @@ private:
     std::map<int, Eigen::Vector4d> peer_xnow_;      // cached from last step() (followSpeed)
     std::map<int, Eigen::VectorXd> peer_xibar_;     // cached from last step() (safe_prefix)
     std::map<int, Eigen::Vector2d> peer_offset_;    // conservative anchoring; empty = no observations
+    std::map<int, PeerEvidence> peer_ev_;           // task 7: peers' evidence from the LAST step()
+    // task 7: THIS agent's own evidence for the NEXT broadcast (set_evidence); empty/0 until the
+    // node calls set_evidence at least once.
+    std::vector<int> ev_out_peer_;
+    std::vector<double> ev_out_pos_;
+    std::uint64_t ev_out_slot_ = 0;
     // task 4b: peer robot id -> its dedicated keep-out obstacle's index in node_'s obstacle
     // list. Empty when enable_peer_keepout was false at construction (set_peer_keepout no-ops).
     std::map<int, std::size_t> peer_keepout_idx_;
