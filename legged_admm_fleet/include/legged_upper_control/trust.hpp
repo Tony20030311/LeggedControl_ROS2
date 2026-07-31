@@ -241,9 +241,32 @@ inline double trust_llr(double r, double sigma, double d_lie, double clamp_step,
     return l;
 }
 
-// First-hand evidence: decay, add, then cap the optimistic side at the ceiling.
+// First-hand evidence: decay, add, then clamp both sides. Task 7 review round 3: decay is NOT
+// symmetric in the sign of L.
+//   L > 0  (net trust)      decays toward neutral, same as before -- trust must be continually
+//                           re-earned, because any peer can be compromised at any moment.
+//   L <= 0 (net suspicion)  does NOT decay. "Not visible -> no evidence" (trust_step_observed
+//                           passes llr=0 here) must mean exactly zero evidence, not a term that
+//                           quietly moves L toward innocence merely because time passed.
+//                           Decaying suspicion the same way trust decays let an attacker launder
+//                           roughly 80% of 6 units of accumulated suspicion by hiding behind a
+//                           pillar for about 3 seconds (30 slots at lambda=0.951) -- clearing
+//                           suspicion requires evidence of honest behaviour, and evidence
+//                           requires visibility; being unobservable is not proof of innocence.
+//                           The same asymmetry TrustParams::credit_ratio already applies to
+//                           EVIDENCE (an honest residual counts for 1/4), applied here to the
+//                           PASSAGE OF TIME instead -- one rule, not a scenario branch.
+// Floor at l_evict - clamp_step (one evidence step below the conviction threshold): the mirror
+// of the l_max ceiling. Without it, sustained adverse evidence in log-only mode (blocking never
+// actually latches there, so this keeps being called past l_evict) makes L diverge without
+// bound, and an unbounded L makes recovery time unbounded too. One evidence step below the
+// threshold is far enough that conviction still reads cleanly and close enough that
+// rehabilitation stays reachable: recovery from the floor at the honest-credit rate (clamp_step
+// * credit_ratio per slot, no decay while L<=0) takes 23 slots (2.3 s) at the derived defaults
+// -- see test_trust_recovers_from_the_floor_in_a_bounded_number_of_slots.
 inline double trust_step_self(double L, double llr, const TrustParams& p) {
-    return std::min(p.lambda * L + llr, p.l_max);
+    const double decayed = (L > 0.0) ? p.lambda * L : L;
+    return std::clamp(decayed + llr, p.l_evict - p.clamp_step, p.l_max);
 }
 
 inline double trust_prob(double L) { return 1.0 / (1.0 + std::exp(-L)); }

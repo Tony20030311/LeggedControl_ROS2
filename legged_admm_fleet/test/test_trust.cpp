@@ -301,11 +301,55 @@ void test_an_untrusted_relayer_carries_no_weight() {
     assert(std::abs(C) < 1e-9);     // a peer we have already fenced cannot smear anyone
 }
 
-void test_belief_decays_toward_neutral() {
+void test_trust_decays_toward_neutral_only_when_positive() {
     const TrustParams p = params();
-    double L = -5.0;
+    // Task 7 review round 3: "L > 0 decays as before" -- a peer with net TRUST that goes
+    // unobserved must still lose that trust over time (any peer can be compromised at any
+    // moment), so this half of the old symmetric test survives, just no longer starting negative.
+    double L = 4.0;
     for (int i = 0; i < 500; ++i) L = trust_step_self(L, 0.0, p);
-    assert(std::abs(L) < 1e-3);     // stale evidence expires without an expiry rule
+    assert(std::abs(L) < 1e-3);
+}
+
+void test_suspicion_does_not_decay_without_evidence() {
+    const TrustParams p = params();
+    // THE TEST THAT WOULD HAVE CAUGHT THE DEFECT. A peer with net SUSPICION (L<0) that goes
+    // unobserved must NOT drift back toward neutral: "not visible -> no evidence"
+    // (trust_step_observed) has to mean exactly zero evidence, not a decay term that quietly
+    // launders suspicion merely because time passed. 50 slots = 5 s hidden (the review's example),
+    // long enough that the OLD symmetric rule would have erased ~80% of 6 units of suspicion.
+    const double L0 = -6.0;
+    double L = L0;
+    for (int i = 0; i < 50; ++i) L = trust_step_self(L, 0.0, p);
+    assert(L == L0);   // exactly unchanged, not merely "still suspicious"
+}
+
+void test_trust_never_diverges_below_the_floor() {
+    const TrustParams p = params();
+    // log_only mode never actually blocks a peer, so trust_step_self keeps being called past
+    // l_evict under sustained adverse evidence -- without a floor, L diverges without bound and
+    // recovery time becomes unbounded too.
+    double L = 0.0;
+    for (int i = 0; i < 1000; ++i) L = trust_step_self(L, -p.clamp_step, p);
+    assert(L >= p.l_evict - p.clamp_step - 1e-12);
+    assert(L <= p.l_evict - p.clamp_step + 1e-9);   // and it actually REACHES the floor, not just respects it
+}
+
+void test_trust_recovers_from_the_floor_in_a_bounded_number_of_slots() {
+    const TrustParams p = params();
+    // Rehabilitation must stay reachable: no amount of past lying may make recovery impossible,
+    // the mirror of "no amount of past honesty buys immunity" (test_trust_has_a_ceiling). From
+    // the floor, sustained visible HONEST behaviour (the r=0 credit, clamp_step*credit_ratio per
+    // slot) must reach neutral in a small, bounded number of slots -- reported here rather than
+    // just bounded, so the number can be quoted instead of recomputed.
+    double L = p.l_evict - p.clamp_step;   // the floor itself
+    const double credit = p.clamp_step * p.credit_ratio;   // the r=0 honest-evidence llr
+    int slots = 0;
+    while (L < 0.0 && slots < 200) { L = trust_step_self(L, credit, p); ++slots; }
+    printf("test_trust_recovers_from_the_floor_in_a_bounded_number_of_slots: %d slots (%.1f s) "
+           "from floor=%.2f to L=%.3f\n", slots, slots * TS, p.l_evict - p.clamp_step, L);
+    assert(L >= 0.0);
+    assert(slots == 23);   // exact, derived arithmetic: ceil(11.2 / 0.5) = 23 at the defaults
 }
 
 void test_neutral_belief_does_not_fence_the_spawn_formation() {
@@ -785,9 +829,11 @@ void test_trust_step_observed_combines_extra_llr_in_one_step_not_two() {
     // Review finding 3: a peer that is both a first-hand target AND a second-hand reporter this
     // slot must be decayed by lambda ONCE, not twice. Calling trust_step_self a second time would
     // give L2 = lambda*(lambda*L + first) + extra = lambda^2*L + lambda*first + extra, not the
-    // single-decay lambda*L + first + extra this function computes. Hand-verify at L=-1.0 with no
-    // first-hand term (claim_fresh=false) so only the decay-vs-decay^2 difference is visible.
-    const double L = -1.0, extra = -0.5;
+    // single-decay lambda*L + first + extra this function computes. Hand-verify at L=+1.0 (decay
+    // asymmetry, round 3, applies only when L>0 -- a negative L here would make decay a no-op
+    // either way and the once/twice cases indistinguishable) with no first-hand term
+    // (claim_fresh=false) so only the decay-vs-decay^2 difference is visible.
+    const double L = 1.0, extra = -0.5;
     const double got = trust_step_observed(L, /*blocked=*/false, /*claim_fresh=*/false,
                                            /*visible=*/false, {0, 0}, {0, 0}, extra, p);
     const double once = p.lambda * L + extra;               // single decay, this function's contract
@@ -804,7 +850,8 @@ void test_trust_step_observed_extra_llr_applies_without_a_fresh_first_hand_check
     const double L = 0.0, extra = -1.0;
     const double got = trust_step_observed(L, /*blocked=*/false, /*claim_fresh=*/false,
                                            /*visible=*/false, {5.0, 0.0}, {0.0, 0.0}, extra, p);
-    assert(std::abs(got - (p.lambda * L + extra)) < 1e-12);
+    const double decayed = (L > 0.0) ? p.lambda * L : L;   // decay asymmetry, round 3
+    assert(std::abs(got - (decayed + extra)) < 1e-12);
 }
 
 // --- evict_patience (Task 6, review finding 2): a belief conviction earns shorter patience,
@@ -867,7 +914,10 @@ int main() {
     test_relay_sum_capped_not_per_source_at_n5();
     test_first_hand_evidence_still_convicts_with_a_relayer_agreeing();
     test_an_untrusted_relayer_carries_no_weight();
-    test_belief_decays_toward_neutral();
+    test_trust_decays_toward_neutral_only_when_positive();
+    test_suspicion_does_not_decay_without_evidence();
+    test_trust_never_diverges_below_the_floor();
+    test_trust_recovers_from_the_floor_in_a_bounded_number_of_slots();
     test_neutral_belief_does_not_fence_the_spawn_formation();
     test_detection_fits_the_safety_margin();
     test_credit_ratio_scales_the_unsaturated_positive_branch();
