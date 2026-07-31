@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1172,6 +1173,11 @@ private:
         std::map<int, std::deque<admm::ObsSample>> truth;
         { std::lock_guard<std::mutex> l(mu_); truth = peer_truth_; }
         const auto seen = transport_->last_seen();
+        // Task 11 item 1: this cycle's unthrottled telemetry (CycleStats.tel_*), refilled from
+        // scratch every call -- cycle()-thread only, same discipline as ev_out_peer_/ev_out_pos_
+        // just below, so no lock needed.
+        tel_peer_.clear(); tel_resid_.clear(); tel_l_self_.clear();
+        tel_l_total_.clear(); tel_abstain_.clear();
 
         // SECOND-HAND EVIDENCE, PART 1: fold in what other peers reported THIS slot (task 7
         // items 4-6, spec 5.2/5.3), run BEFORE the first-hand loop below for two reasons:
@@ -1214,6 +1220,11 @@ private:
                     // constant is retuned.
                     if (!admm::evidence_plausible(xi->second.head<2>(), z, arena_obs_, obs_range_, margin)) {
                         contrib += admm::refuted_llr(trust_);
+                        // Task 11 item 4: refute_ratio calibration input. With no attacker
+                        // present every count here is a SPURIOUS refutation (a grazing sightline,
+                        // noise, timing skew) against the honest reporter i -- see
+                        // docs/superpowers/results/2026-07-31-trust-calibration.md.
+                        ++n_refuted_this_cycle_;
                         continue;
                     }
                     // ITEM 5: the smear check. If THIS agent independently observed j at the
@@ -1280,6 +1291,10 @@ private:
         // FIRST-HAND EVIDENCE: gating unchanged, but the llr this slot COMBINES with any
         // second-hand smear_contrib computed above for this same peer as a reporter -- exactly
         // once per peer, exactly once per slot (review finding 3).
+        // Task 11 item 1: the four reasons a row can carry no evidence -- see CycleStats.msg's
+        // tel_abstain comment, which this numbering must match.
+        constexpr std::int32_t kAbstainNone = 0, kAbstainPeerBlocked = 1, kAbstainNoFreshClaim = 2,
+                               kAbstainNoObsBuffer = 3, kAbstainNotVisible = 4;
         ev_out_peer_.clear();
         ev_out_pos_.clear();
         for (const auto& kv : agent_->peer_xnow()) {
@@ -1289,7 +1304,12 @@ private:
             bool fresh = false;
             bool vis = false;
             Eigen::Vector2d observed = Eigen::Vector2d::Zero();
+            // Narrowed below as the control flow rules cases out, one assignment per branch --
+            // the same nesting as before item 1, so behaviour (fresh/vis/observed/ev_out_*) is
+            // byte-for-byte unchanged; only this bookkeeping is new.
+            std::int32_t abstain = kAbstainPeerBlocked;
             if (!blocked && claims_fresh) {
+                abstain = kAbstainNoObsBuffer;
                 const auto sit = seen.find(j);
                 const auto tb = truth.find(j);
                 if (sit != seen.end() && tb != truth.end()) {
@@ -1303,22 +1323,38 @@ private:
                         // Not visible -> no evidence at all, and nothing to share either: the
                         // attacker hiding behind a pillar must not appear in ev_peer/ev_pos.
                         vis = admm::visible(self_p, *obs, arena_obs_, obs_range_);
+                        abstain = kAbstainNotVisible;
                         if (vis) {
                             observed = *obs + admm::obs_noise(slot, self_id_, j, trust_.sigma, obs_noise_seed_);
                             fresh = true;
+                            abstain = kAbstainNone;
                             ev_out_peer_.push_back(j);
                             ev_out_pos_.push_back(observed[0]);
                             ev_out_pos_.push_back(observed[1]);
                         }
                     }
                 }
+            } else if (!blocked) {
+                abstain = kAbstainNoFreshClaim;
             }
             double& L = l_self_[j];
             const auto sc = smear_contrib.find(j);
             L = admm::trust_step_observed(L, blocked, fresh, vis, observed, kv.second.head<2>(),
                                           sc != smear_contrib.end() ? sc->second : 0.0, trust_);
-            if (blocked) continue;   // already latched off; nothing left to decide
+            // Task 11 item 1: recorded for EVERY peer, including a blocked one (trust_total is
+            // pure and cheap -- the live decision path below still skips it there via `continue`,
+            // this is telemetry only). r is NaN whenever abstain != kAbstainNone: the residual
+            // literally doesn't exist for those rows, and a 0.0 would misrepresent "no evidence"
+            // as "perfect agreement" to whoever calibrates obs_sigma off this column.
             const double total = admm::trust_total(L, l_relay_[j], trust_);
+            tel_peer_.push_back(j);
+            tel_resid_.push_back(abstain == kAbstainNone
+                                      ? (observed - kv.second.head<2>()).norm()
+                                      : std::numeric_limits<double>::quiet_NaN());
+            tel_l_self_.push_back(L);
+            tel_l_total_.push_back(total);
+            tel_abstain_.push_back(abstain);
+            if (blocked) continue;   // already latched off; nothing left to decide
             // Logged unconditionally, same discipline as gate2's residual line: this IS the
             // calibration procedure for trust_.sigma / trust_.d_lie.
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
@@ -1581,6 +1617,19 @@ private:
         // the harness must be able to assert on it instead of trusting a run whose channel died
         // silently. See peer_truth_subs_'s subscription callback.
         m.n_obs_dropped = static_cast<int32_t>(obs_dropped_this_cycle_.exchange(0));
+        // Task 11 item 1: this cycle's unthrottled belief telemetry (see beliefStep and
+        // CycleStats.msg's tel_* comment). Copied, not moved: beliefStep clears and refills these
+        // itself at the top of its NEXT call, so an empty-until-refilled window doesn't matter,
+        // but a move would leave them in an unspecified state if publishStats ever ran twice
+        // between beliefStep calls (it doesn't today, but a copy costs nothing at fleet scale).
+        m.tel_peer = tel_peer_;
+        m.tel_resid = tel_resid_;
+        m.tel_l_self = tel_l_self_;
+        m.tel_l_total = tel_l_total_;
+        m.tel_abstain = tel_abstain_;
+        // Task 11 item 4: same read-and-reset pattern as n_obs_dropped just above.
+        m.n_refuted = n_refuted_this_cycle_;
+        n_refuted_this_cycle_ = 0;
         m.hold = res.hold;
         // A finite-guard (NaN xi) cycle returns hold=false but publishes NO target and
         // announces a fleet cold-start next slot; mark it so G5 doesn't read it as a normal cycle.
@@ -1652,6 +1701,16 @@ private:
     // l_relay_[j][i]: peer i's relayed contribution to OUR belief about peer j (trust_step_relay),
     // so "all hearsay about j" is the single map l_relay_[j] that trust_total consumes directly.
     std::map<int, std::map<int, double>> l_relay_;
+    // Task 11 item 1: this cycle's unthrottled per-peer telemetry (CycleStats.tel_*), written
+    // and cleared by beliefStep() only -- cycle()-thread only, same as ev_out_peer_/ev_out_pos_.
+    // Stay empty for the whole run under obs_gate2=false (gate2() never touches them).
+    std::vector<std::int32_t> tel_peer_;
+    std::vector<double> tel_resid_, tel_l_self_, tel_l_total_;
+    std::vector<std::int32_t> tel_abstain_;
+    // Task 11 item 4: relayed reports refuted as geometrically implausible THIS cycle (the
+    // refute_ratio calibration input). Same thread as tel_*_ above -- no atomic needed, unlike
+    // obs_dropped_this_cycle_ below, which is written from a subscription callback thread.
+    int n_refuted_this_cycle_ = 0;
     int obs_noise_seed_ = 0;                        // must vary per run -- see admm::obs_noise
     // Task 7 item 1: sensing range visible() gates first-hand evidence on, and (widened) the
     // geometric refutation of relayed reports (item 6).

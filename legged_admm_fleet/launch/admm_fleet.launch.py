@@ -31,6 +31,17 @@ def _distributed_agents(context, *_a, **_k):
     # agent gets inject_forged_obs=0 -> inert.
     forged_obs_attacker = int(LaunchConfiguration('forged_obs_attacker').perform(context))
     forged_obs_target = int(LaunchConfiguration('forged_obs_target').perform(context))
+    # Task 11 item 6 (arm selector, scripts/d_run.sh): which detector is armed and whether it
+    # blocks are per-run, launch-time decisions -- design spec section 9 protocol item 1 requires
+    # A1's mechanism to survive the whole matrix unchanged, so which one runs cannot be a
+    # mid-run `ros2 param set` (obs_gate2 is deliberately absent from admm_agent_node.cpp's
+    # runtime callback allowlist; see its REFUSED-param branch). detection_log_only IS runtime-
+    # settable too (kept that way for the d_run.sh LIE_LOGONLY pre-arm sequence), so this is only
+    # its bring-up default, not its only entry point.
+    obs_gate2 = LaunchConfiguration('obs_gate2').perform(context).lower() in ('true', '1')
+    detection_log_only = LaunchConfiguration('detection_log_only').perform(context).lower() in (
+        'true', '1')
+    obs_noise_seed = int(LaunchConfiguration('obs_noise_seed').perform(context))
     nodes = []
     # standalone formation slot allocator (was hosted on dog1; now its own process, no dog special)
     nodes.append(Node(
@@ -71,6 +82,9 @@ def _distributed_agents(context, *_a, **_k):
                 'enable_peer_keepout': LaunchConfiguration('enable_peer_keepout').perform(
                     context).lower() in ('true', '1'),
                 'inject_forged_obs': forged_obs_target if int(i) == forged_obs_attacker else 0,
+                'obs_gate2': obs_gate2,
+                'detection_log_only': detection_log_only,
+                'obs_noise_seed': obs_noise_seed,
             }],
             remappings=[
                 # The observation channel is the observer's own sensor, subscribed under a LOCAL
@@ -124,6 +138,14 @@ def generate_launch_description():
         # `ros2 param set` on whichever agent you choose, after bring-up.
         DeclareLaunchArgument('forged_obs_attacker', default_value='0'),
         DeclareLaunchArgument('forged_obs_target', default_value='0'),
+        # Task 11 item 6: the arm selector's three bring-up knobs (see scripts/d_run.sh's ARM
+        # case). Defaults reproduce pre-Task-11 behaviour exactly: gate2()'s single-shot EMA
+        # (A1), blocking, seed 0.
+        DeclareLaunchArgument('obs_gate2', default_value='false'),
+        DeclareLaunchArgument('detection_log_only', default_value='false'),
+        # Task 11 item 7: must vary per run, or a false-positive/refutation-rate measurement is
+        # n=1 in the only dimension that produces one -- see admm::obs_noise.
+        DeclareLaunchArgument('obs_noise_seed', default_value='0'),
         Node(
             package='legged_admm_fleet',
             executable='fleet_centralized_node',

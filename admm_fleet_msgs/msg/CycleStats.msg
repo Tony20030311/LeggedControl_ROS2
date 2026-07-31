@@ -24,3 +24,31 @@ float64[] r_prim_edge    # primal residual per adopted edge at cycle end
 float64[] r_prim_hist    # primal residual per ADMM round (convergence trajectory; len = rounds run)
 bool    hold             # HOLD this cycle (barrier timed out -> reused old target)
 bool    reset            # NaN/cold-start cycle: solved but published no target (fleet cold-starts next slot)
+
+# Task 11 item 1: unthrottled per-peer belief telemetry, one entry per peer beliefStep() judged
+# THIS cycle -- the replacement for the 1 Hz RCLCPP_*_THROTTLE lines in admm_agent_node.cpp's
+# beliefStep(), whose throttle state is per CALL SITE, not per peer: with two peers the token
+# alternates between them, so ~19 of 20 slots are unsampled and, because the peer map is ordered,
+# the lowest-id peer wins the token almost every time -- the attacker on the third robot is
+# essentially never printed. Deriving obs_sigma/refute_ratio from that samples exactly the tail
+# calibration exists to bound. Parallel arrays, same length, same indexing as tel_peer (same
+# convention as AgentState's ev_peer/ev_pos). Only populated when obs_gate2=true (arm A2 and its
+# variants); gate2()'s A1 EMA residual keeps its own, separately-calibrated throttled log.
+int32[]   tel_peer      # peer (target) robot id this row is about
+float64[] tel_resid     # |observed - claimed| this slot; NaN when tel_abstain != 0 (no evidence)
+float64[] tel_l_self    # first-hand log-odds for this peer AFTER this slot's update (l_self_[j])
+float64[] tel_l_total   # first-hand + capped hearsay (trust_total), computed every row for
+                         # telemetry even on a blocked peer, where the live code path skips it
+int32[]   tel_abstain    # why tel_resid carries no evidence this slot:
+                         #   0 = evidence produced (tel_resid is real)
+                         #   1 = peer_blocked    (already fenced; trust_step_self not even called)
+                         #   2 = no_fresh_claim  (this agent's own AgentState barrier held this slot)
+                         #   3 = no_obs_buffer   (no truth sample covers this slot -- dead/late channel)
+                         #   4 = not_visible     (occluded or past obs_range)
+# Task 11 item 4: relayed reports this agent judged geometrically impossible THIS cycle
+# (evidence_plausible() false -> refuted_llr applied against the REPORTER). With no attacker
+# present every one of these is a SPURIOUS refutation -- an honest reporter's sightline grazing a
+# pillar, noise, or timing skew -- and refute_ratio is calibrated from this count's rate over a
+# clean-flight run (see docs/superpowers/results/2026-07-31-trust-calibration.md). Same
+# read-and-reset-in-publishStats pattern as n_obs_dropped above.
+int32   n_refuted

@@ -53,10 +53,19 @@ class G5Logger(Node):
         self.ref = {}           # r -> (times[], px[], py[], vx[], vy[])  latest target
         self.tofs = {}          # r -> sim_epoch - controller_time (see THE TWO CLOCKS above)
         self.sf = open(f"{OUTDIR}/stats.csv", "w", buffering=1)
+        # n_obs_dropped: added to CycleStats by Task 10 but never reached this CSV -- a channel
+        # could die silently and no offline reader would ever see it. n_refuted is Task 11's
+        # refute_ratio calibration input (spurious relayed-report refutations this cycle). tel is
+        # the unthrottled per-peer belief telemetry (CycleStats.tel_*, beliefStep in
+        # admm_agent_node.cpp): one "peer:resid:l_self:l_total:abstain" group per peer judged this
+        # cycle, groups '|'-joined -- the calibration source for obs_sigma/refute_ratio/d_lie,
+        # since the RCLCPP_*_THROTTLE lines it replaces sample the tail, not the distribution.
+        # See docs/superpowers/results/2026-07-31-trust-calibration.md.
         self.sf.write("t,robot,cycle,achieved_rounds,n_timeouts,"
                       "t_wait_state,t_wait_xi,t_wait_z,t_cycle_wall,"
                       "t_node,t_edge_solve,bytes_tx,bytes_rx,hold,"
-                      "reset,n_stale,t_rx_mean,r_prim_hist\n")
+                      "reset,n_stale,t_rx_mean,r_prim_hist,"
+                      "n_obs_dropped,n_refuted,tel\n")
         self.tf = open(f"{OUTDIR}/traj.csv", "w", buffering=1)
         cols = ",".join(f"pos_err{r},vel_err{r},ax{r},ay{r},cx{r},cy{r}" for r in ROBOTS)
         self.tf.write("t," + cols + "\n")
@@ -94,11 +103,19 @@ class G5Logger(Node):
     def on_stats(self, m):
         t = self.get_clock().now().nanoseconds * 1e-9
         hist = "|".join(f"{x:.6g}" for x in m.r_prim_hist)
+        # Task 11 item 1: parallel arrays (tel_peer/tel_resid/tel_l_self/tel_l_total/tel_abstain),
+        # same convention as r_prim_hist above -- '|'-joined groups, one per peer judged this
+        # cycle. Empty under obs_gate2=false (A1 arm never populates these; see CycleStats.msg).
+        tel = "|".join(
+            f"{p}:{r:.6g}:{ls:.6g}:{lt:.6g}:{ab}"
+            for p, r, ls, lt, ab in zip(m.tel_peer, m.tel_resid, m.tel_l_self, m.tel_l_total,
+                                        m.tel_abstain))
         self.sf.write(f"{t:.3f},{m.robot_id},{m.cycle_id},{m.achieved_rounds},{m.n_timeouts},"
                       f"{m.t_wait_state:.6g},{m.t_wait_xi:.6g},{m.t_wait_z:.6g},"
                       f"{m.t_cycle_wall:.6g},{m.t_node:.6g},{m.t_edge_solve:.6g},"
                       f"{m.bytes_tx},{m.bytes_rx},{int(m.hold)},"
-                      f"{int(m.reset)},{m.n_stale},{m.t_rx_mean:.6g},{hist}\n")
+                      f"{int(m.reset)},{m.n_stale},{m.t_rx_mean:.6g},{hist},"
+                      f"{m.n_obs_dropped},{m.n_refuted},{tel}\n")
 
     def tick(self):
         # tofs too: without an observation from a dog there is no way to place its target's

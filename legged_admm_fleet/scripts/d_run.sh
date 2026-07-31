@@ -30,6 +30,32 @@ ARRIVE_DIST=99
 REJOIN=${REJOIN:-0}
 SURVIVORS=$(echo $ROBOTS | tr ' ' '\n' | grep -vx "$VICTIM" | tr '\n' ' ')
 
+# Task 11 item 6: the arm selector. Which detector is armed and whether it blocks are BRING-UP
+# (launch-time) decisions, not runtime ones -- obs_gate2 is deliberately absent from
+# admm_agent_node.cpp's runtime param callback allowlist (design spec section 9 protocol item 1:
+# A1's mechanism must survive the whole matrix unchanged, so which detector runs cannot itself
+# flip mid-run). detection_log_only IS runtime-settable (kept that way for LIE_LOGONLY's pre-arm
+# sequence below), so this is only its bring-up default.
+ARM=${ARM:-a1}
+case "$ARM" in
+  a0)         OBS_GATE2=false ;;   # no defence at all (log-only forced below)
+  a1)         OBS_GATE2=false ;;   # self-report gate: gate2()'s single-shot EMA odom residual
+  a2)         OBS_GATE2=true  ;;   # observation belief layer (this spec)
+  smear)      OBS_GATE2=true  ;;   # A2 + attacker fabricates a sighting of an honest peer
+  duty)       OBS_GATE2=true  ;;   # A2 + attacker lies only every other window (inject_duty_cycle)
+  forged_obs) OBS_GATE2=true  ;;   # A2 + attacker also impersonates a peer's observation channel
+  *) die_infra "unknown ARM='$ARM' (want a0|a1|a2|smear|duty|forged_obs)" ;;
+esac
+# a0 must survive its own breach (design spec protocol item 3): its own detector still computes
+# and logs a verdict, but is forced never to act on it, for the whole run, not just from the
+# trigger -- the same "measure before you block" default admm_agent_node.cpp ships if unset.
+if [ "$ARM" = a0 ]; then DETECT_LOG_ONLY=true; EXPECT_EVICT=0
+else DETECT_LOG_ONLY=false; EXPECT_EVICT=1; fi
+# Task 11 item 7: must vary per run, or a false-positive/refutation-rate measurement is n=1 in
+# the only dimension that produces one (admm::obs_noise). $RANDOM is bash's own PRNG.
+OBS_NOISE_SEED=${OBS_NOISE_SEED:-$RANDOM}
+LAUNCH_EXTRA="obs_gate2:=$OBS_GATE2 detection_log_only:=$DETECT_LOG_ONLY obs_noise_seed:=$OBS_NOISE_SEED $LAUNCH_EXTRA"
+
 grep_agents() { grep -h "$1" "$LOGD/admm.log" 2>/dev/null; }
 count_agents() { grep_agents "$1" | wc -l; }
 # EVICT/REJOIN lines carry their origin as rclcpp's own `[admm_agent_N]` prefix. A single agent
@@ -162,6 +188,7 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
 }
 
 say "victim=robot$VICTIM survivors='$SURVIVORS' rejoin=$REJOIN arena='${ARENA:-none}'"
+say "ARM=$ARM -> obs_gate2=$OBS_GATE2 detection_log_only(bring-up default)=$DETECT_LOG_ONLY expect_evict=$EXPECT_EVICT obs_noise_seed=$OBS_NOISE_SEED"
 fleet_bringup
 
 # ---------- optional recording (RECORD=1) ----------
@@ -199,10 +226,19 @@ setsid python3 $SCRIPTS/phys_gap_logger.py "$ROBOTS" "$LOGD/phys_gap.csv" "" \
   --ros-args -p use_sim_time:=true >"$LOGD/phys_gap.log" 2>&1 &
 PHYSPID=$!
 
+# Task 11 items 1-3: g5_logger.py's stats.csv is CycleStats already published every cycle and
+# already recorded (per-cycle, not the 1 Hz throttled RCLCPP_*_THROTTLE log lines) -- it now also
+# carries n_obs_dropped/n_refuted/tel (see g5_logger.py), the unthrottled per-peer belief
+# telemetry the calibration procedure (obs_sigma, refute_ratio) reads from. traj.csv is unused
+# here but comes from the same node at no extra cost.
+setsid python3 $SCRIPTS/g5_logger.py "$ROBOTS" "$LOGD" \
+  --ros-args -p use_sim_time:=true >"$LOGD/g5_logger.log" 2>&1 &
+G5PID=$!
+
 RVIZPID=""; RVGRABPID=""; VIZPID=""; CHASEPID=""
 # Without this, a `die` anywhere below leaves rviz2, the x11grab and the marker node running —
 # they outlive the script, hold :98, and the next run's capture fails for no visible reason.
-trap 'kill -9 $RVIZPID $RVGRABPID $VIZPID $RECPID $BRPID $PHYSPID $CHASEPID 2>/dev/null' EXIT
+trap 'kill -9 $RVIZPID $RVGRABPID $VIZPID $RECPID $BRPID $PHYSPID $G5PID $CHASEPID 2>/dev/null' EXIT
 if [ "${RVIZ:-0}" = 1 ]; then
   say "recording RViz -> rviz.mp4"
   RVIZ_CFG=$WS/src/legged_fleet/legged_admm_fleet/rviz/fleet.rviz
@@ -355,6 +391,33 @@ if [ -n "${LIE:-}" ]; then
   # staged instead of 8 m downfield.
   pset /admm_agent_$VICTIM inject_fake_offset "$LIE" \
     || die_infra "inject_fake_offset failed (is the param declared?)"
+  # Task 11 item 6: the arm's OWN attack knob, fired in the SAME burst as the position lie above
+  # -- design spec protocol item 2: switching two forgery channels at different times lets the
+  # detector catch the attacker on the first channel alone, minutes before the second is live,
+  # which makes any control-arm timing meaningless. Task 10's report on inject_forged_obs (used
+  # by forged_obs below) documents its "late impostor" case needs no launch-time support -- it is
+  # this same runtime param, fired here, after the real Gazebo publisher already exists.
+  case "$ARM" in
+    smear)
+      SMEAR_TARGET=${SMEAR_TARGET:-${SURVIVORS%% *}}
+      pset /admm_agent_$VICTIM inject_fake_evidence_target "$SMEAR_TARGET" \
+        || die_infra "inject_fake_evidence_target failed"
+      pset /admm_agent_$VICTIM inject_fake_evidence "$LIE" \
+        || die_infra "inject_fake_evidence failed"
+      say "  smear: robot$VICTIM fabricates a ${LIE}m false sighting of robot$SMEAR_TARGET"
+      ;;
+    duty)
+      pset /admm_agent_$VICTIM inject_duty_cycle "${DUTY_PERIOD:-2}" \
+        || die_infra "inject_duty_cycle failed"
+      say "  duty: robot$VICTIM lies for the first half of every ${DUTY_PERIOD:-2}-slot window"
+      ;;
+    forged_obs)
+      FORGED_TARGET=${FORGED_TARGET:-${SURVIVORS%% *}}
+      pset /admm_agent_$VICTIM inject_forged_obs "$FORGED_TARGET" \
+        || die_infra "inject_forged_obs failed"
+      say "  forged_obs: robot$VICTIM impersonates robot$FORGED_TARGET's observation channel"
+      ;;
+  esac
   # CHARGE NOW, not after the eviction is logged. Waiting for that cost ~10 s, and at 0.4 m/s the
   # attacker walks 4 m in it — past the very peg it was supposed to round, which is why three
   # takes filmed a stroll instead of an attack. The eviction lands ~1 s after the lie regardless.
@@ -451,11 +514,28 @@ say "phase 5: SIGSTOP admm_agent_$VICTIM (pid $PIDV)"
 kill -STOP "$PIDV" || die_infra "SIGSTOP failed"
 fi
 
-N_EVICT=$(wait_for_log "EVICT robot$VICTIM" 2 60)
-[ "$N_EVICT" -ge 2 ] || die "only $N_EVICT survivor(s) evicted robot$VICTIM within 60s"
-say "EVICT seen on $N_EVICT survivor(s)"
-grep_agents "EVICT robot$VICTIM" | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
-grep_agents "REBUILD" | tail -2 | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
+# Task 11 item 6: the eviction assertion is conditional on whether THIS arm expects one at all.
+# Plain silence (no LIE) always evicts regardless of ARM -- evict_after_'s heartbeat timeout does
+# not read the detector or its log-only flag, only whether the peer is still broadcasting.
+if [ "$EXPECT_EVICT" = 1 ] || [ -z "${LIE:-}" ]; then
+  N_EVICT=$(wait_for_log "EVICT robot$VICTIM" 2 60)
+  [ "$N_EVICT" -ge 2 ] || die "only $N_EVICT survivor(s) evicted robot$VICTIM within 60s"
+  say "EVICT seen on $N_EVICT survivor(s)"
+  grep_agents "EVICT robot$VICTIM" | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
+  grep_agents "REBUILD" | tail -2 | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
+else
+  # ARM=a0: undefended by design (detection_log_only forced true for the whole run) -- a
+  # detector may still WARN "would reject", but block_peer() is never called, so no EVICT line
+  # can appear and evict_after_lying_/evict_after_belief_lying_ never fire either. There is
+  # nothing to wait 60s FOR; a short window is enough to catch a wiring mistake that evicts
+  # anyway. The arm's actual result (how close the real body got) is measured later via
+  # phys_gap/pair_among, not here.
+  sleep 5
+  N_EVICT=$(count_distinct_agents "EVICT robot$VICTIM")
+  [ "$N_EVICT" = 0 ] \
+    || die "ARM=a0 is supposed to be undefended, but $N_EVICT survivor(s) evicted robot$VICTIM anyway"
+  say "ARM=a0: no eviction (as expected) -- survivors are undefended against robot$VICTIM"
+fi
 
 
 # survivors must keep going to the ORIGINAL goal, routing around the corpse
