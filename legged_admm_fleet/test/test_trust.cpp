@@ -392,16 +392,6 @@ void test_anchoring_reaches_the_barrier_and_buys_back_the_lie() {
     assert(std::abs(seen_plain[0] - claimed[0]) < 1e-12);
 }
 
-void test_no_observations_changes_nothing() {
-    // The G1 invariant in miniature: an empty offset map must leave the trajectory bit-identical
-    // to the untouched code path. (The real gate is test_distributed_parity.)
-    const Eigen::Vector2d claimed(3.00, 0.0), truth(2.60, 0.0);
-    Eigen::Vector4d a, b;
-    const double x = closest_approach_to_truth(claimed, truth, {0.0, 0.0}, &a);
-    const double y = closest_approach_to_truth(claimed, truth, {0.0, 0.0}, &b);
-    assert(x == y);
-}
-
 void test_duty_cycled_lying_is_still_convicted() {
     const TrustParams p = params();
     // Symmetric credit gives an alternating attacker a fixed point near +1.0: it lies half the
@@ -446,7 +436,6 @@ int main() {
     test_anchor_translates_the_whole_trajectory();
     test_anchor_ignores_a_malformed_plan();
     test_anchoring_reaches_the_barrier_and_buys_back_the_lie();
-    test_no_observations_changes_nothing();
     std::cout << "test_trust: OK\n";
     return 0;
 }
