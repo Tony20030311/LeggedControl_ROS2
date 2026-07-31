@@ -7,11 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
-#include <deque>
 #include <map>
-#include <optional>
-#include <random>
 #include <vector>
 
 #include "legged_upper_control/admm_node_qp.hpp"  // Obstacle
@@ -83,13 +79,13 @@ inline double trust_step_self(double L, double llr, const TrustParams& p) {
     return std::min(p.lambda * L + llr, p.l_max);
 }
 
+inline double trust_prob(double L) { return 1.0 / (1.0 + std::exp(-L)); }
+
 // Second-hand evidence, accumulated per relaying source. Weighted by how much we believe the
 // relayer and capped by that same confidence: you cannot be more certain that j lied, on i's
 // word, than you are that i is honest. That bound is what makes a lone accuser harmless, and it
 // falls out of the likelihood being conditioned on the relayer — it is not a bolted-on rule.
 // l_src is OUR log-odds for the relayer; a relayer at or below neutral carries nothing.
-inline double trust_prob(double L) { return 1.0 / (1.0 + std::exp(-L)); }
-
 inline double trust_step_relay(double C, double llr, double l_src, const TrustParams& p) {
     const double cap = std::clamp(l_src, 0.0, p.l_max);
     const double w = trust_prob(l_src);

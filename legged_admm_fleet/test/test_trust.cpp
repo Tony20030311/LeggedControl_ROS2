@@ -2,6 +2,7 @@
 // Plain assert/main like the other gates in this directory.
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <map>
 #include <vector>
@@ -96,6 +97,7 @@ void test_first_hand_evidence_can_evict() {
         L = trust_step_self(L, -p.clamp_step, p);
         ++slots;
     }
+    printf("test_first_hand_evidence_can_evict: slots=%d final_L=%g fenced=%d\n", slots, L, trust_fences_peer(L, p));
     assert(trust_fences_peer(L, p));
     assert(slots <= 10);            // 10 slots = 1.0 s; report the real number in the run log
 }
@@ -128,6 +130,7 @@ void test_first_hand_evidence_still_convicts_with_a_relayer_agreeing() {
         L = trust_step_self(L, -p.clamp_step, p);
     for (double L = 0.0; !trust_fences_peer(trust_total(L, relay), p) && with_help < 200; ++with_help)
         L = trust_step_self(L, -p.clamp_step, p);
+    printf("test_first_hand_evidence_still_convicts_with_a_relayer_agreeing: solo=%d with_help=%d ratio=%.1f\n", solo, with_help, solo > 0 ? (double)solo / with_help : 0);
     assert(with_help <= solo);
     assert(with_help < 200);
 }
