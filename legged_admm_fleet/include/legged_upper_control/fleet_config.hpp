@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -127,14 +128,39 @@ inline std::string shape_for(std::size_t n_live, std::size_t n_full,
 // A robot never votes on itself, and an EMPTY roster abstains rather than voting "everyone is
 // in": empty means a pre-members sender, and counting it as a voter would dilute the honest
 // majority with a robot that never had an opinion.
+//
+// A robot the fleet has already fenced does not get to keep voting either — otherwise its
+// stale roster (a frozen or evicted peer keeps broadcasting whatever it last held) survives
+// forever, and one attacker plus a single honest misjudgment is enough to evict a robot that
+// did nothing wrong (the stale-vote deadlock this project hit on a live run: every dog's
+// roster shrank to itself, and the frozen attacker's vote alone tipped two honest dogs into
+// "excluded"). Fixed point: drop every currently-excluded sender's ballot and recompute from
+// the full roster, repeat until the excluded set stops changing. The set can grow OR shrink
+// between passes (a robot excluded only by an unfiltered vote can turn out innocent once a
+// bad voter's ballot is removed), so this is bounded to views.size()+1 passes rather than
+// looping on "no more growth" — that bound is what keeps a pathological, fully-symmetric
+// input (every robot's roster contains only itself) from spinning forever instead of
+// returning.
 inline bool majority_excluded(const std::map<int, std::vector<int>>& views, int i) {
-    int voters = 0, votes = 0;
-    for (const auto& kv : views) {
-        if (kv.first == i || kv.second.empty()) continue;
-        ++voters;
-        if (std::find(kv.second.begin(), kv.second.end(), i) == kv.second.end()) ++votes;
+    auto excluded_by = [&views](int j, const std::set<int>& dropped) {
+        int voters = 0, votes = 0;
+        for (const auto& kv : views) {
+            if (kv.first == j || kv.second.empty() || dropped.count(kv.first)) continue;
+            ++voters;
+            if (std::find(kv.second.begin(), kv.second.end(), j) == kv.second.end()) ++votes;
+        }
+        return voters > 0 && 2 * votes > voters;
+    };
+
+    std::set<int> excluded;
+    for (std::size_t pass = 0; pass <= views.size(); ++pass) {
+        std::set<int> next;
+        for (const auto& kv : views)
+            if (excluded_by(kv.first, excluded)) next.insert(kv.first);
+        if (next == excluded) break;
+        excluded = std::move(next);
     }
-    return voters > 0 && 2 * votes > voters;
+    return excluded_by(i, excluded);
 }
 
 // Permutation of slot indices minimising sum ||pos[k]-slot[perm[k]]||^2

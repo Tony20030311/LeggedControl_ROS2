@@ -212,6 +212,45 @@ int main() {
         assert(!majority_excluded(nothing_said, 1) && "silence is not a vote");
         assert(!majority_excluded({}, 1) && "no views at all is not a vote");
     }
+    {
+        // T9: a robot the fleet has already fenced must not get a vote. Reproduces the
+        // measured stale-vote deadlock (coordinator-stale-vote-deadlock) -- one attacker
+        // (1, correctly excluded 3-0 by 2/3/4) plus a single honest misjudgment (3
+        // wrongly thinks 2 is dead) used to be enough to evict robot2 as well, because
+        // 1's stale ballot against 2 still counted even after 1 itself was fenced.
+        const std::map<int, std::vector<int>> attacker_plus_misjudgment{
+            {1, {1, 3, 4}},  // attacker: votes against 2
+            {2, {2, 4}},     // honest, but wrongly votes against 3
+            {3, {3, 4}},     // honest, but wrongly votes against 2 (the misjudgment)
+            {4, {2, 3, 4}},  // honest, no mistakes: everyone alive except the attacker
+        };
+        assert(majority_excluded(attacker_plus_misjudgment, 1)
+               && "3 of 3 non-attacker voters exclude the attacker");
+        assert(!majority_excluded(attacker_plus_misjudgment, 2)
+               && "once the attacker's ballot is dropped, only robot3's mistaken vote "
+                  "stands against robot2 out of 2 remaining voters (3,4) -- not a majority");
+        assert(!majority_excluded(attacker_plus_misjudgment, 3) && "robot3 is never in majority");
+        assert(!majority_excluded(attacker_plus_misjudgment, 4) && "robot4 has no votes against it");
+    }
+    {
+        // T9: the fixed point can take more than one pass. Robot1 is excluded outright
+        // (unanimous 2-0 among 2,3). Robot2 looks safe on the raw, unfiltered vote: among
+        // senders {1,3}, 1 vouches for it (includes it) and only 3 votes against -- 1 of
+        // 2, not a majority. Only once robot1's ballot is dropped (robot1 is itself
+        // excluded) does its vouch for robot2 disappear too, leaving robot3 as the ONLY
+        // remaining voter; a lone vote against is then a majority of one. The un-fixed
+        // function (no ballot-dropping at all) calls robot2 safe -- wrongly.
+        const std::map<int, std::vector<int>> two_pass{
+            {1, {1, 2}},  // excluded on the first pass (2-0); also vouches for robot2
+            {2, {2, 3}},
+            {3, {3}},
+        };
+        assert(majority_excluded(two_pass, 1) && "unanimous 2-0, excluded on the first pass");
+        assert(majority_excluded(two_pass, 2)
+               && "only excluded once robot1's dropped ballot removes its vouch for robot2 "
+                  "-- requires a second pass to see");
+        assert(!majority_excluded(two_pass, 3) && "never in majority");
+    }
     std::cout << "test_false_signal: all cases passed\n";
     return 0;
 }
