@@ -54,18 +54,23 @@ class G5Logger(Node):
         self.tofs = {}          # r -> sim_epoch - controller_time (see THE TWO CLOCKS above)
         self.sf = open(f"{OUTDIR}/stats.csv", "w", buffering=1)
         # n_obs_dropped: added to CycleStats by Task 10 but never reached this CSV -- a channel
-        # could die silently and no offline reader would ever see it. n_refuted is Task 11's
-        # refute_ratio calibration input (spurious relayed-report refutations this cycle). tel is
-        # the unthrottled per-peer belief telemetry (CycleStats.tel_*, beliefStep in
-        # admm_agent_node.cpp): one "peer:resid:l_self:l_total:abstain" group per peer judged this
-        # cycle, groups '|'-joined -- the calibration source for obs_sigma/refute_ratio/d_lie,
-        # since the RCLCPP_*_THROTTLE lines it replaces sample the tail, not the distribution.
-        # See docs/superpowers/results/2026-07-31-trust-calibration.md.
+        # could die silently and no offline reader would ever see it. n_refuted/n_evidence_checked
+        # are Task 11's refute_ratio calibration input (numerator: spurious relayed-report
+        # refutations this cycle; denominator: every evidence_plausible() attempt this cycle,
+        # added review round 2 so the rate doesn't have to be reconstructed from the throttled
+        # "smear-check coverage" line). tel is the unthrottled per-peer belief telemetry
+        # (CycleStats.tel_*, beliefStep in admm_agent_node.cpp): one
+        # "peer:resid:l_self:l_total:abstain" group per peer judged this cycle, groups '|'-joined
+        # -- the calibration source for obs_sigma/refute_ratio/d_lie, since the RCLCPP_*_THROTTLE
+        # lines it replaces sample the tail, not the distribution. abstain 4/5 (out_of_range/
+        # occluded, split from one "not_visible" code in review round 2) let a reader tell those
+        # apart instead of assuming every one is occlusion. See
+        # docs/superpowers/results/2026-07-31-trust-calibration.md.
         self.sf.write("t,robot,cycle,achieved_rounds,n_timeouts,"
                       "t_wait_state,t_wait_xi,t_wait_z,t_cycle_wall,"
                       "t_node,t_edge_solve,bytes_tx,bytes_rx,hold,"
                       "reset,n_stale,t_rx_mean,r_prim_hist,"
-                      "n_obs_dropped,n_refuted,tel\n")
+                      "n_obs_dropped,n_refuted,n_evidence_checked,tel\n")
         self.tf = open(f"{OUTDIR}/traj.csv", "w", buffering=1)
         cols = ",".join(f"pos_err{r},vel_err{r},ax{r},ay{r},cx{r},cy{r}" for r in ROBOTS)
         self.tf.write("t," + cols + "\n")
@@ -115,7 +120,7 @@ class G5Logger(Node):
                       f"{m.t_cycle_wall:.6g},{m.t_node:.6g},{m.t_edge_solve:.6g},"
                       f"{m.bytes_tx},{m.bytes_rx},{int(m.hold)},"
                       f"{int(m.reset)},{m.n_stale},{m.t_rx_mean:.6g},{hist},"
-                      f"{m.n_obs_dropped},{m.n_refuted},{tel}\n")
+                      f"{m.n_obs_dropped},{m.n_refuted},{m.n_evidence_checked},{tel}\n")
 
     def tick(self):
         # tofs too: without an observation from a dog there is no way to place its target's

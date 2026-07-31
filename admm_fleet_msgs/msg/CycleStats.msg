@@ -44,7 +44,11 @@ int32[]   tel_abstain    # why tel_resid carries no evidence this slot:
                          #   1 = peer_blocked    (already fenced; trust_step_self not even called)
                          #   2 = no_fresh_claim  (this agent's own AgentState barrier held this slot)
                          #   3 = no_obs_buffer   (no truth sample covers this slot -- dead/late channel)
-                         #   4 = not_visible     (occluded or past obs_range)
+                         #   4 = out_of_range    (admm::visible()'s range gate: farther than obs_range_)
+                         #   5 = occluded        (within range, but a pillar blocks the sightline)
+                         # Review round 2: split from one "not_visible" code -- admm::visible() is
+                         # both tests, and a document that reads every one of these as occlusion is
+                         # only correct if range never binds, which needs checking, not assuming.
 # Task 11 item 4: relayed reports this agent judged geometrically impossible THIS cycle
 # (evidence_plausible() false -> refuted_llr applied against the REPORTER). With no attacker
 # present every one of these is a SPURIOUS refutation -- an honest reporter's sightline grazing a
@@ -52,3 +56,9 @@ int32[]   tel_abstain    # why tel_resid carries no evidence this slot:
 # clean-flight run (see docs/superpowers/results/2026-07-31-trust-calibration.md). Same
 # read-and-reset-in-publishStats pattern as n_obs_dropped above.
 int32   n_refuted
+# Review round 2, I2': the DENOMINATOR for n_refuted -- every relayed-report entry this agent ran
+# evidence_plausible() on this cycle, refuted or not. Without this, the refute-rate calibration
+# has to be reconstructed from the throttled "smear-check coverage" log line (per call site, not
+# per cycle -- the same sampling problem item 1 exists to avoid), or guessed. Same
+# read-and-reset-in-publishStats pattern as n_refuted above.
+int32   n_evidence_checked

@@ -49,8 +49,10 @@ esac
 # a0 must survive its own breach (design spec protocol item 3): its own detector still computes
 # and logs a verdict, but is forced never to act on it, for the whole run, not just from the
 # trigger -- the same "measure before you block" default admm_agent_node.cpp ships if unset.
-if [ "$ARM" = a0 ]; then DETECT_LOG_ONLY=true; EXPECT_EVICT=0
-else DETECT_LOG_ONLY=false; EXPECT_EVICT=1; fi
+# NOTE: there is no EXPECT_EVICT here anymore (review round 2, C1/C2) -- see the eviction-check
+# block below for why "will an EVICT line appear" is not a per-arm question at all.
+if [ "$ARM" = a0 ]; then DETECT_LOG_ONLY=true
+else DETECT_LOG_ONLY=false; fi
 # Task 11 item 7: must vary per run, or a false-positive/refutation-rate measurement is n=1 in
 # the only dimension that produces one (admm::obs_noise). $RANDOM is bash's own PRNG.
 OBS_NOISE_SEED=${OBS_NOISE_SEED:-$RANDOM}
@@ -188,7 +190,7 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
 }
 
 say "victim=robot$VICTIM survivors='$SURVIVORS' rejoin=$REJOIN arena='${ARENA:-none}'"
-say "ARM=$ARM -> obs_gate2=$OBS_GATE2 detection_log_only(bring-up default)=$DETECT_LOG_ONLY expect_evict=$EXPECT_EVICT obs_noise_seed=$OBS_NOISE_SEED"
+say "ARM=$ARM -> obs_gate2=$OBS_GATE2 detection_log_only(bring-up default)=$DETECT_LOG_ONLY obs_noise_seed=$OBS_NOISE_SEED"
 fleet_bringup
 
 # ---------- optional recording (RECORD=1) ----------
@@ -238,7 +240,13 @@ G5PID=$!
 RVIZPID=""; RVGRABPID=""; VIZPID=""; CHASEPID=""
 # Without this, a `die` anywhere below leaves rviz2, the x11grab and the marker node running —
 # they outlive the script, hold :98, and the next run's capture fails for no visible reason.
-trap 'kill -9 $RVIZPID $RVGRABPID $VIZPID $RECPID $BRPID $PHYSPID $G5PID $CHASEPID 2>/dev/null' EXIT
+# $DLPID (the dist logger) belongs here too: _fleet_bringup.sh's `trap ... EXIT` inside
+# fleet_bringup() gets silently REPLACED by this one (bash traps don't stack, the last `trap`
+# call for a given signal wins), so without adding it here $DLPID was never actually killed by
+# anything -- it kept running past every d_run.sh exit, its 20 Hz timer re-writing the last
+# cached pose forever with no liveness check, corrupting that run's dist.csv for anyone who
+# re-read it later (found via review round 2's unreproducible peer-distance figures).
+trap 'kill -9 $RVIZPID $RVGRABPID $VIZPID $RECPID $BRPID $PHYSPID $G5PID $CHASEPID $DLPID 2>/dev/null' EXIT
 if [ "${RVIZ:-0}" = 1 ]; then
   say "recording RViz -> rviz.mp4"
   RVIZ_CFG=$WS/src/legged_fleet/legged_admm_fleet/rviz/fleet.rviz
@@ -389,8 +397,18 @@ if [ -n "${LIE:-}" ]; then
   # Detector arming and the hostile-mode knobs were PRE-ARMED before the trigger wait, so the lie
   # is the only round trip left here. Everything below happens while the fleet is where it was
   # staged instead of 8 m downfield.
-  pset /admm_agent_$VICTIM inject_fake_offset "$LIE" \
-    || die_infra "inject_fake_offset failed (is the param declared?)"
+  # Review round 2, I3': the smear arm is DEFINED as "the attacker's own position stays honest"
+  # (see admm_agent_node.cpp's beliefStep comment on the smear check) -- it fabricates a sighting
+  # of an honest peer instead. Sending inject_fake_offset unconditionally here made the smear
+  # attacker ALSO lie about its own position, so a2 convicted it on the first-hand residual in
+  # under a second: the transport blocks it, blocked reporters' relay entries are erased, and the
+  # smear channel dies before it ever accumulates anything -- the arm would report "no honest
+  # peer was evicted" for entirely the wrong reason and prove nothing about acceptance criterion
+  # 5. Skip the position lie for smear; every other arm still sends it.
+  if [ "$ARM" != smear ]; then
+    pset /admm_agent_$VICTIM inject_fake_offset "$LIE" \
+      || die_infra "inject_fake_offset failed (is the param declared?)"
+  fi
   # Task 11 item 6: the arm's OWN attack knob, fired in the SAME burst as the position lie above
   # -- design spec protocol item 2: switching two forgery channels at different times lets the
   # detector catch the attacker on the first channel alone, minutes before the second is live,
@@ -514,28 +532,70 @@ say "phase 5: SIGSTOP admm_agent_$VICTIM (pid $PIDV)"
 kill -STOP "$PIDV" || die_infra "SIGSTOP failed"
 fi
 
-# Task 11 item 6: the eviction assertion is conditional on whether THIS arm expects one at all.
-# Plain silence (no LIE) always evicts regardless of ARM -- evict_after_'s heartbeat timeout does
-# not read the detector or its log-only flag, only whether the peer is still broadcasting.
-if [ "$EXPECT_EVICT" = 1 ] || [ -z "${LIE:-}" ]; then
+# Review round 2, C1/C2: an EVICT line is NOT evidence any detector fired, for ANY arm,
+# including a0. LIE_DEAF defaults to 1 -- the victim stops hearing the survivors, so ITS OWN
+# evict_after_misses silence timeout drops them from ITS roster; each survivor then hits
+# dds_transport.hpp's roster-exclusion path ("its roster excludes us") and blocks the VICTIM
+# right back, and evict_after_lying_'s 3-slot debounce prints "EVICT robot$VICTIM" on both
+# survivors about 1.3s after the trigger -- REGARDLESS of ARM, regardless of whether gate2 or
+# the belief layer ever saw the position lie at all. The old assertion ("EVICT line appeared =
+# 2" for every arm but a0, "no EVICT line" for a0) was therefore vacuous everywhere: it always
+# passed via this one silence-driven path, so a control arm whose detector never fired (a1's
+# gate2 EMA approaches its gate asymptotically and may never cross it for a lie AT the gate) and
+# an undefended arm whose own detector never fired (a0, correctly) looked identical to a run
+# where the belief layer genuinely convicted the attacker.
+#
+# Fix: treat "an EVICT happened" as an infrastructure sanity check only (it should ALWAYS be
+# true given LIE_DEAF=1, independent of ARM), and attribute the REAL per-arm signal by the block
+# REASON dds_transport.hpp already logs -- "REJECTED AgentState from robotN -- <reason>", thrown
+# by block_peer() the first time a peer's messages start being rejected for that reason.
+if [ -n "${LIE:-}" ]; then
+  N_EVICT=$(wait_for_log "EVICT robot$VICTIM" 2 60)
+  [ "$N_EVICT" -ge 2 ] \
+    || die_infra "only $N_EVICT survivor(s) evicted robot$VICTIM within 60s -- roster-exclusion (LIE_DEAF=${LIE_DEAF:-1}) should do this regardless of ARM; if it didn't, the lab flaked, not the experiment"
+  say "EVICT seen on $N_EVICT survivor(s) (roster-exclusion sanity check -- NOT proof any detector fired)"
+  grep_agents "EVICT robot$VICTIM" | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
+
+  N_G2=$(count_distinct_agents "REJECTED AgentState from robot$VICTIM.*gate2 odom residual")
+  N_BEL=$(count_distinct_agents "REJECTED AgentState from robot$VICTIM.*belief threshold")
+  case "$ARM" in
+    a0)
+      # Undefended by design (detection_log_only forced true for the whole run): eviction via
+      # roster-exclusion is fine and expected; a DETECTOR-attributed block must never appear --
+      # that would mean log_only somehow didn't actually disarm blocking.
+      [ "$((N_G2 + N_BEL))" = 0 ] \
+        || die "ARM=a0 is supposed to be undefended, but $((N_G2 + N_BEL)) survivor(s)' own detector blocked robot$VICTIM anyway (detection_log_only not actually disarmed?)"
+      say "ARM=a0: no detector-attributed block (as expected) -- eviction was roster-exclusion only"
+      ;;
+    a1)
+      # Control arm: a MISS is a legitimate, reportable result (design spec acceptance criterion
+      # 1 -- A2 must catch what A1 structurally cannot), not a script failure. Never `die` on it.
+      say "ARM=a1: gate2 (odom residual) caught the lie on $N_G2/2 survivor(s)$( [ "$N_G2" -lt 2 ] && echo " -- MISS recorded (expected control-arm result, not a failure)")"
+      ;;
+    a2)
+      # The flagship defended arm: LIE is well past d_lie/2 (undetectable band is only +-2.7mm
+      # around d_lie/2 -- see the calibration doc), so a miss here IS a real defence failure.
+      [ "$N_BEL" -ge 1 ] \
+        || die "ARM=a2: no survivor's belief layer ever blocked robot$VICTIM -- only roster-exclusion fired, so this run proves nothing about detection"
+      say "ARM=a2: belief layer caught the lie on $N_BEL survivor(s)"
+      ;;
+    smear|duty|forged_obs)
+      # Recorded, not enforced: EXPECT_EVICT=1 here would write the hypothesis into the harness
+      # (review round 2, "also" bullet) -- these arms test degradation/evasion, and the run's
+      # whole point can legitimately be that the attacker evades, which must not exit as a
+      # script failure indistinguishable from a lab flake.
+      say "ARM=$ARM: belief layer caught the lie on $N_BEL survivor(s) -- recorded, not enforced"
+      ;;
+  esac
+else
+  # Plain silence (no LIE): unaffected by ARM -- the silence-timeout eviction path (evict_after_)
+  # doesn't read the detector or its log-only flag at all.
   N_EVICT=$(wait_for_log "EVICT robot$VICTIM" 2 60)
   [ "$N_EVICT" -ge 2 ] || die "only $N_EVICT survivor(s) evicted robot$VICTIM within 60s"
   say "EVICT seen on $N_EVICT survivor(s)"
   grep_agents "EVICT robot$VICTIM" | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
-  grep_agents "REBUILD" | tail -2 | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
-else
-  # ARM=a0: undefended by design (detection_log_only forced true for the whole run) -- a
-  # detector may still WARN "would reject", but block_peer() is never called, so no EVICT line
-  # can appear and evict_after_lying_/evict_after_belief_lying_ never fire either. There is
-  # nothing to wait 60s FOR; a short window is enough to catch a wiring mistake that evicts
-  # anyway. The arm's actual result (how close the real body got) is measured later via
-  # phys_gap/pair_among, not here.
-  sleep 5
-  N_EVICT=$(count_distinct_agents "EVICT robot$VICTIM")
-  [ "$N_EVICT" = 0 ] \
-    || die "ARM=a0 is supposed to be undefended, but $N_EVICT survivor(s) evicted robot$VICTIM anyway"
-  say "ARM=a0: no eviction (as expected) -- survivors are undefended against robot$VICTIM"
 fi
+grep_agents "REBUILD" | tail -2 | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
 
 
 # survivors must keep going to the ORIGINAL goal, routing around the corpse

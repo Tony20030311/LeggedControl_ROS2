@@ -202,9 +202,13 @@ struct TrustParams {
     // No l_rejoin: rejoin is not supported by the transport (blocking is latched in dds_transport
     // with no unblock path anywhere), so a hysteresis threshold for climbing back to neutral would
     // be aspirational. Don't add one without an unblock mechanism to go with it.
-    // Measured, not guessed: clean-flight residual distribution (calibration run, Task 8).
-    // The simulation value is a FLOOR — real perception adds attitude lever arm, inter-robot
-    // drift and surface-vs-origin bias (spec section 4).
+    // This IS the injected noise magnitude (admm::obs_noise), not an independently measured
+    // quantity -- calling it "measured" would claim more than a synthetic channel can give. The
+    // clean-flight calibration run confirms the resulting residual matches Rayleigh(sigma) with
+    // no extra bias (see docs/superpowers/results/2026-07-31-trust-calibration.md), which is the
+    // useful check; it does not derive this number from anything independent of itself. The
+    // simulation value is a FLOOR — real perception adds attitude lever arm, inter-robot drift
+    // and surface-vs-origin bias (spec section 4).
     double sigma = 0.02;
     // Smallest lie worth catching. MUST stay under the 0.433 m safety buffer, or a lie exists
     // that is undetectable and still spends the whole margin — the arithmetic that made the old

@@ -1210,6 +1210,10 @@ private:
                     if (j == self_id_ || j == i) continue;
                     const Eigen::Vector2d z(ev.pos[2 * k], ev.pos[2 * k + 1]);
                     if (!z.allFinite()) continue;
+                    // Review round 2, I2': the refute_ratio calibration DENOMINATOR -- every
+                    // entry that reaches the plausibility test, refuted or not. Incremented
+                    // before the call so it counts attempts, not just the ones that passed.
+                    ++n_evidence_checked_this_cycle_;
                     // ITEM 6: geometry i itself is bound by, using i's OWN CLAIMED position as
                     // its vantage point -- we do not need to have observed i to run this check,
                     // which is the whole point of broadcasting positions instead of residuals.
@@ -1291,10 +1295,11 @@ private:
         // FIRST-HAND EVIDENCE: gating unchanged, but the llr this slot COMBINES with any
         // second-hand smear_contrib computed above for this same peer as a reporter -- exactly
         // once per peer, exactly once per slot (review finding 3).
-        // Task 11 item 1: the four reasons a row can carry no evidence -- see CycleStats.msg's
-        // tel_abstain comment, which this numbering must match.
+        // Task 11 item 1 (review round 2 split occluded/out_of_range into their own codes): the
+        // reasons a row can carry no evidence -- see CycleStats.msg's tel_abstain comment, which
+        // this numbering must match.
         constexpr std::int32_t kAbstainNone = 0, kAbstainPeerBlocked = 1, kAbstainNoFreshClaim = 2,
-                               kAbstainNoObsBuffer = 3, kAbstainNotVisible = 4;
+                               kAbstainNoObsBuffer = 3, kAbstainOutOfRange = 4, kAbstainOccluded = 5;
         ev_out_peer_.clear();
         ev_out_pos_.clear();
         for (const auto& kv : agent_->peer_xnow()) {
@@ -1323,7 +1328,14 @@ private:
                         // Not visible -> no evidence at all, and nothing to share either: the
                         // attacker hiding behind a pillar must not appear in ev_peer/ev_pos.
                         vis = admm::visible(self_p, *obs, arena_obs_, obs_range_);
-                        abstain = kAbstainNotVisible;
+                        // Review round 2: admm::visible() is both a range gate and an occlusion
+                        // test, checked in that order (range first) -- mirrored here rather than
+                        // plumbing a reason code through trust.hpp, since this is telemetry only
+                        // and visible() itself must stay a single yes/no safety predicate. NaN
+                        // (non-finite obs/self_p) falls into out_of_range here too, matching
+                        // visible()'s own earliest-exit priority.
+                        abstain = ((*obs - self_p).norm() <= obs_range_) ? kAbstainOccluded
+                                                                          : kAbstainOutOfRange;
                         if (vis) {
                             observed = *obs + admm::obs_noise(slot, self_id_, j, trust_.sigma, obs_noise_seed_);
                             fresh = true;
@@ -1630,6 +1642,9 @@ private:
         // Task 11 item 4: same read-and-reset pattern as n_obs_dropped just above.
         m.n_refuted = n_refuted_this_cycle_;
         n_refuted_this_cycle_ = 0;
+        // Review round 2, I2': the refute_ratio denominator, same pattern.
+        m.n_evidence_checked = n_evidence_checked_this_cycle_;
+        n_evidence_checked_this_cycle_ = 0;
         m.hold = res.hold;
         // A finite-guard (NaN xi) cycle returns hold=false but publishes NO target and
         // announces a fleet cold-start next slot; mark it so G5 doesn't read it as a normal cycle.
@@ -1711,6 +1726,9 @@ private:
     // refute_ratio calibration input). Same thread as tel_*_ above -- no atomic needed, unlike
     // obs_dropped_this_cycle_ below, which is written from a subscription callback thread.
     int n_refuted_this_cycle_ = 0;
+    // Review round 2, I2': the denominator for n_refuted_this_cycle_ above -- every
+    // evidence_plausible() attempt this cycle, refuted or not.
+    int n_evidence_checked_this_cycle_ = 0;
     int obs_noise_seed_ = 0;                        // must vary per run -- see admm::obs_noise
     // Task 7 item 1: sensing range visible() gates first-hand evidence on, and (widened) the
     // geometric refutation of relayed reports (item 6).
