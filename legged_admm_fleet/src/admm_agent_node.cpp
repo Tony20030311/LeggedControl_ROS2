@@ -1063,9 +1063,17 @@ private:
     // pairwise CBF safety. Rejoin is NOT supported (a returning peer stays ignored).
     // Runs on the worker thread only (same thread as cycle()), so no locking needed.
     // GATE 2 — the detector that actually decides, and the only one that can catch a lie a
-    // healthy agent could plausibly have produced. Gate 1 already chained xibar to xnow, so
-    // anchoring xnow to odom anchors both: one norm, and no allowance for the TS the two knots
-    // are apart (that allowance is not a constant — it grows when the dog turns hard).
+    // healthy agent could plausibly have produced. It anchors xnow to odom and nothing else.
+    //
+    // This comment used to say Gate 1 chains xibar to xnow, so anchoring one anchors both. It
+    // does not: that check was removed when honest traffic showed 0.597-1.335 m of legitimate
+    // divergence (see agent_core.hpp). Anchoring xnow therefore leaves the PLAN unchecked, and
+    // the plan is what the pairwise barrier linearises around — an attacker can be truthful
+    // about where it is, earning a clean residual here, while drifting its knots up to
+    // MAX_VX*TS*vel_margin = 0.165 m each, which erodes the effective standoff from 1.300 m to
+    // 0.354 m, past the 1.22 m knee-to-knee contact distance. Closing it needs one more term in
+    // the residual, not a revived Gate 1 bound: a HOLD legitimately produces the same
+    // divergence that killed the original check.
     //
     // Low-passed because a single sample cannot separate a lie from odom noise, and armed only
     // after a solved cycle: during bring-up odom and the broadcast state are not yet the same
