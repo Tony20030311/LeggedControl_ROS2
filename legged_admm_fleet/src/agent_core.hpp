@@ -66,10 +66,20 @@ struct PeerEvidence {
 // here carries 3x slack: false negatives are cheap (Gate 2 catches the lie), false positives
 // are not.
 //
-// It also CHAINS the two claimed positions together: xibar's first knot must agree with xnow.
-// Both fields are consumed downstream (xnow feeds followSpeed and the corpse anchor fallback,
-// xibar feeds the CBF operating point), so leaving either unchecked leaves a free channel for
-// a lie. Chaining them here means Gate 2 only has to anchor ONE of them to odom.
+// It does NOT chain the two claimed positions together. That check existed and had to go —
+// see the "NO xnow <-> xibar consistency check" note below, where honest traffic was measured
+// at 0.597-1.335 m of legitimate divergence. This comment used to claim the chain was here,
+// which is worse than having no check at all: both fields are consumed downstream (xnow feeds
+// followSpeed and the corpse anchor fallback, xibar feeds the CBF operating point), so a
+// reader who trusts the claim believes the plan is anchored when nothing anchors it.
+//
+// The consequence is real and measured: an attacker can be truthful about xnow, earning
+// clean residuals from the belief layer, while drifting its plan knots up to
+// MAX_VX*TS*vel_margin = 0.165 m each — which erodes the effective pairwise standoff from
+// 1.300 m to 0.354 m, past the 1.22 m knee-to-knee contact distance. Closing it needs one
+// more term in the residual (the peer's own plan knot for this slot, differenced against the
+// same observation), not a revived Gate 1 bound, because a HOLD legitimately produces the
+// same divergence honest traffic showed.
 //
 // NOTE on indexing: xi has no k=0 — px_index(k) = 4*(k-1) starts at k=1 — so xibar's first
 // position knot is TS ahead of xnow, not equal to it. That is why the comparison carries a
