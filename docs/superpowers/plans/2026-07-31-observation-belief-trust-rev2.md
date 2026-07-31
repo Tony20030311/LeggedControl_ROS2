@@ -226,7 +226,9 @@ Keep the remap (it is a useful interface seam for real perception) but **delete 
 
 - [ ] **Step 5: Eviction patience 1 for belief-triggered blocks** (`evict_after_lying_` 3 → 1). The accumulator already did the debounce work that patience was invented for.
 
-- [ ] **Step 6:** Full ctest, a 60 s honest-fleet Gazebo smoke run with zero evictions, commit.
+- [ ] **Step 6: Keep the detector's input RAW.** Since this task was first written, Tasks 4, 4b and 5 landed conservative anchoring, a local keep-out, and the observation source that feeds both. `AgentCore::peer_xnow()` and `peer_xibar()` deliberately still return the peer's UNCORRECTED claim, and the belief layer must keep reading those. Anchoring the detector's input would drive the residual to zero exactly when a peer starts lying — the correction would erase the evidence of the thing it is correcting for. The anchored values exist only inside the constraint builder. Add a test that pins this: with a non-zero offset applied, the residual the belief layer computes must be unchanged.
+
+- [ ] **Step 7:** Full ctest, a 60 s honest-fleet Gazebo smoke run with zero evictions, commit.
 
 ---
 
