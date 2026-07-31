@@ -88,12 +88,21 @@ public:
                                : "single-shot EMA residual gate (gate2, obs_gate2=false)");
         // Silence needs patience — it might be a network hiccup. A lie is POSITIVE evidence and
         // does not: waiting the full 10 slots hands a hostile peer another 0.55 m of approach.
-        // A belief-triggered block already spent ~8 slots accumulating that evidence -- the exact
-        // debounce depth evict_after_lying_'s patience exists to provide -- so stacking gate2's
-        // shorter 3-slot allowance on top of it just hands an already-convicted liar more free
-        // approach time. Only the DEFAULT tracks the armed detector; an experiment script may
-        // still override it explicitly (the on-set-parameters callback keeps it runtime-settable).
-        evict_after_lying_ = declare_parameter<int>("evict_after_lying", obs_gate2_ ? 1 : 3);
+        // This patience covers gate2's odom residual AND the roster-exclusion path in
+        // dds_transport.hpp (a peer whose broadcast roster excludes us) -- both latch on the
+        // FIRST bad signal, with none of the belief accumulator's multi-slot debounce, so BOTH
+        // keep this original, unconditional value regardless of which detector is armed. This
+        // codebase has a recorded incident of two healthy agents evicting each other after one
+        // bad signal at this exact threshold (2026-07-28, d_0728_072027) -- shortening it here
+        // would make that worse, not better.
+        evict_after_lying_ = declare_parameter<int>("evict_after_lying", 3);
+        // A belief conviction gets ITS OWN, shorter patience: the accumulator already spent ~8
+        // slots accumulating that evidence (the debounce depth the patience above exists to
+        // provide, done inside the belief itself), so stacking more on top just hands an
+        // already-convicted liar more free approach time. Applies ONLY when this node's own
+        // belief_blocked_ set names the peer (see beliefStep/maybeEvict) — never to a gate2 or
+        // roster-exclusion block, which read evict_after_lying_ above instead.
+        evict_after_belief_lying_ = declare_parameter<int>("evict_after_belief_lying", 1);
         corpse_anchor_knot_ = declare_parameter<int>("corpse_anchor_knot", admm::K_SEND);
         if (corpse_anchor_knot_ != admm::K_SEND)
             RCLCPP_WARN(get_logger(),
@@ -420,6 +429,8 @@ public:
                         resid_alpha_ = p.as_double();
                     } else if (n == "evict_after_lying") {
                         evict_after_lying_ = static_cast<int>(p.as_int());
+                    } else if (n == "evict_after_belief_lying") {
+                        evict_after_belief_lying_ = static_cast<int>(p.as_int());
                     } else {
                         // Anything else is read once at construction. Say so rather than
                         // accepting it: a silent no-op is worse than a refusal.
@@ -757,9 +768,11 @@ private:
             // (measured 2026-07-28, d_0728_095209: "GATE2 would" fired 0 times across a dead run).
             // trackMobileCorpses() moves here for the same reason: a keep-out circle that stops
             // following its body while we are held is fencing yesterday's position.
-            // res.n_timeouts==0 tells detect()/beliefStep whether peer_xnow() was actually
+            // res.peer_xnow_fresh tells detect()/beliefStep whether peer_xnow() was actually
             // refreshed this slot (see beliefStep's comment) -- gate2 ignores the flag entirely.
-            detect(slot, res.n_timeouts == 0);
+            // NOT res.n_timeouts==0: an EdgeXi/EdgeZ timeout deep in the ADMM loop also bumps
+            // n_timeouts on an otherwise-solved cycle where peer_xnow_ is perfectly fresh.
+            detect(slot, res.peer_xnow_fresh);
             trackMobileCorpses();
             if (res.hold) maybeEvict(slot);
             publishStats(slot, res, t_cycle_wall);
@@ -773,7 +786,7 @@ private:
         // dog it is not allowed to evict. Measured 2026-07-28 (d_0728_045133): 51 straight
         // "NOT ARMED", peer silent 370 slots, zero evictions, run dead.
         evict_armed_ = true;
-        detect(slot, res.n_timeouts == 0);
+        detect(slot, res.peer_xnow_fresh);
         trackMobileCorpses();
 
         // ADAPT: translate xi to estimator frame, build 24-D target, yaw latch, publish.
@@ -965,17 +978,21 @@ private:
     // channel a compromised planning/comms layer cannot author.
     //
     // claims_fresh: whether agent_->peer_xnow() was actually refreshed THIS slot, i.e. whether
-    // this agent's own AgentState barrier completed this cycle. res.n_timeouts==0 is the exact
-    // test for that: peer_xnow_ is assigned exactly once per step(), right after the barrier
-    // succeeds (agent_core.cpp), and every path that reaches that assignment -- the ordinary
-    // solved cycle AND the fleet-reset-sync HOLD gate2 was moved onto HOLD to keep catching (see
-    // gate2's own comment: a liar that jams the barrier by spamming reset must still be judged) --
-    // leaves n_timeouts at 0. Only the TransportTimeout early-return, which returns before that
-    // assignment runs, leaves it above 0. transport_->last_seen()[j] cannot substitute for this:
-    // it advances on every message this process commits regardless of whether OUR OWN barrier for
-    // the current slot ever completed, so a peer talking exactly on time can still show a frozen,
-    // stale claim here — differencing that against a live observation fabricates up to 0.11 m of
-    // residual against a 0.15 m decision boundary.
+    // this agent's own AgentState barrier completed this cycle. The caller passes
+    // res.peer_xnow_fresh directly (AgentCore reports it -- see StepResult::peer_xnow_fresh and
+    // agent_core.cpp for exactly which return path sets it). This is deliberately NOT
+    // res.n_timeouts==0: an EdgeXi/EdgeZ timeout deep in the ADMM inner loop increments the SAME
+    // counter via a catch that just breaks that loop, and still returns hold=false with
+    // peer_xnow_ genuinely fresh (it was assigned once, earlier, right after the AgentState
+    // barrier) -- n_timeouts>0 there would wrongly zero out evidence on an otherwise-solved
+    // cycle. It is also NOT res.hold: hold is equally true on the fleet-reset-sync HOLD, where
+    // peer_xnow_ IS fresh (gate2 was moved onto HOLD specifically so a liar that jams the barrier
+    // by spamming reset is still judged there -- gating belief off on every hold would silently
+    // reopen that exact deadlock for arm A2). transport_->last_seen()[j] cannot substitute for
+    // any of this either: it advances on every message this process commits regardless of
+    // whether OUR OWN barrier for the current slot ever completed, so a peer talking exactly on
+    // time can still show a frozen, stale claim here — differencing that against a live
+    // observation fabricates up to 0.11 m of residual against a 0.15 m decision boundary.
     void beliefStep(std::uint64_t slot, bool claims_fresh) {
         if (!evict_armed_) return;
         std::map<int, std::deque<admm::ObsSample>> truth;
@@ -1017,6 +1034,11 @@ private:
                                      self_id_, j, L, trust_.l_evict);
             } else {
                 transport_->block_peer(j, "belief threshold");
+                // Tag WHY this peer is blocked so maybeEvict can give it the shorter, belief-
+                // only patience (finding 2) without that patience leaking to a gate2 or
+                // roster-exclusion block, which share the same transport-level blocked_ set but
+                // never earned the accumulator's multi-slot debounce.
+                belief_blocked_.insert(j);
             }
         }
     }
@@ -1068,7 +1090,15 @@ private:
             // liar: measured 2026-07-28 (d_0728_072027), agent2 and agent3 each rejected one
             // NaN message from the other, then evicted each other at the 3-slot threshold,
             // ended up alone with no pairwise CBF at all, and closed to 0.838 m.
-            const int need = transport_->blocked(j) ? evict_after_lying_ : evict_after_;
+            //
+            // Three patiences, not two (finding 2): a belief conviction gets the shortest one
+            // (belief_blocked_ names it -- the accumulator already debounced it internally);
+            // gate2 and roster-exclusion blocks share evict_after_lying_ (both latch on their
+            // FIRST bad signal and never earned the belief's multi-slot debounce); anything not
+            // blocked at all is ordinary silence.
+            const int need = admm::evict_patience(belief_blocked_.count(j) != 0,
+                                                  transport_->blocked(j), evict_after_belief_lying_,
+                                                  evict_after_lying_, evict_after_);
             if (slot > last && slot - last >= static_cast<std::uint64_t>(need)) {
                 dead.push_back(j);
                 silent[j] = slot - last;
@@ -1286,6 +1316,8 @@ private:
     double robot_margin_ = 0.60;
     int evict_after_ = 10;                          // slots of peer silence before eviction (0=off)
     int evict_after_lying_ = 3;                     // ...but a CAUGHT liar is positive evidence
+    int evict_after_belief_lying_ = 1;              // ...and a BELIEF conviction already debounced itself
+    std::set<int> belief_blocked_;                  // peers block_peer'd via beliefStep; worker-thread only
     int corpse_anchor_knot_ = admm::K_SEND;         // A/B knob; K_SEND is the safe setting
     // Gate 2 state. Budget for evict_after_lying_: the CBF has D_MIN 1.3 - contact 0.867 =
     // 0.433 m of slack, a hostile peer closes at MAX_VX 0.55 m/s, so the whole detect-and-evict

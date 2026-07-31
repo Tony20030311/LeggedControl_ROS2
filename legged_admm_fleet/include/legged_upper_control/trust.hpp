@@ -289,6 +289,24 @@ inline double trust_step_observed(double L, bool blocked, bool claim_fresh,
     return trust_step_self(L, llr, p);
 }
 
+// How many silent slots a peer earns before eviction (task 6, finding 2). A belief conviction
+// gets the shortest patience: the accumulator already spent slots deliberating (that IS the
+// debounce evict_after_lying's patience exists to provide elsewhere), so stacking more patience
+// on top just hands an already-convicted liar extra free approach time. Everything else that
+// reaches blocked() -- gate2's odom residual AND the roster-exclusion path in dds_transport.hpp,
+// which latches on the FIRST message carrying an excluding roster with none of that debounce --
+// keeps the original, longer patience; shortening it too would propagate one bad signal (a
+// mistaken roster, or a single-shot gate2 residual bump) to a healthy third party within one
+// silent slot instead of three, exactly the failure this codebase has already recorded once
+// (two healthy agents evicting each other after one bad signal). Not blocked at all is ordinary
+// silence, which gets the longest patience of the three (it might just be a network hiccup).
+inline int evict_patience(bool belief_blocked, bool blocked, int belief_patience,
+                          int lying_patience, int silence_patience) {
+    if (belief_blocked) return belief_patience;
+    if (blocked) return lying_patience;
+    return silence_patience;
+}
+
 // Belief -> geometry, and the ONLY place a peer stops being treated as a cooperating agent.
 // FLAT over the trusted range by construction: above the threshold a peer is fenced exactly as
 // today (pairwise CBF, no corpse circle). It cannot be otherwise — the fleet spawns 1.40 m apart

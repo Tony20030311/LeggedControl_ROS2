@@ -160,6 +160,8 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
         states = transport_->recv_states(slot, peers);
     } catch (const TransportTimeout&) {
         // barrier miss: HOLD this cycle, do not advance warm-start state (plan §66).
+        // peer_xnow_fresh stays false (the default): this is the ONLY return path that precedes
+        // "peer_xnow_ = xnow;" below, so it is the ONLY case where the cached claims are stale.
         StepResult hr;
         hr.xi = has_prev_ ? prev_xi_ : xibar_self;
         hr.hold = true;
@@ -220,6 +222,7 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
             hr.n_timeouts = transport_->take_timeouts();
             hr.chain_margin = chain_margin;
             hr.hold_streak = ++hold_streak_;
+            hr.peer_xnow_fresh = true;  // reached after "peer_xnow_ = xnow;" above: it IS current
             if (!self_cold) {  // join the fleet reset
                 has_prev_ = false;
                 cycle_ = 0;
@@ -237,6 +240,7 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
                          nullptr, nullptr).xi.head(nz_);
         StepResult sr;
         sr.xi = xi_solo;
+        sr.peer_xnow_fresh = true;  // reached after "peer_xnow_ = xnow;" above (trivially: no peers)
         if (xi_solo.allFinite()) {
             prev_xi_ = xi_solo;
             has_prev_ = true;
@@ -406,6 +410,9 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
     res.hist = std::move(hist);
     res.hold = false;
     res.achieved_rounds = achieved;
+    res.peer_xnow_fresh = true;  // reached after "peer_xnow_ = xnow;" above, whatever n_timeouts
+                                 // says: an EdgeXi/EdgeZ timeout below in the ADMM loop breaks
+                                 // that loop and still lands here with peer_xnow_ untouched since.
     res.n_timeouts = transport_->take_timeouts();
     res.t_node = t_node_acc;
     res.t_edge_solve = t_edge_acc;

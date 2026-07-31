@@ -406,6 +406,47 @@ private:
     Eigen::VectorXd xibar_;
 };
 
+// A scripted peer for an agent that does NOT own its only edge (edge_owner(1,2)==2, so this is
+// used with self_id=1). recv_states succeeds normally -- peer_xnow_ gets assigned -- but recv_z
+// (the non-owner's wait for the edge round's consensus copy) always times out, simulating the
+// EdgeXi/EdgeZ timeout finding 1 is about: one that happens strictly AFTER peer_xnow_ is already
+// fresh. take_timeouts() reports a fixed 1, standing in for the counter the real DdsTransport
+// increments before throwing.
+class EdgeTimeoutPeer : public Transport {
+public:
+    EdgeTimeoutPeer(int peer, const Eigen::Vector2d& claims) : peer_(peer) {
+        xnow_ << claims[0], claims[1], 0.0, 0.0;
+        xibar_ = Eigen::VectorXd::Zero(XI_DIM);
+        for (int k = 1; k <= N; ++k) {
+            xibar_[px_index(k)] = claims[0];
+            xibar_[py_index(k)] = claims[1];
+        }
+    }
+    void send_state(const AgentStateMsg&) override {}
+    std::map<int, AgentStateMsg> recv_states(std::uint64_t c, const std::vector<int>&) override {
+        AgentStateMsg m;
+        m.cycle_id = c;
+        m.robot_id = peer_;
+        m.xnow = xnow_;
+        m.xibar = xibar_;
+        m.reset = (c == 0);
+        return {{peer_, m}};
+    }
+    void send_xi(int, const EdgeXiMsg&) override {}
+    std::map<int, EdgeXiMsg> recv_xi(const EdgeKey&, std::uint64_t, int) override {
+        assert(false && "self does not own this edge; recv_xi is never reached");
+        return {};
+    }
+    void send_z(int, const EdgeZMsg&) override {}
+    EdgeZMsg recv_z(const EdgeKey&, std::uint64_t, int) override { throw TransportTimeout{}; }
+    int take_timeouts() override { return 1; }
+
+private:
+    int peer_;
+    Eigen::Vector4d xnow_;
+    Eigen::VectorXd xibar_;
+};
+
 // Walk robot 2 down the x axis, straight at a stationary robot 1, and report how close its BODY
 // ever gets to robot 1's TRUE position. Closed loop with perfect tracking (the body lands on the
 // first knot of the plan it just solved), because that is what makes the encounter develop the way
@@ -491,6 +532,28 @@ void test_belief_residual_ignores_the_anchoring_offset() {
     assert(!r.hold && r.xi.allFinite());
     const double residual = (observed - ag.peer_xnow().at(1).head<2>()).norm();
     assert(std::abs(residual - (observed - claimed).norm()) < 1e-9);   // still 1.0, not ~0
+}
+
+void test_peer_xnow_fresh_survives_an_edge_round_timeout() {
+    // Review finding 1: res.n_timeouts==0 is NOT the same condition as "peer_xnow_ was refreshed
+    // this cycle". An EdgeXi/EdgeZ timeout happens strictly AFTER peer_xnow_ is assigned (right
+    // after the AgentState barrier succeeds) and is caught by a handler that just breaks the ADMM
+    // loop -- the cycle still returns hold=false with a genuinely fresh peer_xnow_, but
+    // n_timeouts is now > 0. self=1 does not own edge (1,2) (edge_owner returns 2), so it waits
+    // on recv_z every round; EdgeTimeoutPeer always times that out.
+    const std::vector<int> dogs = {1, 2};
+    const std::vector<EdgeKey> edges = {{1, 2}};
+    EdgeTimeoutPeer tp(2, Eigen::Vector2d(3.0, 0.0));
+    AgentCore ag(1, dogs, edges, nullptr, 0.0, {}, {}, 1, &tp);
+    Eigen::Vector4d xnow(0.0, 0.0, 0.0, 0.0);
+    Eigen::MatrixX2d wp(2, 2);
+    wp.row(0) = xnow.head<2>().transpose();
+    wp.row(1) = Eigen::RowVector2d(5.0, 0.0);
+    const Eigen::MatrixXd xdes = build_reference(xnow.head<2>(), wp);
+    const StepResult r = ag.step(xnow, xdes, 0);
+    assert(!r.hold);            // an edge-round timeout ends the cycle early, not on a barrier HOLD
+    assert(r.n_timeouts > 0);   // the timeout DID happen and DID get counted
+    assert(r.peer_xnow_fresh);  // but peer_xnow_ was refreshed before that timeout ever occurred
 }
 
 void test_credit_ratio_scales_the_unsaturated_positive_branch() {
@@ -580,6 +643,31 @@ void test_trust_step_observed_fresh_claim_uses_the_residual() {
     assert(got < L);   // r = d_lie sits on the lying side of the zero crossing at d_lie/2
 }
 
+// --- evict_patience (Task 6, review finding 2): a belief conviction earns shorter patience,
+// but that must NOT leak to gate2 or the roster-exclusion path, which share the same transport-
+// level blocked() latch and never earned the accumulator's multi-slot debounce.
+
+void test_evict_patience_belief_block_gets_the_short_patience() {
+    const int got = evict_patience(/*belief_blocked=*/true, /*blocked=*/true,
+                                   /*belief_patience=*/1, /*lying_patience=*/3, /*silence_patience=*/10);
+    assert(got == 1);
+}
+
+void test_evict_patience_roster_exclusion_or_gate2_keeps_the_long_patience() {
+    // Same "blocked" state as a belief conviction, but NOT tagged as one -- this is exactly what
+    // a gate2 block or a roster-exclusion block looks like from here. Must fall back to the
+    // ORIGINAL (longer) patience, not the one meant only for a debounced belief verdict.
+    const int got = evict_patience(/*belief_blocked=*/false, /*blocked=*/true,
+                                   /*belief_patience=*/1, /*lying_patience=*/3, /*silence_patience=*/10);
+    assert(got == 3);
+}
+
+void test_evict_patience_unblocked_peer_gets_ordinary_silence_patience() {
+    const int got = evict_patience(/*belief_blocked=*/false, /*blocked=*/false,
+                                   /*belief_patience=*/1, /*lying_patience=*/3, /*silence_patience=*/10);
+    assert(got == 10);
+}
+
 }  // namespace
 
 int main() {
@@ -624,9 +712,13 @@ int main() {
     test_anchor_ignores_a_malformed_plan();
     test_anchoring_reaches_the_barrier_and_buys_back_the_lie();
     test_belief_residual_ignores_the_anchoring_offset();
+    test_peer_xnow_fresh_survives_an_edge_round_timeout();
     test_trust_step_observed_blocked_peer_is_untouched();
     test_trust_step_observed_no_fresh_claim_decays_only();
     test_trust_step_observed_fresh_claim_uses_the_residual();
+    test_evict_patience_belief_block_gets_the_short_patience();
+    test_evict_patience_roster_exclusion_or_gate2_keeps_the_long_patience();
+    test_evict_patience_unblocked_peer_gets_ordinary_silence_patience();
     std::cout << "test_trust: OK\n";
     return 0;
 }

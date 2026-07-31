@@ -216,6 +216,15 @@ struct StepResult {
     std::vector<double> r_prim_edge;  // final ADMM primal residual per adopted edge (my_edges_ order)
     double r_prim = 0.0;              // max over adopted edges (0 if no round completed)
     int n_timeouts = 0;              // per-hop recv deadline misses observed this cycle
+    // Was peer_xnow()/peer_xibar() actually refreshed THIS call to step()? NOT the same thing as
+    // n_timeouts==0: an EdgeXi/EdgeZ timeout deep in the ADMM inner loop is caught, breaks the
+    // loop, and still returns hold=false with a perfectly fresh peer_xnow_ (it was assigned once,
+    // earlier, right after the AgentState barrier). Only the TransportTimeout thrown by THAT
+    // earlier barrier (recv_states) returns before the assignment ever runs. A caller judging
+    // whether a peer's cached claim is trustworthy (the belief layer) must read THIS flag, not
+    // infer it from n_timeouts or from `hold` (hold is also true on the fleet-reset-sync HOLD,
+    // where peer_xnow_ is fresh) — see agent_core.cpp for exactly where each is set.
+    bool peer_xnow_fresh = false;
     double t_node = 0.0;             // total node-QP solve time this cycle (s)
     double t_edge_solve = 0.0;       // total owned edge-QP solve time this cycle (s)
     // Why the warm start was thrown away THIS cycle, so the node layer can say so out loud.
