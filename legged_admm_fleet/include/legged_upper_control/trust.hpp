@@ -10,6 +10,7 @@
 #include <map>
 #include <vector>
 
+#include "legged_upper_control/admm_constants.hpp"  // N, XI_DIM, px_index, MAX_VX, TS
 #include "legged_upper_control/admm_node_qp.hpp"  // Obstacle
 
 namespace admm {
@@ -36,6 +37,67 @@ inline bool visible(const Eigen::Vector2d& pi, const Eigen::Vector2d& pj,
         if ((w - t * d).norm() < o.radius) return false;
     }
     return true;
+}
+
+// --- conservative anchoring (spec section 4.1) ---
+//
+// The collision barrier is built from what a peer SAYS about itself, so it protects the distance
+// to a claim rather than to a body. A peer that misreports its position by 0.42 m closed the
+// measured physical gap from 0.433 m to 0.038 m without ever moving abnormally. This corrects the
+// geometry BEFORE the constraint is built, so it costs no detection delay: no belief, no
+// threshold, no verdict. The belief layer then only decides who to keep cooperating with.
+//
+// One-sided by construction: a liar cannot make itself look FURTHER away than it is, so a claim is
+// only ever pulled TOWARDS us. A claim that is already nearer than what we see is either noise or
+// a ghost, and honouring it just leaves more room — the safe direction, and the reason this needs
+// no judgement about who is lying.
+//
+//   dead_band  3 sigma of the observation channel. Below it the correction is noise, and a hard
+//              constraint that jitters is worse than one that is slightly stale.
+//   rate_limit how far the correction may move in one slot (MAX_VX*TS = one slot of robot travel).
+//              Coming out of an occlusion the raw correction can step by metres; applying that at
+//              once tightens a hard constraint instantly, which is the born-violated failure this
+//              project has already paid for. So the correction RAMPS: a lie of size L is fully
+//              anchored after L/rate_limit slots.
+//   prev       last slot's offset for this peer. State lives with the caller, so this stays pure.
+inline Eigen::Vector2d conservative_offset(const Eigen::Vector2d& self,
+                                           const Eigen::Vector2d& claimed,
+                                           const Eigen::Vector2d& observed,
+                                           double dead_band, double rate_limit,
+                                           const Eigen::Vector2d& prev) {
+    if (!self.allFinite() || !claimed.allFinite() || !observed.allFinite() || !prev.allFinite())
+        return Eigen::Vector2d::Zero();
+    // Not "closer to us than claimed" -> no correction at all, and prev is dropped rather than
+    // decayed: the anchored position is claimed + offset, so when the claim itself comes back to
+    // the truth, dropping the offset keeps that anchored position continuous. Decaying it would
+    // instead keep pushing an honest claim towards us for another 8 slots.
+    if ((claimed - self).norm() - (observed - self).norm() <= dead_band)
+        return Eigen::Vector2d::Zero();
+    const Eigen::Vector2d step = (observed - claimed) - prev;
+    const double n = step.norm();
+    if (!(n > rate_limit) || !(n > 0.0)) return prev + step;
+    return prev + step * (rate_limit / n);
+}
+
+// Apply one peer's offset to its ENTIRE broadcast: the current state and every knot of the plan.
+//
+// Translating the whole thing is not tidiness. The HOCBF constraint is a three-point combination
+// of the barrier value at consecutive knots (rti.cpp three_point), i.e. a second difference.
+// Substituting only the current point makes that difference see a jump that no motion produced —
+// an inconsistency of 0.5 m demands roughly 21 m/s^2 of differential acceleration to recover,
+// outside the QP's box bounds, so the solver poisons rather than avoids. A uniform translation
+// leaves every difference unchanged: the implied velocity and acceleration are identical and only
+// the location moves, which is exactly the claim being made ("you are actually over there").
+//
+// All or nothing on a short plan: wire data reaches here, and a half-translated peer would be a
+// geometry nobody derived. Gate 1 already rejects wrong-length messages; this is the backstop.
+inline void anchor_peer(const Eigen::Vector2d& d, Eigen::Vector4d& xnow, Eigen::VectorXd& xibar) {
+    if (!d.allFinite() || xibar.size() < XI_DIM) return;
+    xnow.head<2>() += d;
+    for (int k = 1; k <= N; ++k) {
+        xibar[px_index(k)] += d[0];
+        xibar[py_index(k)] += d[1];
+    }
 }
 
 // Every constant here is derived, not tuned. Changing one means redoing its derivation.

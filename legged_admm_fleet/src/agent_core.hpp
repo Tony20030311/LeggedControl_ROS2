@@ -290,6 +290,14 @@ public:
     // Peers' broadcast predicted trajectory xibar (6N: [px,py,vx,vy,ax,ay]*N) from the LAST
     // step(); positions feed safe_prefix_length. Keyed by robot id, self included.
     const std::map<int, Eigen::VectorXd>& peer_xibar() const { return peer_xibar_; }
+    // CONSERVATIVE ANCHORING (spec 4.1): per-peer position corrections, applied to each peer's
+    // whole broadcast before the constraint is built, so the barrier protects the distance to a
+    // body instead of the distance to a claim. The node computes them (it owns the observation
+    // channel and the per-peer `prev` the rate limit needs); AgentCore only applies them.
+    // Not set, or no observation of a peer -> that peer is absent from the map -> zero offset and
+    // the arithmetic is untouched. That is why the loopback parity harness, which has no
+    // observation channel at all, stays bit-identical.
+    void set_peer_offsets(const std::map<int, Eigen::Vector2d>& d) { peer_offset_ = d; }
     // Move an already-registered obstacle. The node layer owns WHY an obstacle moves (a peer
     // that broadcasts garbage is still walking, so its keep-out has to follow its odom); this
     // is only the route to the node QP, which holds the obstacle set. No rebuild, no cold start
@@ -309,6 +317,7 @@ private:
     int self_id_;
     std::map<int, Eigen::Vector4d> peer_xnow_;      // cached from last step() (followSpeed)
     std::map<int, Eigen::VectorXd> peer_xibar_;     // cached from last step() (safe_prefix)
+    std::map<int, Eigen::Vector2d> peer_offset_;    // conservative anchoring; empty = no observations
     std::vector<int> dogs_;
     std::vector<EdgeKey> edges_;        // full edge list (for neighbor/owner bookkeeping)
     std::vector<EdgeKey> my_edges_;     // edges incident to self_id_

@@ -3,6 +3,8 @@
 // (G1). See agent_core.hpp for the separability argument.
 #include "agent_core.hpp"
 
+#include "legged_upper_control/trust.hpp"  // anchor_peer (conservative anchoring, spec 4.1)
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -126,8 +128,31 @@ StepResult AgentCore::step(const Eigen::Vector4d& xnow_self,
         xibar[kv.first] = kv.second.xibar;
         xnow[kv.first] = kv.second.xnow;
     }
+    // Exposed BEFORE anchoring, i.e. exactly what each peer claimed. The belief layer's evidence
+    // is |claim - observation|; handing it the corrected claim would drive that residual to ~0 and
+    // silently blind the detector. Anchoring belongs to the constraint, not to the evidence.
     peer_xnow_ = xnow;      // expose to admm_agent_node (followSpeed)
     peer_xibar_ = xibar;    // expose to admm_agent_node (safe_prefix)
+
+    // 2a. CONSERVATIVE ANCHORING (spec 4.1). The pairwise CBF is built from what a peer SAYS, so
+    // it defends the distance to a claim, not to a body: a peer misreporting its position by
+    // 0.42 m closed the measured physical gap from 0.433 m to 0.038 m without moving abnormally.
+    // Relocating the peer onto what we observe of it — and only when the observation is CLOSER,
+    // since a liar cannot make itself look further away than it is — removes that leverage with no
+    // detector, no belief and no threshold in the loop.
+    // The offset moves the peer's ENTIRE broadcast (anchor_peer): the HOCBF reads a three-point
+    // difference of the barrier, so substituting only the current point manufactures an
+    // acceleration nothing produced (0.5 m of inconsistency needs ~21 m/s^2 to recover, outside
+    // the QP's box) and the solver poisons instead of avoiding. Translating every knot leaves all
+    // those differences untouched; only the location moves.
+    // Empty map (nothing observed, and the loopback parity harness) -> nothing runs here at all.
+    for (const auto& kv : peer_offset_) {
+        if (kv.first == self_id_) continue;      // I am never the one being relocated
+        const auto xn = xnow.find(kv.first);
+        const auto xb = xibar.find(kv.first);
+        if (xn == xnow.end() || xb == xibar.end()) continue;   // did not report this slot
+        anchor_peer(kv.second, xn->second, xb->second);
+    }
 
     // 2b. fleet-reset synchronization. Rule table (stateless, no ping-pong):
     //   warm + any peer cold  -> discard this slot, drop warm start (join the reset)

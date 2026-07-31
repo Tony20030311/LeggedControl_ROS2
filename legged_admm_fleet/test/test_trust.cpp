@@ -7,7 +7,9 @@
 #include <map>
 #include <vector>
 
+#include "agent_core.hpp"
 #include "legged_upper_control/admm_constants.hpp"  // TS
+#include "legged_upper_control/admm_reference.hpp"
 #include "legged_upper_control/trust.hpp"
 
 using namespace admm;
@@ -174,6 +176,232 @@ void test_detection_fits_the_safety_margin() {
     assert(v_div_covered >= 0.25);
 }
 
+// --- conservative anchoring (spec 4.1): safety that does not wait for a verdict ---
+
+// Sensor-derived, not tuned: 3 sigma of the observation channel, and one slot of robot travel.
+constexpr double kDead = 3.0 * 0.02, kRate = MAX_VX * TS;   // 0.06 m, 0.055 m/slot
+
+void test_offset_pulls_a_distant_claim_back_to_the_observation() {
+    // A peer claiming to be further away than it is must be relocated onto what we see.
+    // The rate limit is deliberately slack here so this test measures the CORRECTION; how fast it
+    // may be applied is a separate property (see the ramp test below). A binding rate limit and an
+    // exact one-metre answer cannot both be asserted in a single call.
+    const Eigen::Vector2d self(0, 0), claimed(3.0, 0), observed(2.0, 0);
+    const Eigen::Vector2d d = conservative_offset(self, claimed, observed, kDead, 2.0, {0, 0});
+    assert(std::abs(d[0] + 1.0) < 1e-9);   // claim moves 1 m closer, onto the truth
+    assert(std::abs(d[1]) < 1e-12);
+}
+
+void test_offset_ignores_a_claim_that_is_already_closer() {
+    // A peer claiming to be nearer than we see is the ghost case: keep the claim, give it room.
+    const Eigen::Vector2d self(0, 0), claimed(2.0, 0), observed(3.0, 0);
+    assert(conservative_offset(self, claimed, observed, kDead, kRate, {0, 0}).norm() < 1e-12);
+}
+
+void test_offset_has_a_dead_band() {
+    // Measurement noise must not jitter a safety constraint.
+    const Eigen::Vector2d self(0, 0), claimed(2.0, 0), observed(1.97, 0);
+    assert(conservative_offset(self, claimed, observed, kDead, kRate, {0, 0}).norm() < 1e-12);
+}
+
+void test_offset_is_rate_limited() {
+    // Coming out of occlusion the offset can step. An unlimited step tightens a hard constraint
+    // instantly and can make the QP infeasible — the born-violated failure this project knows.
+    const Eigen::Vector2d self(0, 0), claimed(5.0, 0), observed(1.0, 0);
+    const Eigen::Vector2d d = conservative_offset(self, claimed, observed, kDead, kRate, {0, 0});
+    assert(d.norm() <= kRate + 1e-12);
+    assert(d[0] < 0.0);             // rate limited, but still in the direction of the truth
+}
+
+void test_offset_ramps_onto_the_truth_and_stops_there() {
+    // The rate limit is a delay, not a ceiling: a persistent lie is fully corrected within
+    // |lie| / rate slots, and the correction then holds instead of drifting past the truth.
+    const Eigen::Vector2d self(0, 0), claimed(3.0, 0), observed(2.0, 0);
+    Eigen::Vector2d d(0, 0);
+    const int need = static_cast<int>(std::ceil(1.0 / kRate));
+    for (int i = 0; i < need; ++i)
+        d = conservative_offset(self, claimed, observed, kDead, kRate, d);
+    printf("test_offset_ramps_onto_the_truth_and_stops_there: %d slots (%.2f s) for 1.00 m\n",
+           need, need * TS);
+    assert(std::abs(d[0] + 1.0) < 1e-9);
+    for (int i = 0; i < 5; ++i)
+        d = conservative_offset(self, claimed, observed, kDead, kRate, d);
+    assert(std::abs(d[0] + 1.0) < 1e-9);   // no overshoot once it is on the observation
+}
+
+void test_offset_abstains_on_non_finite_input() {
+    const double nan = std::nan("");
+    const Eigen::Vector2d self(0, 0), claimed(3.0, 0);
+    assert(conservative_offset(self, claimed, {nan, 0.0}, kDead, kRate, {0, 0}).norm() < 1e-12);
+}
+
+void test_anchor_translates_the_whole_trajectory() {
+    // The property the whole design rests on: every point moves by the same vector, so the
+    // differences the HOCBF actually reads are untouched and only the location changes.
+    const Eigen::Vector2d d(-0.42, 0.13);
+    Eigen::Vector4d xnow(3.0, 1.0, 0.4, -0.1);
+    Eigen::VectorXd xibar = Eigen::VectorXd::Zero(XI_DIM);
+    for (int k = 1; k <= N; ++k) {       // a moving plan, not a standing one
+        xibar[px_index(k)] = 3.0 + 0.05 * k;
+        xibar[py_index(k)] = 1.0 - 0.01 * k * k;
+        xibar[vx_index(k)] = 0.5;
+        xibar[vy_index(k)] = -0.02 * k;
+    }
+    for (int k = 0; k < N; ++k) { xibar[ax_index(k)] = 0.1; xibar[ay_index(k)] = -0.02; }
+    const Eigen::VectorXd before = xibar;
+    anchor_peer(d, xnow, xibar);
+
+    assert((xnow.head<2>() - (Eigen::Vector2d(3.0, 1.0) + d)).norm() < 1e-12);
+    assert((xnow.tail<2>() - Eigen::Vector2d(0.4, -0.1)).norm() < 1e-12);  // velocity untouched
+    for (int k = 1; k <= N; ++k) {
+        assert(std::abs(xibar[px_index(k)] - (before[px_index(k)] + d[0])) < 1e-12);
+        assert(std::abs(xibar[py_index(k)] - (before[py_index(k)] + d[1])) < 1e-12);
+        assert(xibar[vx_index(k)] == before[vx_index(k)]);
+        assert(xibar[vy_index(k)] == before[vy_index(k)]);
+    }
+    for (int k = 0; k < N; ++k) {        // accelerations are what the barrier constrains
+        assert(xibar[ax_index(k)] == before[ax_index(k)]);
+        assert(xibar[ay_index(k)] == before[ay_index(k)]);
+    }
+    // and therefore every consecutive difference — the second difference the HOCBF reads — is
+    // preserved to rounding (exact in real arithmetic; (a+d)-(b+d) costs a ULP or two in doubles).
+    // Substituting one point instead would put a step of |d| in here, twelve orders of magnitude
+    // above this tolerance.
+    for (int k = 1; k < N; ++k) {
+        assert(std::abs((xibar[px_index(k + 1)] - xibar[px_index(k)]) -
+                        (before[px_index(k + 1)] - before[px_index(k)])) < 1e-12);
+        assert(std::abs((xibar[py_index(k + 1)] - xibar[py_index(k)]) -
+                        (before[py_index(k + 1)] - before[py_index(k)])) < 1e-12);
+    }
+}
+
+void test_anchor_ignores_a_malformed_plan() {
+    Eigen::Vector4d xnow(3.0, 1.0, 0.0, 0.0);
+    Eigen::VectorXd xibar = Eigen::VectorXd::Zero(4);   // wire data; never index past it
+    anchor_peer({-0.4, 0.0}, xnow, xibar);
+    assert(xnow[0] == 3.0);   // all or nothing: a plan we cannot translate is left alone
+    assert(xibar.isZero());
+}
+
+// A scripted peer for exactly one agent. Robot 1 stands still, says so, and hands back its own
+// plan as its ADMM iterate. Single-threaded on purpose: agent 2 OWNS edge (1,2) (edge_owner), so
+// it solves the edge QP — and therefore builds the CBF — itself, and never waits for a z.
+class ScriptedPeer : public Transport {
+public:
+    ScriptedPeer(int peer, const Eigen::Vector2d& claims) : peer_(peer) {
+        xnow_ << claims[0], claims[1], 0.0, 0.0;
+        xibar_ = Eigen::VectorXd::Zero(XI_DIM);
+        for (int k = 1; k <= N; ++k) {
+            xibar_[px_index(k)] = claims[0];
+            xibar_[py_index(k)] = claims[1];
+        }
+    }
+    void send_state(const AgentStateMsg&) override {}
+    std::map<int, AgentStateMsg> recv_states(std::uint64_t c, const std::vector<int>&) override {
+        AgentStateMsg m;
+        m.cycle_id = c;
+        m.robot_id = peer_;
+        m.xnow = xnow_;
+        m.xibar = xibar_;
+        m.reset = (c == 0);      // cold-start together, or the agent spends the slot announcing
+        return {{peer_, m}};
+    }
+    void send_xi(int, const EdgeXiMsg&) override {}
+    std::map<int, EdgeXiMsg> recv_xi(const EdgeKey& e, std::uint64_t c, int it) override {
+        EdgeXiMsg m;
+        m.cycle_id = c;
+        m.iter = it;
+        m.edge = e;
+        m.from_robot = peer_;
+        m.xi = xibar_;
+        m.lam = Eigen::VectorXd::Zero(XI_DIM);
+        return {{peer_, m}};
+    }
+    void send_z(int, const EdgeZMsg&) override {}
+    EdgeZMsg recv_z(const EdgeKey&, std::uint64_t, int) override {
+        assert(false && "the agent owns its only edge; it never waits for a z");
+        return {};
+    }
+
+private:
+    int peer_;
+    Eigen::Vector4d xnow_;
+    Eigen::VectorXd xibar_;
+};
+
+// Walk robot 2 down the x axis, straight at a stationary robot 1, and report how close its BODY
+// ever gets to robot 1's TRUE position. Closed loop with perfect tracking (the body lands on the
+// first knot of the plan it just solved), because that is what makes the encounter develop the way
+// it does in the field: the barrier violation migrates from the soft tail of the horizon to the
+// hard front as the gap closes, and the CBF stops the approach. offset = what conservative_offset
+// hands AgentCore.
+double closest_approach_to_truth(const Eigen::Vector2d& claimed, const Eigen::Vector2d& truth,
+                                 const Eigen::Vector2d& offset, Eigen::Vector4d* claim_seen) {
+    const std::vector<int> dogs = {1, 2};
+    const std::vector<EdgeKey> edges = {{1, 2}};
+    ScriptedPeer tp(1, claimed);
+    // formation=nullptr: this gate is about the pairwise barrier, and a formation pull has nothing
+    // to say about anchoring.
+    AgentCore ag(2, dogs, edges, nullptr, 0.0, {}, {}, 1, &tp);
+    Eigen::Vector4d xnow(0.0, 0.0, 0.0, 0.0);
+    std::map<int, Eigen::Vector2d> off;
+    if (offset.norm() > 0.0) off[1] = offset;
+
+    const int CYCLES = 80;   // 8 s at v_cruise 0.30 m/s: long enough to arrive and settle
+    double closest = 1e9;
+    for (std::uint64_t c = 0; c < static_cast<std::uint64_t>(CYCLES); ++c) {
+        Eigen::MatrixX2d wp(2, 2);          // replan from where the body is, as the node does
+        wp.row(0) = xnow.head<2>().transpose();
+        wp.row(1) = Eigen::RowVector2d(5.0, 0.0);
+        const Eigen::MatrixXd xdes = build_reference(xnow.head<2>(), wp);
+        ag.set_peer_offsets(off);
+        const StepResult r = ag.step(xnow, xdes, c);
+        assert(!r.hold && r.xi.allFinite());
+        xnow << r.xi[px_index(1)], r.xi[py_index(1)], r.xi[vx_index(1)], r.xi[vy_index(1)];
+        closest = std::min(closest, (xnow.head<2>() - truth).norm());
+    }
+    *claim_seen = ag.peer_xnow().at(1);
+    return closest;
+}
+
+void test_anchoring_reaches_the_barrier_and_buys_back_the_lie() {
+    // Robot 1 says it is at 1.80 m; it is really at 1.45 m — the same shape of lie as the 0.42 m
+    // one measured against the fleet, sized so the barrier is active either way and robot 2 is
+    // NOT already inside the true keep-out at t=0. Believing the claim lets robot 2 plan to within
+    // D_MIN of 1.80, i.e. 0.35 m inside the keep-out around the body that is actually there.
+    const Eigen::Vector2d claimed(3.00, 0.0), truth(2.60, 0.0);
+    const double lie = (claimed - truth).norm();
+    Eigen::Vector4d seen_plain, seen_anchored;
+    Eigen::Vector4d seen_honest;
+    const double plain = closest_approach_to_truth(claimed, truth, {0.0, 0.0}, &seen_plain);
+    const double anchored = closest_approach_to_truth(claimed, truth, truth - claimed, &seen_anchored);
+    // What the same encounter looks like when the peer simply tells the truth. This is the
+    // reference the correction has to reproduce, and unlike an absolute number it does not depend
+    // on how hard this stub harness happens to enforce the barrier.
+    const double honest = closest_approach_to_truth(truth, truth, {0.0, 0.0}, &seen_honest);
+    printf("anchoring: body's closest approach to the true body  believed=%.3f m  anchored=%.3f m"
+           "  honest=%.3f m  (anchored-honest=%.2e, lie=%.2f, D_MIN=%.2f)\n",
+           plain, anchored, honest, anchored - honest, lie, D_MIN);
+    assert(plain < D_MIN);                     // the lie works when the claim is believed
+    assert(anchored > plain + 0.5 * lie);      // most of the lie is bought back, in the QP itself
+    assert(anchored >= honest - 0.05);         // the lie buys the attacker essentially nothing
+    // The claim itself must survive intact: the belief layer's residual is |claim - observation|,
+    // so an anchored peer_xnow() would silently drive that residual to zero and blind the detector
+    // this layer is supposed to be independent of.
+    assert(std::abs(seen_anchored[0] - claimed[0]) < 1e-12);
+    assert(std::abs(seen_plain[0] - claimed[0]) < 1e-12);
+}
+
+void test_no_observations_changes_nothing() {
+    // The G1 invariant in miniature: an empty offset map must leave the trajectory bit-identical
+    // to the untouched code path. (The real gate is test_distributed_parity.)
+    const Eigen::Vector2d claimed(3.00, 0.0), truth(2.60, 0.0);
+    Eigen::Vector4d a, b;
+    const double x = closest_approach_to_truth(claimed, truth, {0.0, 0.0}, &a);
+    const double y = closest_approach_to_truth(claimed, truth, {0.0, 0.0}, &b);
+    assert(x == y);
+}
+
 void test_duty_cycled_lying_is_still_convicted() {
     const TrustParams p = params();
     // Symmetric credit gives an alternating attacker a fixed point near +1.0: it lies half the
@@ -209,6 +437,16 @@ int main() {
     test_neutral_belief_does_not_fence_the_spawn_formation();
     test_detection_fits_the_safety_margin();
     test_duty_cycled_lying_is_still_convicted();
+    test_offset_pulls_a_distant_claim_back_to_the_observation();
+    test_offset_ignores_a_claim_that_is_already_closer();
+    test_offset_has_a_dead_band();
+    test_offset_is_rate_limited();
+    test_offset_ramps_onto_the_truth_and_stops_there();
+    test_offset_abstains_on_non_finite_input();
+    test_anchor_translates_the_whole_trajectory();
+    test_anchor_ignores_a_malformed_plan();
+    test_anchoring_reaches_the_barrier_and_buys_back_the_lie();
+    test_no_observations_changes_nothing();
     std::cout << "test_trust: OK\n";
     return 0;
 }
