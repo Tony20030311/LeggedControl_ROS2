@@ -697,8 +697,9 @@ void test_trust_step_observed_blocked_peer_is_untouched() {
     const double L = -20.0;   // already deep in convicted territory
     const double got = trust_step_observed(L, /*blocked=*/true, /*claim_fresh=*/true,
                                            /*visible=*/true,
-                                           Eigen::Vector2d(5.0, 0.0), Eigen::Vector2d(0.0, 0.0), p);
-    assert(got == L);
+                                           Eigen::Vector2d(5.0, 0.0), Eigen::Vector2d(0.0, 0.0),
+                                           /*extra_llr=*/-5.0, p);
+    assert(got == L);   // blocked overrides even a large second-hand penalty, not just first-hand
 }
 
 void test_trust_step_observed_no_fresh_claim_decays_only() {
@@ -712,7 +713,8 @@ void test_trust_step_observed_no_fresh_claim_decays_only() {
     const double L = -3.0;
     const double got = trust_step_observed(L, /*blocked=*/false, /*claim_fresh=*/false,
                                            /*visible=*/true,
-                                           Eigen::Vector2d(5.0, 0.0), Eigen::Vector2d(0.0, 0.0), p);
+                                           Eigen::Vector2d(5.0, 0.0), Eigen::Vector2d(0.0, 0.0),
+                                           /*extra_llr=*/0.0, p);
     assert(std::abs(got - trust_step_self(L, 0.0, p)) < 1e-12);
 }
 
@@ -726,7 +728,8 @@ void test_trust_step_observed_not_visible_decays_only() {
     const double L = -3.0;
     const double got = trust_step_observed(L, /*blocked=*/false, /*claim_fresh=*/true,
                                            /*visible=*/false,
-                                           Eigen::Vector2d(5.0, 0.0), Eigen::Vector2d(0.0, 0.0), p);
+                                           Eigen::Vector2d(5.0, 0.0), Eigen::Vector2d(0.0, 0.0),
+                                           /*extra_llr=*/0.0, p);
     assert(std::abs(got - trust_step_self(L, 0.0, p)) < 1e-12);
 }
 
@@ -735,11 +738,38 @@ void test_trust_step_observed_fresh_claim_uses_the_residual() {
     const Eigen::Vector2d observed(0.30, 0.0), claimed(0.0, 0.0);   // r = d_lie exactly
     const double L = 0.0;
     const double got = trust_step_observed(L, /*blocked=*/false, /*claim_fresh=*/true,
-                                           /*visible=*/true, observed, claimed, p);
+                                           /*visible=*/true, observed, claimed, /*extra_llr=*/0.0, p);
     const double expect = trust_step_self(
         L, trust_llr((observed - claimed).norm(), p.sigma, p.d_lie, p.clamp_step, p.credit_ratio), p);
     assert(std::abs(got - expect) < 1e-12);
     assert(got < L);   // r = d_lie sits on the lying side of the zero crossing at d_lie/2
+}
+
+void test_trust_step_observed_combines_extra_llr_in_one_step_not_two() {
+    const TrustParams p = params();
+    // Review finding 3: a peer that is both a first-hand target AND a second-hand reporter this
+    // slot must be decayed by lambda ONCE, not twice. Calling trust_step_self a second time would
+    // give L2 = lambda*(lambda*L + first) + extra = lambda^2*L + lambda*first + extra, not the
+    // single-decay lambda*L + first + extra this function computes. Hand-verify at L=-1.0 with no
+    // first-hand term (claim_fresh=false) so only the decay-vs-decay^2 difference is visible.
+    const double L = -1.0, extra = -0.5;
+    const double got = trust_step_observed(L, /*blocked=*/false, /*claim_fresh=*/false,
+                                           /*visible=*/false, {0, 0}, {0, 0}, extra, p);
+    const double once = p.lambda * L + extra;               // single decay, this function's contract
+    const double twice = p.lambda * (p.lambda * L) + extra; // the finding-3 bug: decays L an extra time
+    assert(std::abs(got - once) < 1e-12);
+    assert(std::abs(got - twice) > 1e-6);   // must actually discriminate the two, not coincide
+}
+
+void test_trust_step_observed_extra_llr_applies_without_a_fresh_first_hand_check() {
+    const TrustParams p = params();
+    // The smear signal is about the REPORTER's credibility and must land even when this agent has
+    // no first-hand look at that peer this slot (not visible, or no fresh claim) -- it is an
+    // independent channel, not conditioned on the first-hand gates.
+    const double L = 0.0, extra = -1.0;
+    const double got = trust_step_observed(L, /*blocked=*/false, /*claim_fresh=*/false,
+                                           /*visible=*/false, {5.0, 0.0}, {0.0, 0.0}, extra, p);
+    assert(std::abs(got - (p.lambda * L + extra)) < 1e-12);
 }
 
 // --- evict_patience (Task 6, review finding 2): a belief conviction earns shorter patience,
@@ -823,6 +853,8 @@ int main() {
     test_trust_step_observed_no_fresh_claim_decays_only();
     test_trust_step_observed_not_visible_decays_only();
     test_trust_step_observed_fresh_claim_uses_the_residual();
+    test_trust_step_observed_combines_extra_llr_in_one_step_not_two();
+    test_trust_step_observed_extra_llr_applies_without_a_fresh_first_hand_check();
     test_evict_patience_belief_block_gets_the_short_patience();
     test_evict_patience_roster_exclusion_or_gate2_keeps_the_long_patience();
     test_evict_patience_unblocked_peer_gets_ordinary_silence_patience();

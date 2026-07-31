@@ -351,13 +351,20 @@ inline double smear_llr(bool have_check, const Eigen::Vector2d& reported,
 // not of the noisy sample. A peer we cannot see produces NO evidence, exactly like a stale claim:
 // abstaining costs latency, crediting an impossible sightline would let an attacker hide behind a
 // pillar and still be judged, which the design's acceptance criteria explicitly forbid.
+//
+// `extra_llr` (task 7 review finding 3): a peer is BOTH a first-hand target here AND, in the same
+// slot, potentially a second-hand REPORTER whose own credibility just moved (smear_llr /
+// refuted_llr, folded together by the caller into one clamped number per reporter per slot).
+// Calling trust_step_self a second time for the same peer in the same slot would decay L by
+// lambda TWICE (tau effectively halves), so the caller must combine both signals into one llr
+// and land here exactly once. 0.0 when the peer generated no second-hand evidence this slot.
 inline double trust_step_observed(double L, bool blocked, bool claim_fresh, bool visible_peer,
                                   const Eigen::Vector2d& observed, const Eigen::Vector2d& claimed,
-                                  const TrustParams& p) {
+                                  double extra_llr, const TrustParams& p) {
     if (blocked) return L;
-    double llr = 0.0;
+    double llr = extra_llr;
     if (claim_fresh && visible_peer)
-        llr = trust_llr((observed - claimed).norm(), p.sigma, p.d_lie, p.clamp_step, p.credit_ratio);
+        llr += trust_llr((observed - claimed).norm(), p.sigma, p.d_lie, p.clamp_step, p.credit_ratio);
     return trust_step_self(L, llr, p);
 }
 

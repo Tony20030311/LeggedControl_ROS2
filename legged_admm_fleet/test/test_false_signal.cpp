@@ -184,6 +184,46 @@ int main() {
         dup.ev_pos = {1.0, 0.0, 1.5, 0.0};
         assert(gateCheck(dup, kRoster, g) == GateReason::kEvidence
                && "a duplicate observed id was accepted");
+
+        AgentStateMsg nonfinite_ev = healthy(2, 3.0, 0.0);
+        nonfinite_ev.ev_peer = {1};
+        nonfinite_ev.ev_pos = {std::nan(""), 0.0};
+        assert(gateCheck(nonfinite_ev, kRoster, g) == GateReason::kEvidence
+               && "a NaN evidence position was accepted");
+
+        // REVIEW FINDING 1: ev_slot itself is attacker-controlled and must be windowed the same
+        // way cycle_id is, or a report's ev_slot can be set to something the observation buffer
+        // can never cover -- making have_check silently always false while the hearsay-about-j
+        // term still runs, so a false report costs the reporter nothing.
+        AgentStateMsg stale_ev = healthy(2, 3.0, 0.0);
+        stale_ev.ev_peer = {1};
+        stale_ev.ev_pos = {5.0, 0.0};
+        stale_ev.ev_slot = 5000;                        // far outside any plausible window
+        assert(gateCheck(stale_ev, kRoster, g, nullptr, /*now_slot=*/100) == GateReason::kEvidence
+               && "an evidence slot far outside the window was accepted");
+        AgentStateMsg future_ev = healthy(2, 3.0, 0.0);
+        future_ev.ev_peer = {1};
+        future_ev.ev_pos = {5.0, 0.0};
+        future_ev.ev_slot = 150;                        // ahead of the receiver's OWN clock
+        assert(gateCheck(future_ev, kRoster, g, nullptr, 100) == GateReason::kEvidence
+               && "evidence from the receiver's future was accepted");
+        AgentStateMsg fresh_ev = healthy(2, 3.0, 0.0);
+        fresh_ev.ev_peer = {1};
+        fresh_ev.ev_pos = {5.0, 0.0};
+        fresh_ev.ev_slot = 99;                           // one slot behind now_slot=100, as designed
+        assert(gateCheck(fresh_ev, kRoster, g, nullptr, 100) == GateReason::kOk
+               && "ordinary one-slot-behind evidence was rejected");
+        // An empty ev_peer ("saw nobody"/pre-evidence sentinel) must not be judged on ev_slot at
+        // all -- otherwise a healthy peer whose belief layer hasn't produced evidence yet (e.g.
+        // still at the ev_slot=0 default) would be rejected wholesale once now_slot outgrows the
+        // window, which is exactly the startup case this project has been bitten by before.
+        // now_slot=110 (cycle_id=100, ordinary jitter, passes the SEPARATE cycle_id check below)
+        // but far enough past ev_slot=0's window (lo = 110-16 = 94) that the bug this test pins
+        // would trip if the empty-ev_peer guard were ever dropped.
+        AgentStateMsg no_ev = healthy(2, 3.0, 0.0);
+        no_ev.ev_slot = 0;
+        assert(gateCheck(no_ev, kRoster, g, nullptr, /*now_slot=*/110) == GateReason::kOk
+               && "an empty evidence array was rejected on ev_slot alone");
     }
     // 6. AND THE POINT OF GATE 2: a consistent lie sails through Gate 1. Shifting the whole
     //    message keeps it well-formed — only an independent observation can catch it.

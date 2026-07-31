@@ -21,6 +21,7 @@
 #include <optional>
 #include <set>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <ocs2_core/misc/LoadData.h>
@@ -343,7 +344,14 @@ public:
         // each peer's observation topic is latched and every other writer is dropped — the same
         // idea as the transport's from-topic check (dds_transport.hpp onState), stronger because
         // it does not trust the topic name at all.
-        obs_window_ = declare_parameter<int>("obs_window", 30);  // samples/peer kept; bounds memory (~3s), not precision
+        // Windowed by AGE, not sample count (review finding 4): the stand-in publisher runs at
+        // ~250 Hz, so the old "30 samples" bound held only ~0.12 s of history -- a little over
+        // one slot (TS=0.1s) -- while the smear check (beliefStep) queries roughly TWO slots
+        // back (ev_slot's one-cycle broadcast lag). That query landed past the end of the buffer
+        // essentially always, so `have_check` was silently false almost every time and a report
+        // that could not be checked read identically to one that checked out clean. 0.5 s covers
+        // several slots of lag with room for jitter.
+        obs_window_s_ = declare_parameter<double>("obs_window_s", 0.5);
         for (int j : dogs_) {
             if (j == self_id_) continue;
             peer_truth_subs_.push_back(create_subscription<nav_msgs::msg::Odometry>(
@@ -361,9 +369,9 @@ public:
                         return;
                     }
                     auto& buf = peer_truth_[j];
-                    buf.push_back({now().seconds(), Eigen::Vector2d(m->pose.pose.position.x,
-                                                                    m->pose.pose.position.y)});
-                    while (static_cast<int>(buf.size()) > obs_window_) buf.pop_front();
+                    const double t = now().seconds();
+                    buf.push_back({t, Eigen::Vector2d(m->pose.pose.position.x, m->pose.pose.position.y)});
+                    while (buf.size() > 1 && t - buf.front().t > obs_window_s_) buf.pop_front();
                 }, cmd_opts));
         }
         // Latch the per-dog goal (transient_local), same discovery-race reason as plan_sub_ below:
@@ -627,6 +635,14 @@ private:
             if (sit == seen.end()) continue;   // no claim to anchor
             const auto obs = admm::interp_at(tb->second, static_cast<double>(sit->second) * ts_);
             if (!obs) continue;   // stream stalled or hasn't started yet: no evidence, no correction
+            // TASK 7 REVIEW FINDING 6: the same range/occlusion gate beliefStep uses for
+            // first-hand evidence, applied here too. Without it, a peer hiding behind a pillar
+            // from everyone but its victim was still judged unobservable by the belief layer
+            // while this function kept anchoring the barrier and moving the local keep-out to a
+            // position it had just declared un-sensed -- safety-positive by accident, but a
+            // stand-in sensor model that the paper's own safety mechanism ignores is not
+            // defensible. Not visible -> treated exactly like "stream stalled": no correction.
+            if (!admm::visible(self_p, *obs, arena_obs_, obs_range_)) continue;
             const Eigen::Vector2d noisy =
                 *obs + admm::obs_noise(slot, self_id_, j, trust_.sigma, obs_noise_seed_);
             auto& prev = peer_offset_prev_[j];
@@ -1008,6 +1024,114 @@ private:
         std::map<int, std::deque<admm::ObsSample>> truth;
         { std::lock_guard<std::mutex> l(mu_); truth = peer_truth_; }
         const auto seen = transport_->last_seen();
+
+        // SECOND-HAND EVIDENCE, PART 1: fold in what other peers reported THIS slot (task 7
+        // items 4-6, spec 5.2/5.3), run BEFORE the first-hand loop below for two reasons:
+        //  - review finding 3: a peer is both a first-hand TARGET (below) and, in the same slot,
+        //    potentially a second-hand REPORTER whose own credibility just moved. Accumulating
+        //    the reporter's contribution here into `smear_contrib` and feeding it to the SAME
+        //    trust_step_observed call below (as `extra_llr`) means l_self_[reporter] is decayed
+        //    by lambda exactly once this slot, not twice.
+        //  - spec 5.3: w_i (how much we weight a relayer) must be "the PREVIOUS slot's" belief in
+        //    that relayer, so trust_step_relay below must read l_self_[i] before this slot's
+        //    first-hand update touches it -- which running this section first guarantees for free.
+        // `touched` records every (target, source) pair trust_step_relay actually updated this
+        // slot, so the decay pass in part 2 does not decay-then-add the same pair twice.
+        std::map<int, double> smear_contrib;      // reporter id -> combined llr about THAT reporter
+        std::set<std::pair<int, int>> touched;    // (target, source) pairs updated this slot
+        if (claims_fresh) {   // peer_evidence() is frozen on a barrier-miss HOLD -- same "no fresh
+                               // data, no evidence" contract as the first-hand loop below; without
+                               // this gate a HOLD would replay the SAME frozen report every silent
+                               // slot as if it were new (review finding 2's sibling problem).
+            const double margin = admm::evidence_margin(trust_.sigma);
+            for (const auto& kv : agent_->peer_evidence()) {
+                const int i = kv.first;
+                if (i == self_id_ || transport_->blocked(i)) continue;   // a fenced peer's word is nothing
+                const auto& ev = kv.second;                              // {peer, pos, slot} as received
+                const auto xi = agent_->peer_xnow().find(i);
+                if (xi == agent_->peer_xnow().end()) continue;            // i itself is gone (evicted)
+                double contrib = 0.0;
+                for (std::size_t k = 0; k < ev.peer.size(); ++k) {
+                    const int j = ev.peer[k];
+                    if (j == self_id_ || j == i) continue;
+                    const Eigen::Vector2d z(ev.pos[2 * k], ev.pos[2 * k + 1]);
+                    if (!z.allFinite()) continue;
+                    // ITEM 6: geometry i itself is bound by, using i's OWN CLAIMED position as
+                    // its vantage point -- we do not need to have observed i to run this check,
+                    // which is the whole point of broadcasting positions instead of residuals.
+                    // Refuted -> the report cannot be about anything real; nothing further is
+                    // extracted from it. Lenient occlusion radius = CBF radius (0.30) minus
+                    // margin -- narrower than the physical pillar (0.20) whenever margin > 0.10,
+                    // so review finding 6's arena/margin numbers are worth re-checking if either
+                    // constant is retuned.
+                    if (!admm::evidence_plausible(xi->second.head<2>(), z, arena_obs_, obs_range_, margin)) {
+                        contrib += admm::refuted_llr(trust_);
+                        continue;
+                    }
+                    // ITEM 5: the smear check. If THIS agent independently observed j at the
+                    // exact slot the report is about, compare directly -- j's true position at
+                    // that instant is exactly what was just measured, so a disagreement is
+                    // evidence the REPORTER fabricated its sighting, not evidence against j.
+                    // Coverage of this check is counted (review finding 4): if the buffer never
+                    // actually covers ev.slot, `have_check` is always false and a report that
+                    // could not be checked would look identical to one that checked out clean.
+                    bool have_check = false;
+                    Eigen::Vector2d self_obs_j = Eigen::Vector2d::Zero();
+                    ++smear_checks_total_;
+                    if (const auto tb = truth.find(j); tb != truth.end()) {
+                        if (const auto obs = admm::interp_at(tb->second, static_cast<double>(ev.slot) * ts_)) {
+                            if (admm::visible(self_p, *obs, arena_obs_, obs_range_)) {
+                                self_obs_j = *obs;
+                                have_check = true;
+                            }
+                        }
+                    }
+                    if (have_check) ++smear_checks_hit_;
+                    contrib += admm::smear_llr(have_check, z, self_obs_j, trust_);
+                    if (transport_->blocked(j)) continue;   // j already fenced; nothing left to decide
+                    const auto cj = agent_->peer_xnow().find(j);
+                    if (cj == agent_->peer_xnow().end()) continue;
+                    // Hearsay about j itself: corroborated against j's OWN claim, weighted and
+                    // capped by how much WE trust i as of LAST slot (trust_step_relay's own
+                    // invariant; l_self_[i] has not been touched yet this slot -- see above).
+                    const double r = (z - cj->second.head<2>()).norm();
+                    double& C = l_relay_[j][i];
+                    C = admm::trust_step_relay(C, admm::trust_llr(r, trust_.sigma, trust_.d_lie,
+                                                                  trust_.clamp_step, trust_.credit_ratio),
+                                               l_self_[i], trust_);
+                    touched.insert({j, i});
+                }
+                if (contrib != 0.0)
+                    smear_contrib[i] = std::clamp(contrib, -trust_.clamp_step, trust_.clamp_step);
+            }
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+                                 "[agent%d] smear-check coverage: %lu/%lu hit (review finding 4 telemetry)",
+                                 self_id_, smear_checks_hit_, smear_checks_total_);
+        }
+        // SECOND-HAND EVIDENCE, PART 2: decay every relay entry NOT freshly updated above, once
+        // per slot -- the same "decay always, evidence only when fresh" discipline l_self_
+        // follows below. A blocked reporter's entries are ERASED outright (review finding 2):
+        // once fenced, its word about anyone must stop existing, not decay toward neutral over
+        // ~2s while still counting toward a target's total -- the same shape of bug as the
+        // stale-vote deadlock already on record for this project. Without this, an attacker could
+        // earn trust, accuse j for a few slots, go silent about j, and the frozen accusation would
+        // keep counting against j for the rest of the mission, surviving the attacker's own
+        // eviction.
+        for (auto& target_kv : l_relay_) {
+            const int j = target_kv.first;
+            auto& sources = target_kv.second;
+            for (auto it = sources.begin(); it != sources.end();) {
+                const int i = it->first;
+                if (transport_->blocked(i)) { it = sources.erase(it); continue; }
+                if (touched.count({j, i})) { ++it; continue; }
+                it->second = admm::trust_step_relay(it->second, 0.0, l_self_[i], trust_);
+                ++it;
+            }
+        }
+
+        // FIRST-HAND EVIDENCE: gating unchanged, but the llr this slot COMBINES with any
+        // second-hand smear_contrib computed above for this same peer as a reporter -- exactly
+        // once per peer, exactly once per slot (review finding 3).
         ev_out_peer_.clear();
         ev_out_pos_.clear();
         for (const auto& kv : agent_->peer_xnow()) {
@@ -1042,7 +1166,9 @@ private:
                 }
             }
             double& L = l_self_[j];
-            L = admm::trust_step_observed(L, blocked, fresh, vis, observed, kv.second.head<2>(), trust_);
+            const auto sc = smear_contrib.find(j);
+            L = admm::trust_step_observed(L, blocked, fresh, vis, observed, kv.second.head<2>(),
+                                          sc != smear_contrib.end() ? sc->second : 0.0, trust_);
             if (blocked) continue;   // already latched off; nothing left to decide
             const double total = admm::trust_total(L, l_relay_[j], trust_);
             // Logged unconditionally, same discipline as gate2's residual line: this IS the
@@ -1066,71 +1192,6 @@ private:
             }
         }
         ev_out_slot_ = slot;   // stamp for the NEXT broadcast (agent_->set_evidence in cycle())
-
-        // SECOND-HAND EVIDENCE (task 7 items 4-6, spec 5.2/5.3): what OTHER peers say they saw.
-        // One reporter's whole message is accumulated into a SINGLE llr contribution before it
-        // touches l_self_[reporter] -- see trust.hpp's refuted_llr/smear_llr comment for why one
-        // call per SLOT, not one per reported target, matters at N > 3.
-        //
-        // Gated on claims_fresh for the exact same reason the first-hand loop above is:
-        // peer_evidence() (like peer_xnow()) is only assigned when THIS agent's own AgentState
-        // barrier actually completes this cycle and stays frozen on a barrier-miss HOLD. Without
-        // this gate, a HOLD would replay the SAME frozen (i, j, z) through trust_step_self /
-        // trust_step_relay every silent slot -- decaying and re-crediting on data that never
-        // changed, which is not new evidence and must not be treated as if it were.
-        if (!claims_fresh) return;
-        const double margin = admm::evidence_margin(trust_.sigma);
-        for (const auto& kv : agent_->peer_evidence()) {
-            const int i = kv.first;
-            if (i == self_id_ || transport_->blocked(i)) continue;   // a fenced peer's word is nothing
-            const auto& ev = kv.second;                              // {peer, pos, slot} as received
-            const auto xi = agent_->peer_xnow().find(i);
-            if (xi == agent_->peer_xnow().end()) continue;            // i itself is gone (evicted)
-            double contrib = 0.0;
-            for (std::size_t k = 0; k < ev.peer.size(); ++k) {
-                const int j = ev.peer[k];
-                if (j == self_id_ || j == i) continue;
-                const Eigen::Vector2d z(ev.pos[2 * k], ev.pos[2 * k + 1]);
-                if (!z.allFinite()) continue;
-                // ITEM 6: geometry i itself is bound by, using i's OWN CLAIMED position as its
-                // vantage point -- we do not need to have observed i to run this check, which is
-                // the whole point of broadcasting positions instead of residuals. Refuted -> the
-                // report cannot be about anything real; nothing further is extracted from it.
-                if (!admm::evidence_plausible(xi->second.head<2>(), z, arena_obs_, obs_range_, margin)) {
-                    contrib += admm::refuted_llr(trust_);
-                    continue;
-                }
-                // ITEM 5: the smear check. If THIS agent independently observed j at the exact
-                // slot the report is about, compare directly -- j's true position at that instant
-                // is exactly what was just measured, so a disagreement is evidence the REPORTER
-                // fabricated its sighting, not evidence against j.
-                bool have_check = false;
-                Eigen::Vector2d self_obs_j = Eigen::Vector2d::Zero();
-                if (const auto tb = truth.find(j); tb != truth.end()) {
-                    if (const auto obs = admm::interp_at(tb->second, static_cast<double>(ev.slot) * ts_)) {
-                        if (admm::visible(self_p, *obs, arena_obs_, obs_range_)) {
-                            self_obs_j = *obs;
-                            have_check = true;
-                        }
-                    }
-                }
-                contrib += admm::smear_llr(have_check, z, self_obs_j, trust_);
-                if (transport_->blocked(j)) continue;   // j already fenced; nothing left to decide
-                const auto cj = agent_->peer_xnow().find(j);
-                if (cj == agent_->peer_xnow().end()) continue;
-                // Hearsay about j itself: corroborated against j's OWN claim, weighted and capped
-                // by how much WE trust i (trust_step_relay's own invariant).
-                const double r = (z - cj->second.head<2>()).norm();
-                double& C = l_relay_[j][i];
-                C = admm::trust_step_relay(C, admm::trust_llr(r, trust_.sigma, trust_.d_lie,
-                                                              trust_.clamp_step, trust_.credit_ratio),
-                                           l_self_[i], trust_);
-            }
-            if (contrib != 0.0) {
-                contrib = std::clamp(contrib, -trust_.clamp_step, trust_.clamp_step);
-                l_self_[i] = admm::trust_step_self(l_self_[i], contrib, trust_);
-            }
-        }
     }
 
     // Single dispatch point for both of gate2()'s call sites (HOLD path and SOLVED path), so the
@@ -1420,7 +1481,7 @@ private:
     // of use (updatePeerOffsets), not here, so this buffer stays a clean, re-queryable history.
     std::map<int, std::deque<admm::ObsSample>> peer_truth_;
     std::map<int, std::optional<rmw_gid_t>> obs_gid_;  // first writer GID/peer topic (latched); guarded by mu_
-    int obs_window_ = 30;                            // samples kept per peer (declared with the subscription)
+    double obs_window_s_ = 0.5;                      // seconds of history kept per peer (declared with the subscription)
     std::map<int, Eigen::Vector2d> peer_offset_prev_;  // conservative_offset rate-limit state; cycle()-thread only
     std::map<int, double> resid_;                   // low-passed |odom - claimed|, cycle() only
     double resid_alpha_ = 0.2, resid_gate_ = 0.5;
@@ -1437,6 +1498,11 @@ private:
     // Task 7 item 1: sensing range visible() gates first-hand evidence on, and (widened) the
     // geometric refutation of relayed reports (item 6).
     double obs_range_ = 4.0;
+    // Review finding 4 telemetry: how often the smear check (beliefStep) actually had a
+    // buffered self-observation to compare a relayed report against, vs how often it merely
+    // abstained -- cumulative, logged throttled, so the smear experiment arm can prove the
+    // check ran instead of a silent 0/0.
+    std::uint64_t smear_checks_total_ = 0, smear_checks_hit_ = 0;
     // Task 7 / spec 5.2: this agent's own evidence, produced by the LAST beliefStep call and
     // broadcast at the TOP of the NEXT step() (see cycle()'s set_evidence call and AgentState.msg
     // for why ev_slot must accompany it). cycle()-thread only, same as ev_out_slot_.

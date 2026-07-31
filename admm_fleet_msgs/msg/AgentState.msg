@@ -18,11 +18,16 @@ int32[] members        # the sender's CURRENT roster (its dogs_). A receiver mis
 # Observation-belief-trust (spec 5.2): what the sender SAW, not what it concluded. A residual is
 # unfalsifiable; a position is constrained by sensing range and by which sightlines the arena
 # permits, so a receiver can refute a fabricated report without seeing either party.
-int32[]   ev_peer      # peer ids the sender observed (its own observation channel, spec 5.1)
+# Bounded (review finding 5): these are attacker-controlled and deserialise on the thread that
+# services the consensus barrier, on a host also running a 250 Hz whole-body controller. The
+# bound is a statically known cap, not a tuned fleet size -- 8 comfortably covers every roster
+# this project runs (N=3 primarily, N=5 tested) with room to spare -- so an oversized claim is
+# rejected by the deserialiser itself instead of reaching gateCheck's own size checks at all.
+int32[<=8]   ev_peer   # peer ids the sender observed (its own observation channel, spec 5.1)
                        # during the slot named by ev_slot. Empty = "saw nobody that slot", which
                        # is also what a pre-evidence sender means, so old peers and the loopback
                        # test transport are unaffected.
-float64[] ev_pos       # observed (x,y) per entry, length exactly 2 * len(ev_peer).
+float64[<=16] ev_pos   # observed (x,y) per entry, length exactly 2 * len(ev_peer).
 uint64    ev_slot      # the slot this evidence describes. NOT the same as cycle_id above:
                        # send_state runs at the TOP of AgentCore::step, before this cycle's
                        # evidence is even produced, so every broadcast necessarily carries the

@@ -13,6 +13,7 @@
 //
 // Implementation in agent_core.cpp. Messages are ROS-agnostic structs here; the node maps
 // them to admm_fleet_msgs on the wire.
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <algorithm>
@@ -131,11 +132,31 @@ inline GateReason gateCheck(const AgentStateMsg& m, const std::vector<int>& rost
     // impossible payload is: the whole message, not a best-effort partial read.
     if (m.ev_pos.size() != 2 * m.ev_peer.size()) return GateReason::kEvidence;
     if (m.ev_peer.size() > roster.size()) return GateReason::kEvidence;
+    for (double v : m.ev_pos)
+        if (!std::isfinite(v)) return GateReason::kEvidence;
     for (std::size_t a = 0; a < m.ev_peer.size(); ++a) {
         if (std::find(roster.begin(), roster.end(), m.ev_peer[a]) == roster.end())
             return GateReason::kEvidence;
         for (std::size_t b = a + 1; b < m.ev_peer.size(); ++b)
             if (m.ev_peer[a] == m.ev_peer[b]) return GateReason::kEvidence;   // no duplicates
+    }
+    // ev_slot itself must be windowed too (review finding 1), the same reason cycle_id is below:
+    // an unvalidated ev_slot lets a reporter's report about j miss the observation buffer
+    // (interp_at returns nullopt -> have_check=false -> smear_llr contributes 0) while the
+    // hearsay-about-j term still runs against j's CURRENT claim regardless -- the report costs
+    // the reporter nothing while still costing the target. Skipped when there is no evidence to
+    // begin with (empty ev_peer is the "saw nobody"/pre-evidence sentinel and may legitimately
+    // carry a stale or zero ev_slot). Bounded above by now_slot itself, not now_slot+slot_window:
+    // evidence describes something that already happened, so unlike cycle_id (the SENDER's own
+    // broadcast slot, which is allowed to run a little ahead on clock skew) it must never be from
+    // the receiver's future.
+    if (now_slot != 0 && !m.ev_peer.empty()) {
+        const std::uint64_t lo = now_slot > g.slot_window ? now_slot - g.slot_window : 0;
+        if (m.ev_slot < lo || m.ev_slot > now_slot) {
+            if (worst_margin)
+                *worst_margin = static_cast<double>(m.ev_slot) - static_cast<double>(now_slot);
+            return GateReason::kEvidence;
+        }
     }
     // cycle_id must name a slot near NOW. It is not just a label: it keys the mailbox, it
     // advances last_seen_ (so a peer claiming slot+1000 can never be judged silent again), and
