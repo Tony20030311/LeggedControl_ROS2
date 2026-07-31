@@ -22,23 +22,35 @@ GOAL_X=${GOAL_X:-3.0}
 # 0.90, not 0.95: a legitimate detour around the corpse was measured at 0.93 and 0.95 killed
 # the run. Contact is 0.867 (2x base half-diagonal 0.433).
 DMIN_ABORT=${DMIN_ABORT:-0.90}
-# Worst all-robot separation seen while LIE_LOGONLY=1 tolerated it. NOT `local` anywhere: it is
-# the counterfactual arm's headline number and has to survive walk_until returning.
-BREACH=99
+# NOT `local` inside walk_until: the caller prints how close the fleet actually got, not just
+# whether it crossed 0.45 (real arrival) or the 0.65 keep-out-blocked convergence (only a defended
+# arm plants a keep-out that can trip that one) -- a number is comparable across arms, a boolean
+# that can mean two different things is not.
+ARRIVE_DIST=99
 REJOIN=${REJOIN:-0}
 SURVIVORS=$(echo $ROBOTS | tr ' ' '\n' | grep -vx "$VICTIM" | tr '\n' ' ')
 
 grep_agents() { grep -h "$1" "$LOGD/admm.log" 2>/dev/null; }
 count_agents() { grep_agents "$1" | wc -l; }
+# EVICT/REJOIN lines carry their origin as rclcpp's own `[admm_agent_N]` prefix. A single agent
+# can log the same pattern more than once (re-evicting as its corpse-CBF estimate updates), so a
+# LINE count can satisfy a "2 independent agents agreed" assertion off ONE agent alone -- dedup
+# on the agent tag instead of counting lines.
+count_distinct_agents() { grep_agents "$1" | grep -oE '\[admm_agent_[0-9]+\]' | sort -u | wc -l; }
 
-# Wait until $2 agents have logged pattern $1, or $3 seconds elapse. Echoes the count.
+# die_infra: the results protocol says only an infrastructure failure justifies a re-run. A
+# distinct exit code lets a sweep across six arms tell "the lab flaked" (2) from "the experiment
+# produced this outcome" (1, ordinary die) without a human reading every log.
+die_infra() { say "FAIL(infra): $*"; exit 2; }
+
+# Wait until $2 DISTINCT agents have logged pattern $1, or $3 seconds elapse. Echoes the count.
 wait_for_log() {
   local pat="$1" want="$2" secs="$3"
   for i in $(seq 1 "$secs"); do
-    [ "$(count_agents "$pat")" -ge "$want" ] && break
+    [ "$(count_distinct_agents "$pat")" -ge "$want" ] && break
     sleep 1
   done
-  count_agents "$pat"
+  count_distinct_agents "$pat"
 }
 
 # EXPECT=stall: this scenario is known to be geometrically infeasible (plum_dense in two-dog
@@ -101,6 +113,7 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
     D=$(python3 -c "import math;print(f'{math.hypot($wx-$1, $wy-$2):.3f}')")
     M=$(min_pair)
     say "  centroid=($wx,$wy) dist=$D min_pair=$M"
+    ARRIVE_DIST=$D   # global (see declaration) -- covers every return below, success or timeout
     if [ "$(python3 -c "print(1 if $M<$DMIN_ABORT else 0)")" = 1 ]; then
       # LIE_CHASE joins LIE_LOGONLY here for the same reason: with a hostile robot deliberately
       # driven into the fleet, the all-robot minimum measures how hard IT rammed, and failing the
@@ -117,13 +130,12 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
         local S=$(pair_among $SURVIVORS)
         [ "$(python3 -c "print(1 if $S<$DMIN_ABORT else 0)")" = 1 ] \
           && die "survivor pair $S < $DMIN_ABORT — survivors collided, not the expected breach"
-        [ "$(python3 -c "print(1 if $M<$BREACH else 0)")" = 1 ] && BREACH=$M
         say "  BREACH $M (expected: survivors hold the ghost, the real body closes in; survivors $S)"
       else
         die "pairwise $M < $DMIN_ABORT (collision guard)"
       fi
     fi
-    gz_deactivated && die "WBC deactivated mid-walk"
+    gz_deactivated && die_infra "WBC deactivated mid-walk"
     [ "$(python3 -c "print(1 if $D<0.45 else 0)")" = 1 ] && return 0
     # A SLOT can be inside the corpse keep-out, and then the centroid can never reach the goal.
     # Measured (late kill at x=15.3): corpse at (16.16,-0.55), COL2 rear slot at (17.24,-0.02) is
@@ -261,7 +273,7 @@ if [ -n "${LIE:-}" ]; then
   fi
   if [ "${LIE_LOGONLY:-0}" = 1 ]; then
     for j in $SURVIVORS; do
-      pset /admm_agent_$j detection_log_only true || die "could not disarm Gate 2 on agent$j"
+      pset /admm_agent_$j detection_log_only true || die_infra "could not disarm Gate 2 on agent$j"
     done
   fi
   say "pre-armed: the lie now costs one param set at the trigger"
@@ -272,7 +284,7 @@ if [ "$(python3 -c "print(1 if $KILL_AT_X>0 else 0)")" = 1 ]; then
   for i in $(seq 1 120); do
     read kx ky <<< "$(fleet_centroid "$ROBOTS")"
     [ "$(python3 -c "print(1 if $kx>=$KILL_AT_X else 0)")" = 1 ] && { KX_OK=1; break; }
-    gz_deactivated && die "WBC deactivated before the kill point"
+    gz_deactivated && die_infra "WBC deactivated before the kill point"
     sleep 1
   done
   [ "$KX_OK" = 1 ] || die "fleet never reached x=$KILL_AT_X (last centroid x=$kx)"
@@ -288,7 +300,7 @@ fi
 if [ "${NO_KILL:-0}" = 1 ]; then
   say "phase 5: SKIPPED (NO_KILL=1) — nobody silenced; verifying undisturbed 3-dog operation"
   say "phase 6: all three continue to ($GX,$GY)"
-  walk_until "$GX" "$GY" "$ROBOTS" 60 || die "fleet never reached the outbound goal"
+  walk_until "$GX" "$GY" "$ROBOTS" 60 || die "fleet never reached the outbound goal (arrive_dist=$ARRIVE_DIST)"
   N_EV=$(count_agents "EVICT robot")
   [ "$N_EV" = 0 ] || { grep_agents "EVICT robot" | sed 's/^/    /'; die "spurious EVICT x$N_EV with nobody silenced"; }
   N_RB=$(count_agents "REBUILD")
@@ -302,7 +314,7 @@ else
 # robot_id never appears on the command line; only the `-r __node:=admm_agent_N` remap does.
 # pgrep -f is read-only and safe here; `pkill -f` is banned (it matches this shell).
 PIDV=$(pgrep -f "admm_agent_$VICTIM" | head -1)
-[ -n "$PIDV" ] || die "cannot find admm_agent_$VICTIM (try: pgrep -af admm_agent)"
+[ -n "$PIDV" ] || die_infra "cannot find admm_agent_$VICTIM (try: pgrep -af admm_agent)"
 # LIE=<metres>: experiment C instead of experiment D. The victim is not silenced — it is
 # COMPROMISED. Two knobs, because a real attacker has both: it broadcasts a position offset by
 # LIE metres (sender side, so every survivor judges the same bytes), and it is steered into the
@@ -338,7 +350,7 @@ if [ -n "${LIE:-}" ]; then
   # is the only round trip left here. Everything below happens while the fleet is where it was
   # staged instead of 8 m downfield.
   pset /admm_agent_$VICTIM inject_fake_offset "$LIE" \
-    || die "inject_fake_offset failed (is the param declared?)"
+    || die_infra "inject_fake_offset failed (is the param declared?)"
   # CHARGE NOW, not after the eviction is logged. Waiting for that cost ~10 s, and at 0.4 m/s the
   # attacker walks 4 m in it — past the very peg it was supposed to round, which is why three
   # takes filmed a stroll instead of an attack. The eviction lands ~1 s after the lie regardless.
@@ -428,11 +440,11 @@ PY
   # cannot claim the survivors kept themselves safe. Dropping all its incoming peer states makes
   # it genuinely non-cooperative — it times out, evicts everyone, and walks solo to its goal.
   if [ "${LIE_DEAF:-1}" = 1 ]; then
-    pset /admm_agent_$VICTIM inject_drop_p 1.0 || die "could not deafen the liar"
+    pset /admm_agent_$VICTIM inject_drop_p 1.0 || die_infra "could not deafen the liar"
   fi
 else
 say "phase 5: SIGSTOP admm_agent_$VICTIM (pid $PIDV)"
-kill -STOP "$PIDV" || die "SIGSTOP failed"
+kill -STOP "$PIDV" || die_infra "SIGSTOP failed"
 fi
 
 N_EVICT=$(wait_for_log "EVICT robot$VICTIM" 2 60)
@@ -445,15 +457,20 @@ grep_agents "REBUILD" | tail -2 | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
 # survivors must keep going to the ORIGINAL goal, routing around the corpse
 say "phase 6: survivors continue to ($GX,$GY)"
 if ! walk_until "$GX" "$GY" "$SURVIVORS" 60; then
-  [ "$EXPECT" = stall ] || die "survivors never reached the outbound goal"
+  [ "$EXPECT" = stall ] || die "survivors never reached the outbound goal (arrive_dist=$ARRIVE_DIST)"
   # Geometrically infeasible by design — but prove it rather than assume it. The collision
   # guard and the WBC check inside walk_until already ran on every poll and did not fire.
   confirm_stall "$GX" "$GY" "$SURVIVORS" \
     || die "EXPECT=stall but the detector found no stall — the fleet was moving, so this is a plain miss"
   stop_recording
+  # NOT die_infra: dist_summary.py exits 1 for two different reasons (see its own docstring) —
+  # too few rows/unreadable file (genuinely infra: the logger never ran), OR it read the file
+  # fine and found real time below the contact line (a genuine collision finding). This call site
+  # cannot tell which one fired, and mislabeling the second case as infra would let an automated
+  # re-run quietly discard the exact kind of result this whole exercise exists to keep.
   python3 "$SCRIPTS/dist_summary.py" "$LOGD/dist.csv" \
-    || die "collision guard produced no data — STALL-SAFE not claimable"
-  say "D STALL-SAFE: victim=robot$VICTIM, evicted by $N_EVICT, survivors wedged without collision; logs $LOGD"
+    || die "collision guard produced no data (or found contact) — STALL-SAFE not claimable"
+  say "D STALL-SAFE: victim=robot$VICTIM, evicted by $N_EVICT, survivors wedged without collision, arrive_dist=$ARRIVE_DIST; logs $LOGD"
   exit 0
 fi
 say "survivors reached the outbound goal with robot$VICTIM down"
@@ -510,7 +527,7 @@ fi
 if [ "$REJOIN" = 1 ]; then
   # ---------- phase 7: victim comes back (scenario B, needs the Phase-2 view-change) ----------
   say "phase 7: SIGCONT admm_agent_$VICTIM — expecting rejoin"
-  kill -CONT "$PIDV" || die "SIGCONT failed"
+  kill -CONT "$PIDV" || die_infra "SIGCONT failed"
   N_RE=$(wait_for_log "REJOIN robot$VICTIM" 2 60)
   if [ "$N_RE" -lt 2 ]; then
     say "NOTE: no REJOIN on $((2 - N_RE)) survivor(s) — rejoin is Phase 2, not yet implemented?"
@@ -544,7 +561,7 @@ N_WANT=$(echo $WATCH | wc -w)
 say "plan covers ${N_PLAN:-?} robot(s) (expect $N_WANT)"
 [ "${N_PLAN:-0}" = "$N_WANT" ] || die "FleetPlan covers ${N_PLAN:-?} robot(s), expected $N_WANT"
 
-walk_until "$HX" "$HY" "$WATCH" 90 || die "fleet never got home"
+walk_until "$HX" "$HY" "$WATCH" 90 || die "fleet never got home (arrive_dist=$ARRIVE_DIST)"
 
 # A straight-line fallback means A* found no route; that is the silent precursor to a frozen dog.
 NOPATH=$(count_agents "A\* found NO path")
@@ -575,8 +592,18 @@ PY
   case "$GAPV" in
     nan) say "WARNING: no body-gap samples — 'did they touch' is UNANSWERED for this run" ;;
     *)
-      [ "$(python3 -c "print(1 if $GAPV <= 0 else 0)")" = 1 ] \
-        && die "BODIES OVERLAPPED: true surface gap ${GAPV} m"
+      if [ "$(python3 -c "print(1 if $GAPV <= 0 else 0)")" = 1 ]; then
+        # A live, deaf attacker steered INTO the fleet can genuinely make contact — that is the
+        # attack's effect, not a script defect, and an undefended (or weakly-defended) arm
+        # exists specifically to measure how bad it gets. Dying here would erase that arm's own
+        # verdict before the counterfactual summary below ever runs. A lie-free run has no
+        # attacker to blame, so overlap there stays what it always was: a real failure.
+        if [ -n "${LIE:-}" ]; then
+          say "WARNING: BODIES OVERLAPPED: true surface gap ${GAPV} m"
+        else
+          die "BODIES OVERLAPPED: true surface gap ${GAPV} m"
+        fi
+      fi
       [ "$(python3 -c "print(1 if $GAPV < 0.15 else 0)")" = 1 ] \
         && say "WARNING: closest body surfaces ${GAPV} m — boxes cleared, LEGS NOT PROVEN CLEAR"
       ;;
@@ -618,8 +645,15 @@ else:
 elif [ -n "${DIRTY:-}" ]; then
   die "separation was not clean (see dist_summary above) — PASS not claimable"
 fi
-if [ "${LIE_LOGONLY:-0}" = 1 ] && [ "$BREACH" != 99 ]; then
-  say "COUNTERFACTUAL RESULT: the accepted lie cost $BREACH m of true separation"
-  say "  (the survivors never breached D_MIN against the GHOST — only against the real body)"
+if [ "${LIE_LOGONLY:-0}" = 1 ]; then
+  # The old BREACH tracker sampled min_pair() (the CSV's last row) once per ~5s poll inside
+  # walk_until, the same sparse instrument dist_summary.py's own docstring warns about: an
+  # excursion shorter than the poll interval slips past it. pair_among scans every row, exactly
+  # like the post-hoc gate two lines up (SVMIN) — the headline owes the same rigor.
+  BREACH_FULL=$(pair_among $ROBOTS)
+  if [ "$(python3 -c "print(1 if $BREACH_FULL<$DMIN_ABORT else 0)")" = 1 ]; then
+    say "COUNTERFACTUAL RESULT: the accepted lie cost $BREACH_FULL m of true separation"
+    say "  (the survivors never breached D_MIN against the GHOST — only against the real body)"
+  fi
 fi
-say "D PASS (rejoin=$REJOIN): victim=robot$VICTIM, evicted by $N_EVICT, home reached; logs $LOGD"
+say "D PASS (rejoin=$REJOIN): victim=robot$VICTIM, evicted by $N_EVICT, home reached, arrive_dist=$ARRIVE_DIST; logs $LOGD"
