@@ -29,6 +29,7 @@ inline bool visible(const Eigen::Vector2d& pi, const Eigen::Vector2d& pj,
     if (!(len <= range)) return false;   // written so NaN falls through to false
     if (len < 1e-9) return true;
     for (const auto& o : obs) {
+        if (!o.pos.allFinite() || !std::isfinite(o.radius)) return false;  // abstain on non-finite obstacles
         const Eigen::Vector2d w = o.pos - pi;
         const double t = w.dot(d) / (len * len);   // where the foot of the perpendicular lands
         if (t <= 0.0 || t >= 1.0) continue;        // the pile is behind me or past the target

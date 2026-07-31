@@ -39,7 +39,24 @@ void test_visible_grazing_miss() {
 
 void test_visible_nan_is_not_visible() {
     const double nan = std::nan("");
+    // Non-finite target position
     assert(!visible({0.0, 0.0}, {nan, 0.0}, {}, 4.0));
+    // Non-finite observer position
+    assert(!visible({nan, 0.0}, {5.0, 0.0}, {}, 4.0));
+}
+
+void test_visible_nan_obstacle_pos_abstains() {
+    const double nan = std::nan("");
+    const std::vector<Obstacle> bad_obs{{Eigen::Vector2d(nan, 0.0), 0.30}};
+    // A non-finite obstacle forces abstention even on a clear sightline.
+    assert(!visible({5.0, 0.0}, {8.0, 0.0}, bad_obs, 4.0));
+}
+
+void test_visible_nan_obstacle_radius_abstains() {
+    const double nan = std::nan("");
+    const std::vector<Obstacle> bad_obs{{Eigen::Vector2d(6.58, 0.0), nan}};
+    // A non-finite radius forces abstention.
+    assert(!visible({5.0, 0.0}, {8.0, 0.0}, bad_obs, 4.0));
 }
 
 }  // namespace
@@ -51,6 +68,8 @@ int main() {
     test_visible_past_the_peg_is_not_blocked();
     test_visible_grazing_miss();
     test_visible_nan_is_not_visible();
+    test_visible_nan_obstacle_pos_abstains();
+    test_visible_nan_obstacle_radius_abstains();
     std::cout << "test_trust: OK\n";
     return 0;
 }
