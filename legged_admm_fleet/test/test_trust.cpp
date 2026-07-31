@@ -410,6 +410,24 @@ void test_credit_ratio_scales_the_unsaturated_positive_branch() {
     assert(std::abs(got - 0.1875) < 1e-9);
 }
 
+void test_credit_ratio_applies_after_the_clamp_not_before() {
+    const TrustParams p = params();
+    // r=0.149 above cannot discriminate clamp-then-scale from scale-then-clamp: the raw
+    // log-likelihood there (0.75) never reaches clamp_step under either order. r=0 does, and it
+    // is the residual a peer reports almost every honest slot (clean-flight residual ~0.006, but
+    // 0 is the clearest hand computation and the two orders diverge by 4x here, not by rounding).
+    // Hand computed: raw l = -d_lie*(2*0-d_lie)/(2*sigma^2) = d_lie^2/(2*sigma^2)
+    //              = 0.30^2/(2*0.02^2) = 0.09/0.0008 = 112.5
+    // clamp-then-scale (correct):  clamp(112.5, -2, 2) = 2.0;  2.0 * credit_ratio(0.25) = 0.5
+    // scale-then-clamp (the bug):  112.5 * 0.25 = 28.125;      clamp(28.125, -2, 2)     = 2.0
+    // At this residual the bug makes credit_ratio invisible: any ratio in (0, 1] saturates to the
+    // same 2.0, which is exactly the "no-op in practice" defect — every honest cycle sits deep in
+    // this saturated regime (sigma is ~0.006-0.02, d_lie is 0.30), so the asymmetry that is
+    // supposed to defeat a duty-cycled liar never actually fires under the buggy order.
+    const double got = trust_llr(0.0, p.sigma, p.d_lie, p.clamp_step, p.credit_ratio);
+    assert(std::abs(got - 0.5) < 1e-9);
+}
+
 void test_duty_cycled_lying_is_still_convicted() {
     const TrustParams p = params();
     // Symmetric credit gives an alternating attacker a fixed point near +1.0: it lies half the
@@ -445,6 +463,7 @@ int main() {
     test_neutral_belief_does_not_fence_the_spawn_formation();
     test_detection_fits_the_safety_margin();
     test_credit_ratio_scales_the_unsaturated_positive_branch();
+    test_credit_ratio_applies_after_the_clamp_not_before();
     test_duty_cycled_lying_is_still_convicted();
     test_offset_pulls_a_distant_claim_back_to_the_observation();
     test_offset_ignores_a_claim_that_is_already_closer();

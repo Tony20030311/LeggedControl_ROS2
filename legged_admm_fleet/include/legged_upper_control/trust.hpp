@@ -138,14 +138,24 @@ struct TrustParams {
 // Log-likelihood ratio of HONEST over LYING for one residual, 2D Gaussian noise both sides:
 //   log p(r|honest)/p(r|lying) = -d_lie * (2r - d_lie) / (2 sigma^2)
 // Zero at r = d_lie/2, positive below, negative above. The positive (honest-looking) branch is
-// scaled by credit_ratio before the clamp; the negative branch is not — see
-// TrustParams::credit_ratio for why symmetric credit is unsafe against a duty-cycled liar.
+// scaled by credit_ratio AFTER the clamp, not before — see TrustParams::credit_ratio for why
+// symmetric credit is unsafe against a duty-cycled liar.
+//
+// The order is load-bearing, not cosmetic. At any realistic operating residual (sigma is
+// 0.006-0.02, d_lie is 0.30) the raw log-likelihood is already in the hundreds, so scale-then-
+// clamp computes credit_ratio*raw and then clamps THAT to clamp_step -- for any credit_ratio in
+// (0, 1] the result saturates to the same clamp_step as an unscaled penalty, and the asymmetry
+// credit_ratio exists to create is invisible in exactly the regime the fleet operates in. Clamp
+// first, so the credited value is clamp_step*credit_ratio, a genuinely smaller step than the
+// penalty's clamp_step -- see test_credit_ratio_applies_after_the_clamp_not_before for the r=0
+// hand computation (0.5 fixed vs 2.0 under the old order).
 inline double trust_llr(double r, double sigma, double d_lie, double clamp_step,
                         double credit_ratio) {
     if (!(sigma > 0.0) || !std::isfinite(r)) return 0.0;
     double l = -d_lie * (2.0 * r - d_lie) / (2.0 * sigma * sigma);
+    l = std::clamp(l, -clamp_step, clamp_step);
     if (l > 0.0) l *= credit_ratio;
-    return std::clamp(l, -clamp_step, clamp_step);
+    return l;
 }
 
 // First-hand evidence: decay, add, then cap the optimistic side at the ceiling.
