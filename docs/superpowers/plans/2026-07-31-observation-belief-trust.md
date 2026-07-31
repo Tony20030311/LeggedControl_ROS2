@@ -258,12 +258,28 @@ void test_one_relayer_alone_can_never_evict() {
     assert(!trust_fences_peer(trust_total(0.0, relay), p));   // hearsay alone is not a verdict
 }
 
-void test_two_independent_relayers_can_evict() {
+void test_hearsay_cannot_reach_the_eviction_threshold() {
+    const TrustParams p = params();
+    // The invariant that makes a lone accuser harmless, asserted directly rather than through a
+    // particular arithmetic: one relayer's total contribution is capped at l_max, so as long as
+    // the ceiling sits above the eviction threshold, no amount of hearsay from one source gets
+    // there. Constants may be re-derived; this relationship may not be broken.
+    assert(p.l_max < -p.l_evict);
+}
+
+void test_first_hand_evidence_still_convicts_with_a_relayer_agreeing() {
     const TrustParams p = params();
     double C = 0.0;
     for (int i = 0; i < 1000; ++i) C = trust_step_relay(C, -p.clamp_step, p.l_max, p);
-    std::map<int, double> relay{{2, C}, {3, C}};
-    assert(trust_fences_peer(trust_total(0.0, relay), p));
+    std::map<int, double> relay{{2, C}};
+    // A corroborating relayer must make conviction faster, never slower, than our own eyes alone.
+    int solo = 0, with_help = 0;
+    for (double L = 0.0; !trust_fences_peer(L, p) && solo < 200; ++solo)
+        L = trust_step_self(L, -p.clamp_step, p);
+    for (double L = 0.0; !trust_fences_peer(trust_total(L, relay), p) && with_help < 200; ++with_help)
+        L = trust_step_self(L, -p.clamp_step, p);
+    assert(with_help <= solo);
+    assert(with_help < 200);
 }
 
 void test_an_untrusted_relayer_carries_no_weight() {
@@ -289,7 +305,8 @@ and add the calls in `main()`:
     test_trust_has_a_ceiling();
     test_first_hand_evidence_can_evict();
     test_one_relayer_alone_can_never_evict();
-    test_two_independent_relayers_can_evict();
+    test_hearsay_cannot_reach_the_eviction_threshold();
+    test_first_hand_evidence_still_convicts_with_a_relayer_agreeing();
     test_an_untrusted_relayer_carries_no_weight();
     test_belief_decays_toward_neutral();
 ```
