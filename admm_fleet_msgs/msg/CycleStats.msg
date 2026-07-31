@@ -12,6 +12,12 @@ float64 t_cycle_wall     # full cycle wall time (s)
 float64 t_rx_mean        # mean one-way rx latency (rx_wall - tx_wall) this cycle (s)
 int32   n_timeouts       # per-hop timeouts this cycle
 int32   n_stale          # messages that arrived for a slot older than the newest seen (late)
+# Task 10 item 5: observation-channel samples the publisher-GID pin rejected this cycle (any
+# peer, admm_agent_node's peer_truth_ subscription). Nonzero means a peer's ground-truth channel
+# went dark to this agent -- a late-impostor attack (inject_forged_obs) OR a benign publisher
+# restart, operationally indistinguishable either way. A run with a nonzero cumulative sum here
+# has a channel that silently died and MUST NOT be reported as a clean result.
+int32   n_obs_dropped
 uint64  bytes_tx
 uint64  bytes_rx
 float64[] r_prim_edge    # primal residual per adopted edge at cycle end

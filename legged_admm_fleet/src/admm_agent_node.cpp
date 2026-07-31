@@ -219,6 +219,22 @@ public:
         // Experiment C, a DIFFERENT injection: this one corrupts what we SEND, so one lie is
         // broadcast once and every receiver judges the same bytes independently.
         declare_parameter<double>("inject_fake_offset", 0.0);
+        // Task 10 item 2 (spec §9 A2-smear): fabricate what THIS agent claims to have SEEN of
+        // a peer, own position left honest. Same "declare but discard" shape as
+        // inject_fake_offset above -- runtime-only, never live from a launch value.
+        declare_parameter<double>("inject_fake_evidence", 0.0);
+        declare_parameter<int>("inject_fake_evidence_target", 0);
+        // Task 10 item 3 (spec §9 A2-duty): period (slots) over which inject_fake_offset lies
+        // for the first half and tells the truth for the second. 0 = always lying.
+        declare_parameter<int>("inject_duty_cycle", 0);
+        // Task 10 item 1: was a LAUNCH parameter (live from t=0); moved to runtime-only so it
+        // can switch on together with inject_fake_offset at the experiment trigger (see
+        // gate2() and the on-set callback below for why the old shape evicted the attacker
+        // minutes before the attack). inject_odom_fake_peer names WHICH peer's odom copy this
+        // node forges; inject_odom_fake is the offset in metres, applied identically on every
+        // survivor node so they all judge the same forged sample and reach the same verdict.
+        declare_parameter<double>("inject_odom_fake", 0.0);
+        declare_parameter<int>("inject_odom_fake_peer", 0);
         // Attacker characterization: a Byzantine robot does not run our safety layer for OUR
         // benefit. With this set, peers this agent evicts get NO corpse keep-out in its own
         // QP/A* (eviction and the solo rebuild still happen), so it will genuinely drive at
@@ -304,6 +320,11 @@ public:
             [this](nav_msgs::msg::Odometry::SharedPtr m) {
                 std::lock_guard<std::mutex> l(mu_);
                 odom_ = *m; has_odom_ = true; t_odom_ = now();
+                // Task 10 item 4 (inject_forged_obs): republish THIS agent's own real motion
+                // onto a peer's global observation topic, impersonating its ground-truth
+                // publisher. Piggybacks on this callback purely because it already fires at the
+                // stand-in publisher's own high rate -- no separate timer needed.
+                if (forged_obs_pub_) forged_obs_pub_->publish(*m);
                 if (!has_goal_) {  // stand in place until commanded
                     goal_ = Eigen::Vector2d(m->pose.pose.position.x, m->pose.pose.position.y);
                     has_goal_ = true;
@@ -363,8 +384,18 @@ public:
                     if (!pinned) {
                         pinned = gid;
                     } else if (std::memcmp(pinned->data, gid.data, RMW_GID_STORAGE_SIZE) != 0) {
+                        // Task 10 item 5: the pin's real guarantee is "a writer arriving AFTER
+                        // the channel is established is rejected" -- not "any impostor is
+                        // rejected" (an attacker that publishes FIRST wins the latch and the
+                        // real publisher is the one dropped here instead). Either way, this
+                        // peer's observation channel just went dark to us, and a benign
+                        // publisher restart looks identical. The old behaviour was a THROTTLED
+                        // warning nothing downstream ever read; count it too, so it can reach
+                        // the run's verdict via CycleStats (see publishStats).
+                        obs_dropped_this_cycle_.fetch_add(1, std::memory_order_relaxed);
                         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                            "[agent%d] second publisher on robot%d's observation topic — dropped",
+                            "[agent%d] second publisher on robot%d's observation topic — dropped "
+                            "(that peer's observation channel is now silent to us)",
                             self_id_, j);
                         return;
                     }
@@ -374,6 +405,21 @@ public:
                     while (buf.size() > 1 && t - buf.front().t > obs_window_s_) buf.pop_front();
                 }, cmd_opts));
         }
+        // Task 10 item 4 (inject_forged_obs): the adversarial control arm for the observation
+        // channel's publisher-GID pin (spec §5.1's TOFU boundary). ONE knob, two separately-
+        // runnable cases that differ only in WHEN it is set:
+        //   (a) late impostor  -- `ros2 param set` AFTER the real Gazebo publisher is already
+        //       established. The pin has already latched onto the real writer's GID, so this
+        //       loses the race and every sample from this node is rejected -- the defence's
+        //       coverage case.
+        //   (b) first mover    -- given a nonzero value HERE at construction (a launch
+        //       parameter), so this node's publisher exists before the real one and wins the
+        //       latch; the genuine publisher is then the one rejected as "the impostor". This
+        //       is the pin's honest limit (spec: "guards established-first, not genuine"), and
+        //       must be reportable, not a footnote.
+        // The initial declared value is READ (unlike inject_fake_offset et al., which discard
+        // it) specifically so case (b) is reachable from a launch parameter.
+        armForgedObs(declare_parameter<int>("inject_forged_obs", 0));
         // Latch the per-dog goal (transient_local), same discovery-race reason as plan_sub_ below:
         // a short-lived `ros2 topic pub` goal burst can match one agent late and drop its goal for
         // that dog -> it parks at spawn while the others walk. Latching lets a late-matching agent
@@ -428,6 +474,43 @@ public:
                         transport_->set_fake_offset(p.as_double());
                         RCLCPP_WARN(get_logger(), "[agent%d] COMPROMISED: broadcasting a %.2f m "
                                     "lie about its own position", self_id_, p.as_double());
+                    }
+                    // Task 10 item 2 (spec §9 A2-smear): fabricate what THIS agent claims to
+                    // have SEEN of a peer; own position (inject_fake_offset above) untouched.
+                    else if (n == "inject_fake_evidence") {
+                        transport_->set_fake_evidence(p.as_double());
+                        RCLCPP_WARN(get_logger(), "[agent%d] COMPROMISED: smearing robot%d's "
+                                    "reputation by fabricating a %.2f m false sighting of it",
+                                    self_id_, inj_fake_evidence_target_, p.as_double());
+                    } else if (n == "inject_fake_evidence_target") {
+                        inj_fake_evidence_target_ = static_cast<int>(p.as_int());
+                        transport_->set_fake_evidence_target(inj_fake_evidence_target_);
+                    }
+                    // Task 10 item 3 (spec §9 A2-duty): period in slots inject_fake_offset lies
+                    // over (first half lying, second half honest). 0 = always lying.
+                    else if (n == "inject_duty_cycle") {
+                        const int period = static_cast<int>(p.as_int());
+                        transport_->set_duty_cycle(period);
+                        RCLCPP_WARN(get_logger(), "[agent%d] inject_duty_cycle -> %d slot(s) "
+                                    "(0 = always lying whenever inject_fake_offset != 0)",
+                                    self_id_, period);
+                    }
+                    // Task 10 item 1: the odom half of the dual-channel forgery. Must be set in
+                    // the SAME pset burst as inject_fake_offset at the experiment trigger, or
+                    // gate2() spends the time in between differencing an honest claim against
+                    // an already-forged odometry and evicts the attacker early (see agent_core.
+                    // hpp's applyOdomFake for the measured number).
+                    else if (n == "inject_odom_fake") {
+                        inj_odom_fake_ = p.as_double();
+                        RCLCPP_WARN(get_logger(), "[agent%d] COMPROMISED: forging robot%d's odom "
+                                    "copy by %.2f m", self_id_, inj_odom_fake_peer_.load(),
+                                    p.as_double());
+                    } else if (n == "inject_odom_fake_peer") {
+                        inj_odom_fake_peer_ = static_cast<int>(p.as_int());
+                    }
+                    // Task 10 item 4: see armForgedObs for the two cases this knob covers.
+                    else if (n == "inject_forged_obs") {
+                        armForgedObs(static_cast<int>(p.as_int()));
                     }
                     // The detection knobs. These used to fall through to "successful = true"
                     // while changing nothing: `ros2 param set detection_log_only false` reported
@@ -976,10 +1059,40 @@ private:
     // Exceeding the gate does NOT introduce a new failure mode — it increments the same
     // dropped_ counter Gate 1 uses, the peer stops being committed, its last_seen_ freezes and
     // the crash-failover path evicts it. One mechanism, two entry points.
+    // Task 10 item 4 (inject_forged_obs): create the impersonating publisher for `target`'s
+    // observation topic the first time it is armed (via launch value at construction, or later
+    // via the on-set callback). One target per run -- changing it after a publisher already
+    // exists would need a brand new publisher anyway, and the experiment only ever impersonates
+    // one peer at a time.
+    void armForgedObs(int target) {
+        std::lock_guard<std::mutex> l(mu_);
+        if (target == 0) return;
+        if (target == self_id_) {
+            RCLCPP_WARN(get_logger(), "[agent%d] inject_forged_obs=%d ignored (cannot "
+                        "impersonate self)", self_id_, target);
+            return;
+        }
+        if (forged_obs_pub_) {
+            if (target != forged_obs_target_)
+                RCLCPP_WARN(get_logger(), "[agent%d] inject_forged_obs already locked to robot%d "
+                            "-- ignoring change to robot%d", self_id_, forged_obs_target_, target);
+            return;
+        }
+        forged_obs_target_ = target;
+        forged_obs_pub_ = create_publisher<nav_msgs::msg::Odometry>(
+            "/robot" + std::to_string(target) + "/hardware/odom", rclcpp::QoS(1));
+        RCLCPP_WARN(get_logger(), "[agent%d] COMPROMISED: impersonating robot%d's ground-truth "
+                    "observation channel — first writer on that topic wins the GID pin",
+                    self_id_, target);
+    }
+
     void gate2(std::uint64_t slot) {
         if (!evict_armed_) return;
         std::map<int, Eigen::Vector2d> od;
         { std::lock_guard<std::mutex> l(mu_); od = peer_odom_; }
+        // Task 10 item 1: forge THIS node's copy of inject_odom_fake_peer's odom by
+        // inject_odom_fake metres. Inert (no-op) unless both are nonzero -- see applyOdomFake.
+        admm::applyOdomFake(od, inj_odom_fake_peer_.load(), inj_odom_fake_.load());
         const auto seen = transport_->last_seen();
         for (const auto& kv : agent_->peer_xnow()) {
             const int j = kv.first;
@@ -1448,6 +1561,12 @@ private:
         m.bytes_rx = b.rx;
         m.t_rx_mean = transport_->take_rx_mean();  // G5 one-way latency (mean rx-tx this cycle)
         m.n_stale = transport_->take_stale();
+        // Task 10 item 5: observation-channel samples the publisher-GID pin rejected THIS cycle
+        // (any peer). Nonzero means a peer's ground-truth channel went dark to us -- late-
+        // impostor attack OR a benign publisher restart, operationally indistinguishable -- and
+        // the harness must be able to assert on it instead of trusting a run whose channel died
+        // silently. See peer_truth_subs_'s subscription callback.
+        m.n_obs_dropped = static_cast<int32_t>(obs_dropped_this_cycle_.exchange(0));
         m.hold = res.hold;
         // A finite-guard (NaN xi) cycle returns hold=false but publishes NO target and
         // announces a fleet cold-start next slot; mark it so G5 doesn't read it as a normal cycle.
@@ -1466,6 +1585,10 @@ private:
     int k_send_;
     double inj_drop_p_ = 0.0, inj_delay_ms_ = 0.0, inj_jitter_ms_ = 0.0;  // C-experiment injection
     bool inj_ignore_corpses_ = false;  // hostile mode: evict without fencing (demo/threat model)
+    // Task 10 item 2: node-side mirror of DdsTransport's copy, for the WARN log line only (the
+    // transport's own atomic is what send_state actually reads). Param-callback-thread only,
+    // same non-atomic pattern as inj_drop_p_ above.
+    int inj_fake_evidence_target_ = 0;
     bool evade_boost_ = true;          // ask for MAX_VX while evading a keep-out (followSpeed)
     double evade_range_ = 0.5;
     bool enable_peer_keepout_ = false;  // task 4b spike: local pairwise safety net, off by default
@@ -1530,6 +1653,19 @@ private:
     std::vector<int> ev_out_peer_;
     std::vector<double> ev_out_pos_;
     std::uint64_t ev_out_slot_ = 0;
+    // Task 10 item 1: dual-channel forgery (see gate2()/applyOdomFake and the on-set callback).
+    // Atomic: read on the worker thread (gate2), written from the executor thread (param cb).
+    std::atomic<double> inj_odom_fake_{0.0};
+    std::atomic<int> inj_odom_fake_peer_{0};
+    // Task 10 item 4 (inject_forged_obs): guarded by mu_ (armed from construction OR the
+    // executor-thread param callback; read from the executor-thread odom_sub_ callback).
+    int forged_obs_target_ = 0;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr forged_obs_pub_;
+    // Task 10 item 5: observation-channel samples this cycle rejected by the publisher-GID pin
+    // (peer_truth_subs_ callback, executor thread) -- read-and-reset once per cycle into
+    // CycleStats::n_obs_dropped (see publishStats) so a channel going dark reaches the run's
+    // verdict instead of only a throttled log line nothing downstream reads.
+    std::atomic<std::uint32_t> obs_dropped_this_cycle_{0};
     double input_stale_s_ = 1.0;                    // own obs/odom age that self-fences us
     std::vector<admm::ArenaRect> arena_rects_;      // A*-only wall boxes (door)
     std::vector<Eigen::Vector2d> path_;             // cached A* route; cycle()-thread only

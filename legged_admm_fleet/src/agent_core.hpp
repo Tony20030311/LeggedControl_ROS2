@@ -228,6 +228,57 @@ inline bool wellFormed(const AgentStateMsg& m, const std::vector<int>& roster,
                        const GateLimits& g) {
     return gateCheck(m, roster, g) == GateReason::kOk;
 }
+
+// --- Experiment C fault-injection helpers (Task 10) ---
+// Pure functions, testable without a live Transport/node, and NOT on the G1 parity path: the
+// loopback transport used by test_distributed_parity never calls any of them. Each is a no-op
+// at its stated default, so an honest run that never sets the corresponding parameter is
+// byte-identical to a build that never had these functions at all.
+
+// inject_duty_cycle (spec §9 A2-duty arm): is the sender lying THIS slot? period<=0 (default)
+// means "yes, always" -- i.e. whatever knob the caller gates on has full, unfiltered control,
+// exactly today's behaviour. Otherwise lie for the first half of every `period`-slot window and
+// tell the truth for the second half: trust.hpp's credit/penalty asymmetry exists specifically
+// so an intermittent liar still gets convicted, and this is the arm that has to prove it (a
+// SYMMETRIC accumulator would never cross the threshold against a 50%-duty attacker).
+inline bool dutyLying(std::uint64_t slot, int period) {
+    if (period <= 0) return true;
+    const auto p = static_cast<std::uint64_t>(period);
+    return (slot % p) * 2 < p;
+}
+
+// inject_fake_evidence / inject_fake_evidence_target (spec §9 A2-smear arm): corrupt what the
+// sender claims to have SEEN of `target` by `smear` metres in x and y, leaving every other
+// field (in particular its own xnow/xibar, the attacker's honest position) untouched. A no-op
+// when smear==0 (inert default) or when the honest evidence pipeline never reported `target`
+// this cycle (out of range/occluded that slot) -- this can corrupt a sighting already in the
+// message, not manufacture one that was never there.
+inline void applyFakeEvidence(std::vector<int>& ev_peer, std::vector<double>& ev_pos,
+                              int target, double smear) {
+    if (smear == 0.0) return;
+    for (std::size_t k = 0; k < ev_peer.size(); ++k)
+        if (ev_peer[k] == target) {
+            ev_pos[2 * k]     += smear;
+            ev_pos[2 * k + 1] += smear;
+        }
+}
+
+// inject_odom_fake / inject_odom_fake_peer (Task 10 item 1): forge THIS receiver's copy of
+// `target`'s independent odom channel by `off` metres in x and y. Exists so the dual-channel
+// forgery (claim AND odom) can be switched on together at the experiment trigger: if this were
+// live from t=0 (as a launch parameter, the old shape) while the CLAIM lie only starts at the
+// trigger, gate2() spends the whole time before the trigger differencing an honest claim
+// against an already-forged odometry -- a 0.424 m residual against the 0.30 m gate -- and
+// evicts the attacker minutes before the attack begins, making arm A1's numbers meaningless.
+// A no-op when off==0 (inert default) or `target` has no odom sample stored yet.
+inline void applyOdomFake(std::map<int, Eigen::Vector2d>& odom_by_peer, int target, double off) {
+    if (off == 0.0) return;
+    const auto it = odom_by_peer.find(target);
+    if (it == odom_by_peer.end()) return;
+    it->second[0] += off;
+    it->second[1] += off;
+}
+
 struct EdgeXiMsg {
     std::uint64_t cycle_id = 0;
     int iter = 0;

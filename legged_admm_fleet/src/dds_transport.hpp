@@ -109,7 +109,12 @@ public:
         // The offset is applied to BOTH the claimed state and every knot of the plan, so the
         // message stays internally consistent and Gate 1 passes it — this must be caught by
         // Gate 2 (odom), which is the point of having an independent observation channel.
-        if (const double off = inj_fake_offset_.load(); off != 0.0) {
+        // inject_duty_cycle (Task 10 item 3, spec §9 A2-duty arm): gate the offset lie itself so
+        // an attacker that lies only on alternating slots (period configurable, not hardcoded
+        // "every other slot") is a runnable arm. period<=0 (default) means "always lying
+        // whenever off!=0" -- today's behaviour -- so this is inert unless BOTH knobs are set.
+        if (const double off = inj_fake_offset_.load();
+            off != 0.0 && dutyLying(m.cycle_id, inj_duty_period_.load())) {
             s.xnow[0] += off;
             s.xnow[1] += off;
             for (int k = 1; k <= N; ++k) {
@@ -123,6 +128,12 @@ public:
         w.members.assign(s.members.begin(), s.members.end());
         // Task 7 / spec 5.2: not touched by the sender-side fake_offset above, which lies about
         // THIS agent's own position -- ev_peer/ev_pos describe what it saw of OTHERS.
+        // inject_fake_evidence / inject_fake_evidence_target (Task 10 item 2, spec §9 A2-smear
+        // arm): the attacker's own position (above) stays honest while what it claims to have
+        // SEEN of an honest peer is fabricated -- applied here, once, so every receiver judges
+        // the same corrupted bytes, same as the offset lie above.
+        applyFakeEvidence(s.ev_peer, s.ev_pos, inj_fake_evidence_target_.load(),
+                          inj_fake_evidence_.load());
         w.ev_peer.assign(s.ev_peer.begin(), s.ev_peer.end());
         w.ev_pos.assign(s.ev_pos.begin(), s.ev_pos.end());
         w.ev_slot = s.ev_slot;
@@ -251,6 +262,17 @@ public:
     // next broadcast on. 0 disables. Dynamic so a live fleet can be compromised mid-run without
     // a re-bring-up, exactly like set_inject.
     void set_fake_offset(double off) { inj_fake_offset_.store(off); }
+
+    // Task 10 item 2 (spec §9 A2-smear): what THIS agent claims to have SEEN of `target`,
+    // offset by `off` metres. Independent of set_fake_offset -- the attacker's own position is
+    // untouched by these two. 0 / target 0 disables (see applyFakeEvidence in agent_core.hpp).
+    void set_fake_evidence(double off) { inj_fake_evidence_.store(off); }
+    void set_fake_evidence_target(int target) { inj_fake_evidence_target_.store(target); }
+
+    // Task 10 item 3 (spec §9 A2-duty): period in slots over which set_fake_offset's lie is
+    // active for the first half and honest for the second. 0 (default) disables -- the offset
+    // lie is unconditional, exactly as before this parameter existed.
+    void set_duty_cycle(int period) { inj_duty_period_.store(period); }
 
     // How many of this peer's messages have been REJECTED (Gate 1 here, Gate 2 from the node
     // layer via drop_peer). Non-zero means the peer is talking and the content is bad, which is
@@ -537,6 +559,9 @@ private:
     std::atomic<double> gate_worst_{0.0};    // tightest Gate 1 margin seen on ACCEPTED traffic
     std::atomic<std::uint64_t> now_slot_{0}; // receiver's own slot (set_now_slot)
     std::atomic<double> inj_fake_offset_{0.0};  // experiment C: sender-side lie, metres
+    std::atomic<double> inj_fake_evidence_{0.0};       // Task 10 item 2: smear offset, metres
+    std::atomic<int> inj_fake_evidence_target_{0};     // ...on which peer id (0 = none)
+    std::atomic<int> inj_duty_period_{0};              // Task 10 item 3: slots; 0 = always lying
 
     rclcpp::Publisher<admm_fleet_msgs::msg::AgentState>::SharedPtr state_pub_;
     std::vector<rclcpp::Subscription<admm_fleet_msgs::msg::AgentState>::SharedPtr> state_subs_;

@@ -13,6 +13,7 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <map>
 #include <vector>
 
 #include "agent_core.hpp"
@@ -327,6 +328,72 @@ int main() {
                && "only excluded once robot1's dropped ballot removes its vouch for robot2 "
                   "-- requires a second pass to see");
         assert(!majority_excluded(two_pass, 3) && "never in majority");
+    }
+    // 9. TASK 10: the fault-injection helpers themselves. Pure functions (agent_core.hpp), not
+    //    exercised anywhere else in this suite, so their reachability/inertness has to be pinned
+    //    here directly rather than assumed from the send_state wiring around them.
+    {
+        // dutyLying (item 3, inject_duty_cycle): disabled (period<=0) must always say "lying",
+        // i.e. byte-identical to a build that never had this knob.
+        for (std::uint64_t slot = 0; slot < 5; ++slot) {
+            assert(dutyLying(slot, 0) && "period<=0 must be inert (always lying)");
+            assert(dutyLying(slot, -3) && "negative period must also be inert");
+        }
+        // period=2 ("every other slot", the brief's literal example): even slots lie, odd don't.
+        assert(dutyLying(0, 2) && !dutyLying(1, 2) && dutyLying(2, 2) && !dutyLying(3, 2)
+               && "period=2 must alternate every slot");
+        // period=20: first half of the window lies, second half is honest, and it repeats.
+        assert(dutyLying(0, 20) && dutyLying(9, 20) && !dutyLying(10, 20) && !dutyLying(19, 20)
+               && dutyLying(20, 20) && "period=20 must give a 10-slot lying / 10-slot honest window");
+    }
+    {
+        // applyFakeEvidence (item 2, inject_fake_evidence / inject_fake_evidence_target).
+        std::vector<int> peer = {2, 3};
+        std::vector<double> pos = {1.0, 0.5, 4.0, -1.0};
+        // Inert when smear==0, even with a matching target -- the default must change nothing.
+        {
+            auto p = pos;
+            applyFakeEvidence(peer, p, 3, 0.0);
+            assert(p == pos && "smear==0 must be a no-op");
+        }
+        // Corrupts ONLY the matching target's (x,y), leaves every other entry untouched.
+        {
+            auto p = pos;
+            applyFakeEvidence(peer, p, 3, 2.0);
+            assert(p[0] == 1.0 && p[1] == 0.5 && "non-target entry must be untouched");
+            assert(p[2] == 6.0 && p[3] == 1.0 && "target entry must be shifted by the smear");
+        }
+        // No-op (not a fabrication) when the target was never in the honest evidence this cycle.
+        {
+            auto p = pos;
+            applyFakeEvidence(peer, p, 9, 5.0);
+            assert(p == pos && "smearing an unreported peer must not manufacture a sighting");
+        }
+    }
+    {
+        // applyOdomFake (item 1, inject_odom_fake / inject_odom_fake_peer).
+        std::map<int, Eigen::Vector2d> od{{2, {1.0, 2.0}}, {3, {5.0, -1.0}}};
+        // Inert when off==0 -- the dual-channel forgery must default to today's single-channel
+        // behaviour (odom channel honest) exactly.
+        {
+            auto o = od;
+            applyOdomFake(o, 2, 0.0);
+            assert(o.at(2) == od.at(2) && "off==0 must be a no-op");
+        }
+        // Forges only the named peer's odom copy, leaves the other peer's untouched.
+        {
+            auto o = od;
+            applyOdomFake(o, 2, 0.30);
+            assert(std::abs(o.at(2)[0] - 1.30) < 1e-12 && std::abs(o.at(2)[1] - 2.30) < 1e-12
+                   && "named peer's odom must shift by the offset in x AND y");
+            assert(o.at(3) == od.at(3) && "un-named peer's odom must be untouched");
+        }
+        // No odom sample yet for the target -> no-op, not a crash or a fabricated entry.
+        {
+            auto o = od;
+            applyOdomFake(o, 9, 0.30);
+            assert(o.size() == od.size() && "forging an unheard-of peer must not add an entry");
+        }
     }
     std::cout << "test_false_signal: all cases passed\n";
     return 0;

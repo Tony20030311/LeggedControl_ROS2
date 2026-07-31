@@ -24,6 +24,13 @@ def _distributed_agents(context, *_a, **_k):
     # arena obstacle-CBF + A* apply per-agent identically to the centralized node.
     arena = LaunchConfiguration('arena').perform(context)
     use_astar = LaunchConfiguration('use_astar').perform(context).lower() in ('true', '1')
+    # Task 10 item 4 (inject_forged_obs), "first mover" case ONLY: the attacker's publisher must
+    # exist before the real Gazebo one to win the GID-pin race, so it has to be a launch value
+    # rather than a later `ros2 param set` (that is the "late impostor" case and needs no launch
+    # support -- it fires the same parameter, just after bring-up). Default '0' on both -> every
+    # agent gets inject_forged_obs=0 -> inert.
+    forged_obs_attacker = int(LaunchConfiguration('forged_obs_attacker').perform(context))
+    forged_obs_target = int(LaunchConfiguration('forged_obs_target').perform(context))
     nodes = []
     # standalone formation slot allocator (was hosted on dog1; now its own process, no dog special)
     nodes.append(Node(
@@ -63,6 +70,7 @@ def _distributed_agents(context, *_a, **_k):
                 'astar_y_max': float(LaunchConfiguration('astar_y_max').perform(context)),
                 'enable_peer_keepout': LaunchConfiguration('enable_peer_keepout').perform(
                     context).lower() in ('true', '1'),
+                'inject_forged_obs': forged_obs_target if int(i) == forged_obs_attacker else 0,
             }],
             remappings=[
                 # The observation channel is the observer's own sensor, subscribed under a LOCAL
@@ -110,6 +118,12 @@ def generate_launch_description():
         # observe, bypassing edge_owner entirely (see AgentCore ctor in agent_core.hpp). Default
         # off -- this is a feasibility spike, not yet the shipped behaviour.
         DeclareLaunchArgument('enable_peer_keepout', default_value='false'),
+        # Task 10 item 4 (inject_forged_obs) "first mover" case: which agent (robot_id, 0 = none)
+        # impersonates forged_obs_target's ground-truth observation channel from t=0. The "late
+        # impostor" case needs neither of these -- it is the same parameter, set later via
+        # `ros2 param set` on whichever agent you choose, after bring-up.
+        DeclareLaunchArgument('forged_obs_attacker', default_value='0'),
+        DeclareLaunchArgument('forged_obs_target', default_value='0'),
         Node(
             package='legged_admm_fleet',
             executable='fleet_centralized_node',
