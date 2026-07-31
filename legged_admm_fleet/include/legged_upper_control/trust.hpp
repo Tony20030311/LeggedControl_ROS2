@@ -47,6 +47,12 @@ struct TrustParams {
     // Cap on one observation's contribution. With sigma at the clean-flight floor the raw llr is
     // in the hundreds, so a single stumble or dropped scan would decide a verdict by itself.
     double clamp_step = 2.0;
+    // Positive contributions (evidence of honesty) are scaled by this before the clamp; negative
+    // ones are not. With symmetric credit an attacker that lies on alternating slots has a fixed
+    // point near +1.0 — it can lie half the time, arbitrarily large, and never approach the
+    // eviction threshold. One constant fixes it, still one rule, no scenario branch: penalty must
+    // outweigh credit.
+    double credit_ratio = 0.25;
     // Trust ceiling AND the cap on how far one relayer's word can move us. Two jobs, one number:
     // a peer that has been honest all mission must not buy undetected approach time, and
     // hearsay must never on its own reach l_evict (l_max < |l_evict| is the invariant).
@@ -54,7 +60,9 @@ struct TrustParams {
     // Wald SPRT thresholds from alpha = 1e-4 (false eviction) and beta = 0.01 (miss):
     // log(beta / (1 - alpha)) = -4.6 to re-admit, log((1 - beta) / alpha) = 9.2 to convict.
     double l_evict = -9.2;
-    double l_rejoin = 0.0;                  // hysteresis: climb back to neutral before rejoining
+    // No l_rejoin: rejoin is not supported by the transport (blocking is latched in dds_transport
+    // with no unblock path anywhere), so a hysteresis threshold for climbing back to neutral would
+    // be aspirational. Don't add one without an unblock mechanism to go with it.
     // Measured, not guessed: clean-flight residual distribution (calibration run, Task 8).
     // The simulation value is a FLOOR — real perception adds attitude lever arm, inter-robot
     // drift and surface-vs-origin bias (spec section 4).
@@ -67,10 +75,14 @@ struct TrustParams {
 
 // Log-likelihood ratio of HONEST over LYING for one residual, 2D Gaussian noise both sides:
 //   log p(r|honest)/p(r|lying) = -d_lie * (2r - d_lie) / (2 sigma^2)
-// Zero at r = d_lie/2, positive below, negative above. Clamped at both ends.
-inline double trust_llr(double r, double sigma, double d_lie, double clamp_step) {
+// Zero at r = d_lie/2, positive below, negative above. The positive (honest-looking) branch is
+// scaled by credit_ratio before the clamp; the negative branch is not — see
+// TrustParams::credit_ratio for why symmetric credit is unsafe against a duty-cycled liar.
+inline double trust_llr(double r, double sigma, double d_lie, double clamp_step,
+                        double credit_ratio) {
     if (!(sigma > 0.0) || !std::isfinite(r)) return 0.0;
-    const double l = -d_lie * (2.0 * r - d_lie) / (2.0 * sigma * sigma);
+    double l = -d_lie * (2.0 * r - d_lie) / (2.0 * sigma * sigma);
+    if (l > 0.0) l *= credit_ratio;
     return std::clamp(l, -clamp_step, clamp_step);
 }
 

@@ -7,6 +7,7 @@
 #include <map>
 #include <vector>
 
+#include "legged_upper_control/admm_constants.hpp"  // TS
 #include "legged_upper_control/trust.hpp"
 
 using namespace admm;
@@ -71,15 +72,15 @@ void test_llr_zero_crossing_at_half_the_lie() {
     const TrustParams p = params();
     // A residual of exactly d_lie/2 is neutral: below it evidence supports honesty, above it
     // supports lying. Anything else would put the decision boundary somewhere undocumented.
-    assert(std::abs(trust_llr(p.d_lie / 2.0, p.sigma, p.d_lie, p.clamp_step)) < 1e-12);
-    assert(trust_llr(0.0, p.sigma, p.d_lie, p.clamp_step) > 0.0);
-    assert(trust_llr(p.d_lie, p.sigma, p.d_lie, p.clamp_step) < 0.0);
+    assert(std::abs(trust_llr(p.d_lie / 2.0, p.sigma, p.d_lie, p.clamp_step, p.credit_ratio)) < 1e-12);
+    assert(trust_llr(0.0, p.sigma, p.d_lie, p.clamp_step, p.credit_ratio) > 0.0);
+    assert(trust_llr(p.d_lie, p.sigma, p.d_lie, p.clamp_step, p.credit_ratio) < 0.0);
 }
 
 void test_llr_is_clamped() {
     const TrustParams p = params();
-    assert(std::abs(trust_llr(50.0, p.sigma, p.d_lie, p.clamp_step)) <= p.clamp_step + 1e-12);
-    assert(std::abs(trust_llr(0.0, p.sigma, p.d_lie, p.clamp_step)) <= p.clamp_step + 1e-12);
+    assert(std::abs(trust_llr(50.0, p.sigma, p.d_lie, p.clamp_step, p.credit_ratio)) <= p.clamp_step + 1e-12);
+    assert(std::abs(trust_llr(0.0, p.sigma, p.d_lie, p.clamp_step, p.credit_ratio)) <= p.clamp_step + 1e-12);
 }
 
 void test_trust_has_a_ceiling() {
@@ -149,6 +150,42 @@ void test_belief_decays_toward_neutral() {
     assert(std::abs(L) < 1e-3);     // stale evidence expires without an expiry rule
 }
 
+void test_neutral_belief_does_not_fence_the_spawn_formation() {
+    const TrustParams p = params();
+    // Every peer starts neutral. If neutral fenced anyone, three dogs spawning 1.40 m apart
+    // would be born violating their own constraint — the one state a hard constraint never
+    // recovers from.
+    assert(!trust_fences_peer(0.0, p));
+    assert(!trust_fences_peer(p.l_evict + 1e-9, p));
+    assert(trust_fences_peer(p.l_evict - 1e-9, p));
+}
+
+void test_detection_fits_the_safety_margin() {
+    const TrustParams p = params();
+    // The physics, not a slot count. D_MIN 1.3 minus the 0.867 m contact line leaves 0.433 m,
+    // and the accumulator plus one slot of eviction patience must fit inside it at the
+    // divergence rate the design claims to cover. Raising the assert to make this pass is
+    // forbidden: it would ship a detector slower than the damage it prevents.
+    int slots = 0;
+    for (double L = p.l_max; !trust_fences_peer(L, p) && slots < 200; ++slots)
+        L = trust_step_self(L, -p.clamp_step, p);
+    const double v_div_covered = 0.433 / ((slots + 1) * TS);
+    std::printf("detection: %d slots, covers divergence up to %.3f m/s\n", slots, v_div_covered);
+    assert(v_div_covered >= 0.25);
+}
+
+void test_duty_cycled_lying_is_still_convicted() {
+    const TrustParams p = params();
+    // Symmetric credit gives an alternating attacker a fixed point near +1.0: it lies half the
+    // slots, arbitrarily large, and never approaches the threshold. Credit must be smaller than
+    // penalty. One constant, still one rule, no scenario branch.
+    double L = 0.0;
+    int slots = 0;
+    for (; !trust_fences_peer(L, p) && slots < 500; ++slots)
+        L = trust_step_self(L, (slots % 2) ? p.clamp_step * p.credit_ratio : -p.clamp_step, p);
+    assert(trust_fences_peer(L, p));
+}
+
 }  // namespace
 
 int main() {
@@ -169,6 +206,9 @@ int main() {
     test_first_hand_evidence_still_convicts_with_a_relayer_agreeing();
     test_an_untrusted_relayer_carries_no_weight();
     test_belief_decays_toward_neutral();
+    test_neutral_belief_does_not_fence_the_spawn_formation();
+    test_detection_fits_the_safety_margin();
+    test_duty_cycled_lying_is_still_convicted();
     std::cout << "test_trust: OK\n";
     return 0;
 }

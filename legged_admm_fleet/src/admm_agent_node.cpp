@@ -38,6 +38,7 @@
 #include "legged_upper_control/admm_qp_common.hpp"
 #include "legged_upper_control/admm_reference.hpp"
 #include "legged_upper_control/fleet_config.hpp"
+#include "legged_upper_control/trust.hpp"
 
 using namespace std::chrono_literals;
 
@@ -88,6 +89,22 @@ public:
         // 0.038 m of body gap. The floor is odom noise, not the gate: clean flight residual is
         // 0.006 m, so 0.30 still clears it 50x.
         resid_gate_ = declare_parameter<double>("odom_residual_gate", 0.30);
+        // Trust layer. Every default is derived (trust.hpp); obs_sigma is the only measured one.
+        trust_.lambda        = declare_parameter<double>("trust_lambda", trust_.lambda);
+        trust_.clamp_step    = declare_parameter<double>("trust_clamp", trust_.clamp_step);
+        trust_.credit_ratio  = declare_parameter<double>("trust_credit_ratio", trust_.credit_ratio);
+        trust_.l_max         = declare_parameter<double>("trust_l_max", trust_.l_max);
+        trust_.l_evict       = declare_parameter<double>("trust_l_evict", trust_.l_evict);
+        trust_.sigma         = declare_parameter<double>("obs_sigma", trust_.sigma);
+        trust_.d_lie         = declare_parameter<double>("trust_d_lie", trust_.d_lie);
+        obs_noise_seed_      = declare_parameter<int>("obs_noise_seed", 0);
+        // The decision boundary is d_lie/2, not d_lie: that is where the log-likelihood crosses
+        // zero. It must stay well under the 0.433 m buffer AND well above the measured residual,
+        // or the detector either misses damage or convicts honest robots.
+        if (!(trust_.d_lie / 2.0 < 0.433))
+            throw std::runtime_error("trust_d_lie/2 must stay under the 0.433 m safety buffer");
+        if (!(trust_.l_max < -trust_.l_evict))
+            throw std::runtime_error("trust_l_max >= |l_evict|: hearsay could evict alone");
         // ARMED BY DEFAULT. This was true — measure first, block later — and that was right while
         // the gate was being calibrated. It is not right to ship: a fleet that only starts
         // checking when somebody flips a parameter is a fleet that runs unprotected every time
@@ -1076,6 +1093,12 @@ private:
     std::map<int, double> resid_;                   // low-passed |odom - claimed|, cycle() only
     double resid_alpha_ = 0.2, resid_gate_ = 0.5;
     bool log_only_ = true;                          // measure before you block; see calibration
+    // Belief layer (trust.hpp). Every default is derived; wiring the accumulator maps into
+    // cycle()'s per-slot update is a later task (belief replaces the single-shot gate2 verdict).
+    admm::TrustParams trust_;
+    std::map<int, double> l_self_;                  // first-hand log-odds per peer (trust_step_self)
+    std::map<int, std::map<int, double>> l_relay_;  // l_relay_[i][j]: i's relayed belief about j
+    int obs_noise_seed_ = 0;
     double input_stale_s_ = 1.0;                    // own obs/odom age that self-fences us
     std::vector<admm::ArenaRect> arena_rects_;      // A*-only wall boxes (door)
     std::vector<Eigen::Vector2d> path_;             // cached A* route; cycle()-thread only
