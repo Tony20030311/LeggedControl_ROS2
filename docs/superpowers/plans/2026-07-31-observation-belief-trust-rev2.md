@@ -155,6 +155,24 @@ Expected: worst max|Δ| = 0. **If it is not zero, STOP and report BLOCKED** — 
 
 ---
 
+### Task 4b: Local safety constraint — feasibility spike first
+
+**Why this exists.** The Task 4 review established that conservative anchoring only reaches the edges an agent OWNS. `edge_owner` is a fixed table ((1,2)→2, (1,3)→1, (2,3)→3) and `agent_core.cpp:221-226` linearises only owned edges, so an agent's anchored view never reaches the barrier its peer builds. With robot 1 lying, edge (1,2) is protected because robot 2 owns it, and edge (1,3) is not, because the liar owns it. **Anchoring protects a robot against exactly one of its two peers.** Worse and pre-existing: `gateCheck` runs only on `AgentState`, so a Byzantine edge owner's `EdgeXi`/`EdgeZ` output is never validated at all.
+
+**Decision taken with the owner (2026-07-31):** each agent additionally enforces its OWN local pairwise safety constraint against every peer it can observe, independent of edge ownership. Reassigning ownership away from a distrusted peer was rejected: it makes safety depend on fleet-wide agreement about who owns what, and agreement is precisely the layer an attacker disrupts — this project has already measured a wedged fleet caused by a poisoned vote.
+
+**This is not a departure from distributed operation.** It adds no message, no coordinator and no agreement; it uses one more piece of purely local information. The system already carries two per-agent local constraints that bypass edge ownership entirely — the arena obstacle CBF and the corpse keep-out — and this treats an observable peer the same way it already treats an observable obstacle. What the design gains is a cleaner claim: **cooperation goes through ADMM consensus; physical safety does not depend on consensus or on any peer's honesty.**
+
+**Do the spike before the commitment.** Three numbers decide whether this is viable, and they must be measured, not assumed:
+
+- [ ] **Step 1:** Add the local pairwise constraint against observed peers, modelled on how `corpse_keepout` already enters the node QP. Inactive when there is no observation, exactly as the corpse path is inactive with no corpses.
+- [ ] **Step 2: G1 bit-identical parity, as a hard gate.** With no observations the constraint must not exist at all. Quote the printed `worst max|delta|` line. **If it is not zero, STOP and report BLOCKED** — do not adjust the test.
+- [ ] **Step 3: Measure the cost.** QP solve time per cycle and `achieved_rounds` in a three-dog Gazebo run, against the same numbers without the constraint. Report both, and the constraint-row count added per peer.
+- [ ] **Step 4: Measure the interference.** Two agents may now enforce different standoffs for the same pair; the tighter wins, which is safe but can over-constrain the formation. Report the closest survivor-pair distance and whether the fleet still reaches its goal.
+- [ ] **Step 5:** Report the three numbers and STOP for a decision. Do not proceed to full adoption on your own judgement — if the QP cannot carry it, that is a finding, not a failure, and the design goes back to the owner.
+
+---
+
 ### Task 5: Observation channel
 
 **Files:** `admm_agent_node.cpp` (the `peer_truth_` subscription, member block), `launch/admm_fleet.launch.py`, `trust.hpp`, `test_trust.cpp`.
