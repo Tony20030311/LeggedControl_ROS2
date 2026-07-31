@@ -54,8 +54,10 @@ keep-out 圈差 4.5 m）、凍結攻擊者的過期 roster 仍在投票造成 co
   量視角而非誠實度。同一模型生成預期與實際，偏差自動抵銷，**不得**把它塞進 σ 當白噪聲。
   模擬替身的 `h` ＝ identity（替身直接發原點），故自動退化成現行減法：模擬與真機同一條定義，
   不寫兩套。真機的 `h` 兩種實作擇一：形狀模型擬合點雲反推原點，或純距離比較（對姿態最不敏感）。
-- **可見性**：純函式 `admm::visible(p_i, p_j, obstacles, range, fov)`，線段-圓遮擋測試，
+- **可見性**：純函式 `admm::visible(p_i, p_j, obstacles, range)`，距離閘＋線段-圓遮擋測試，
   帶單元測試。不可見 → **不產生證據**（不是產生反向證據）。
+  FOV 錐留到真感知階段（替身是全向的，現在加＝無實作依據的旋鈕）。
+  遮擋用的是 CBF 半徑 0.30（實體樁 0.20）→ 略為**過度遮擋**，偏向棄權，正是安全的方向。
 - **時間對齊**：宣稱是同儕 cycle head（20 Hz）的狀態，觀測非同步進來。0.55 m/s 下
   100 ms 偏差＝5.5 cm，相對 0.30 門檻是白送的空間，且會被誤寫進 σ。故觀測必須內插到
   宣稱的 `cycle_id` 時戳再相減（訊息已有 `cycle_id`、`tx_wall`）。現行 gate2 同病，一併修。
@@ -110,7 +112,7 @@ b_j = 1 / (1 + e^{−L_j})
 | 行為 | 映射 |
 |---|---|
 | admission | b 低於門檻 → 該同儕的宣稱不被 commit（走現行 `block_peer` 路徑），ADMM 更新式一字不改。連續權重進成本函數屬 CBF/QP 數學改動，依專案規則須先與使用者推導，本 spec 不做 |
-| keep-out | 半徑＝f(b)，且 **f 在 b ≥ b_evict 區間必須是平的且等於現行 pairwise 約束**；只有跌破驅逐門檻後才連續長成屍體圈（b→0 即現行 `corpse_keepout`） |
+| keep-out | 半徑＝f(b)，且 **f 在 b ≥ b_evict 區間必須是平的且等於現行 pairwise 約束**；跌破門檻後才套屍體圈。**目前不信任側是階梯（＝現行 `corpse_keepout`）不是斜坡**——斜坡需要量測支撐，沒量過就不做 |
 | 成員資格 | b 跌破 b_evict → 走**現行** `members[]` 多數決驅逐路徑；回升過 b_rejoin → rejoin（雙門檻遲滯，防抖動） |
 
 **keep-out 那條「平段」是硬需求，不是妥協**：b 初值 0.5，若半徑在信任區間就隨 b 膨脹，
@@ -210,7 +212,8 @@ b_j = 1 / (1 + e^{−L_j})
 ## 8. 影響面
 
 改：`admm_agent_node.cpp`（gate2 → 信念層）、`AgentState.msg`（+2 欄）、
-`fleet_config.hpp/cpp`（`visible()`、信念更新純函式、keep-out 隨 b 縮放）、
+新增 `include/legged_upper_control/trust.hpp`（header-only inline，同 `majority_excluded` 慣例：
+`visible()`、信念更新、驅逐門檻——純函式、可單元測試）、
 `d_run.sh`（接 OBS_GATE2/ODOM_FAKE 與三臂矩陣、誣陷臂）、對應單元測試。
 
 **驅逐只能有一條路徑**：信念跌破門檻 → 現行 `block_peer` → 現行沉默驅逐。
