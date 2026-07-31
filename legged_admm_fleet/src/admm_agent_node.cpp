@@ -614,10 +614,26 @@ private:
     // different time manufactures a correction nobody's claim asked for, the same reasoning that
     // keeps Gate 2 from differencing a frozen HOLD claim against live odom.
     //
-    // No observation for a peer this cycle (never subscribed, stream stalled, or the query lands
-    // outside interp_at's window) -> that peer is simply ABSENT from the map handed to
-    // set_peer_offsets, and AgentCore applies zero correction to it -- structurally the same "no
-    // observation -> no correction" contract agent_core.cpp already implements for an empty map.
+    // No FRESH observation for a peer this cycle (never subscribed, stream stalled, the query
+    // lands outside interp_at's window, or -- review round 2 on task 7 finding 6 -- not
+    // currently visible) -> HOLD that peer's last-computed offset rather than dropping it.
+    //
+    // Dropping to zero the instant a peer cannot be observed reopens the exact judge/constraint
+    // asymmetry finding 6 closed, on the constraint side: an attacker that steps behind a pillar,
+    // or beyond sensing range, would get its raw self-reported claim fully re-trusted at the
+    // precise moment it has the most incentive to lie, while set_peer_keepout (same visibility
+    // gate, same fix) already HOLDS a peer's keep-out at its last-known position when it drops
+    // out of the map handed to it. Holding here makes both mechanisms fail the same way instead
+    // of diverging: whichever direction the peer's true behaviour actually goes while unobserved,
+    // holding is never worse than zero (the peer keeps lying similarly -> holding is correct; it
+    // stops lying -> holding over-corrects, costing a little extra standoff, the conservative
+    // direction; it lies MORE while hidden -> holding under-corrects, but strictly less than the
+    // zero correction it would otherwise get). No separate expiry: a peer that is genuinely gone
+    // for good is the crash-failover/eviction path's job (maybeEvict -> rebuild constructs a
+    // fresh AgentCore, which starts this peer's offset over at zero the same as a peer never
+    // seen) -- a SEPARATE timer here would duplicate that mechanism for the one case (persistent
+    // occlusion of a peer still very much in the consensus) where holding is already bounded-safe
+    // by the reasoning above, matching set_peer_keepout's own no-expiry precedent.
     void updatePeerOffsets(std::uint64_t slot, const Eigen::Vector2d& self_p) {
         std::map<int, std::deque<admm::ObsSample>> truth;
         { std::lock_guard<std::mutex> l(mu_); truth = peer_truth_; }
@@ -629,19 +645,24 @@ private:
         for (const auto& kv : agent_->peer_xnow()) {
             const int j = kv.first;
             if (j == self_id_) continue;
+            // Default: hold. Peer never observed at all -> peer_offset_prev_[j] default-
+            // constructs zero, identical to the old "absent from the map" behaviour, so this
+            // changes nothing for a peer this agent has never anchored. Overwritten below only
+            // when this cycle actually produces a fresh, visible observation.
+            off[j] = peer_offset_prev_[j];
             const auto tb = truth.find(j);
             if (tb == truth.end()) continue;   // no observation channel heard from j at all
             const auto sit = seen.find(j);
             if (sit == seen.end()) continue;   // no claim to anchor
             const auto obs = admm::interp_at(tb->second, static_cast<double>(sit->second) * ts_);
-            if (!obs) continue;   // stream stalled or hasn't started yet: no evidence, no correction
+            if (!obs) continue;   // stream stalled or hasn't started yet: hold, no fresh evidence
             // TASK 7 REVIEW FINDING 6: the same range/occlusion gate beliefStep uses for
             // first-hand evidence, applied here too. Without it, a peer hiding behind a pillar
             // from everyone but its victim was still judged unobservable by the belief layer
             // while this function kept anchoring the barrier and moving the local keep-out to a
             // position it had just declared un-sensed -- safety-positive by accident, but a
             // stand-in sensor model that the paper's own safety mechanism ignores is not
-            // defensible. Not visible -> treated exactly like "stream stalled": no correction.
+            // defensible. Not visible -> hold (see the function comment for why hold, not drop).
             if (!admm::visible(self_p, *obs, arena_obs_, obs_range_)) continue;
             const Eigen::Vector2d noisy =
                 *obs + admm::obs_noise(slot, self_id_, j, trust_.sigma, obs_noise_seed_);

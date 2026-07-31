@@ -388,6 +388,41 @@ void test_offset_ramps_onto_the_truth_and_stops_there() {
     assert(std::abs(d[0] + 1.0) < 1e-9);   // no overshoot once it is on the observation
 }
 
+void test_anchor_offset_holds_through_a_visibility_flip() {
+    // Task 7, review round 2 (a new risk found in the finding-6 fix): updatePeerOffsets must
+    // HOLD the last computed offset when a peer becomes unobservable, not drop it to zero.
+    // Dropping to zero would let an attacker regain full trust in its raw self-reported claim at
+    // exactly the moment (stepping behind a pillar, or beyond range) it has the most incentive
+    // to lie -- reopening the judge/constraint asymmetry finding 6 existed to close, on the
+    // constraint side. The node has no unit test harness, so this reproduces
+    // updatePeerOffsets' exact per-cycle rule directly: off[j] defaults to peer_offset_prev_[j]
+    // every cycle, and is overwritten only on a fresh, visible observation.
+    const Eigen::Vector2d self(0, 0), claimed(3.0, 0), observed(2.0, 0);   // peer lies by 1 m
+    const std::vector<Obstacle> pillar_between{{Eigen::Vector2d(1.5, 0.0), 0.30}};  // blocks the sightline
+    Eigen::Vector2d prev(0, 0), off(0, 0);
+
+    // Cycle 1: visible -> a real correction goes into effect (same math as the ramp test above).
+    assert(visible(self, observed, {}, 4.0));
+    off = conservative_offset(self, claimed, observed, kDead, kRate, prev);
+    prev = off;   // updatePeerOffsets' "prev = off[j]" on the fresh path
+    const double held_norm = off.norm();
+    assert(held_norm > 0.0);
+
+    // Cycle 2: the SAME peer, same claim, same truth -- but a pillar now sits on the sightline.
+    // updatePeerOffsets' rule for "not visible" is off[j] = peer_offset_prev_[j] (hold), never
+    // touching prev itself.
+    assert(!visible(self, observed, pillar_between, 4.0));
+    off = prev;
+    assert(std::abs(off.norm() - held_norm) < 1e-12);   // THE property under test: it did not vanish
+    assert(off.norm() > 0.0);
+
+    // Cycle 3: visible again, peer still lying by the same amount -> ramps FORWARD from where it
+    // held, never resets to zero and re-ramps from scratch.
+    assert(visible(self, observed, {}, 4.0));
+    const Eigen::Vector2d next = conservative_offset(self, claimed, observed, kDead, kRate, prev);
+    assert(next.norm() >= held_norm - 1e-12);
+}
+
 void test_offset_abstains_on_non_finite_input() {
     const double nan = std::nan("");
     const Eigen::Vector2d self(0, 0), claimed(3.0, 0);
@@ -843,6 +878,7 @@ int main() {
     test_offset_has_a_dead_band();
     test_offset_is_rate_limited();
     test_offset_ramps_onto_the_truth_and_stops_there();
+    test_anchor_offset_holds_through_a_visibility_flip();
     test_offset_abstains_on_non_finite_input();
     test_anchor_translates_the_whole_trajectory();
     test_anchor_ignores_a_malformed_plan();
