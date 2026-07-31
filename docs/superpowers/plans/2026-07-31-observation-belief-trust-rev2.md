@@ -278,7 +278,8 @@ Keep the remap (it is a useful interface seam for real perception) but **delete 
 
 - [ ] **Step 1: `inject_odom_fake` must be runtime-settable**, not a launch parameter. As a launch parameter it is live from t=0 while the claim forgery fires at the trigger, so the old detector sees a 0.424 m residual against a 0.30 gate and evicts the attacker minutes BEFORE the attack — making arm A1's numbers meaningless.
 - [ ] **Step 2:** Add `inject_fake_evidence` / `inject_fake_evidence_target` (smear) and `inject_duty_cycle` (lie on alternating slots) to the send path.
-- [ ] **Step 3:** Add `inject_forged_obs` — the attacker also forges the observation channel, for the adversarial control arm.
+- [ ] **Step 3:** Add `inject_forged_obs` — the attacker also forges the observation channel, for the adversarial control arm. **Two cases, not one.** (a) The attacker publishes alongside the legitimate writer AFTER the channel is established — the GID pin should reject it, and this arm proves the pin works. (b) The attacker publishes FIRST and wins the latch — the pin then locks onto the attacker and drops the real publisher as the impostor. Case (b) is the mechanism's actual boundary (trust-on-first-use), so it must be run and reported rather than left implicit; the number it produces is the honest limit of the defence.
+- [ ] **Step 3b:** Make a lost observation channel visible to the run's verdict. When the GID pin starts dropping a peer's samples — whether from an attacker or from a benign publisher restart, which are operationally indistinguishable — the run currently emits only a throttled warning that never reaches the pass/fail logic. A silently blinded observation channel is the "defence looks present but does nothing" failure this project has been bitten by before. Surface it so a run whose observation channel died cannot be reported as a clean result.
 - [ ] **Step 4:** ctest, commit.
 
 ---
