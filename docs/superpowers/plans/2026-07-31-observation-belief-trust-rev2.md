@@ -287,4 +287,14 @@ Keep the remap (it is a useful interface seam for real perception) but **delete 
 - [ ] **Step 3:** Occlusion check — abstention logged POSITIVELY with a reason code, `L` numerically unchanged across the window, resumption afterwards, `visible()` false for both observers.
 - [ ] **Step 4:** Stale-vote deadlock scenario; 600 s no-attacker soak with a walking goal (a stationary soak cannot show drift-driven false positives).
 - [ ] **Step 5:** 44 oracle tests + full ctest.
-- [ ] **Step 6:** Results document. Required per arm: physical body gap (`phys_gap_logger.py`, the only contact criterion), closest survivor pair over EVERY row of `dist.csv`, time-to-evict per survivor in sim time, measured `v_div`, arrival distance, `achieved_rounds`, WBC deactivations, `obs_noise_seed`. **Table every attempted run including aborted ones with their cause.** No significance claims at n = 3. State the design envelope from spec §2 and whether the measured `v_div` fell inside it.
+- [ ] **Step 6:** Results document. Required per arm: physical body gap (`phys_gap_logger.py`, the only contact criterion), closest survivor pair over EVERY row of `dist.csv`, time-to-evict per survivor in sim time, measured `v_div`, arrival distance, `achieved_rounds`, WBC deactivations, `obs_noise_seed`, **and the communication cost**. **Table every attempted run including aborted ones with their cause.** No significance claims at n = 3. State the design envelope from spec §2 and whether the measured `v_div` fell inside it.
+
+- [ ] **Step 7: G5 — communication measurement, folded in rather than run separately.**
+  This is the project's outstanding gate (`CLAUDE.md`), and it belongs here: the trust layer adds
+  fields to `AgentState`, so measuring G5 before it lands would measure a system about to change.
+  Nothing new needs building — `dds_transport.hpp` already maintains `bytes_tx_` / `bytes_rx_` and
+  computes per-message `wire_bytes()`, and `CycleStats` is already published every cycle and bagged.
+  Report per arm: bytes/second per agent, mean `AgentState` payload with and without the evidence
+  fields, and the resulting percentage overhead of the defence. That last number answers the
+  question a reviewer will certainly ask — what does this defence cost in bandwidth — and it is the
+  honest counterweight to the safety benefit.
