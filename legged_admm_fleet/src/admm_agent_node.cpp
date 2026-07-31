@@ -728,10 +728,22 @@ private:
         for (const auto& kv : agent_->peer_xnow()) {
             const int j = kv.first;
             if (j == self_id_) continue;
-            // Default: hold. Peer never observed at all -> peer_offset_prev_[j] default-
-            // constructs zero, identical to the old "absent from the map" behaviour, so this
-            // changes nothing for a peer this agent has never anchored. Overwritten below only
-            // when this cycle actually produces a fresh, visible observation.
+            // BUG FIX (found in review): std::map::operator[]'s "value-init a fresh key"
+            // guarantee zero-initializes a scalar -- why resid_[j]/l_self_[j] elsewhere in this
+            // file are safe -- but Eigen::Vector2d's default constructor is a deliberate no-op
+            // for performance (no EIGEN_INITIALIZE_MATRICES_BY_ZERO/NAN in this build), so a
+            // never-written key's operator[] returns whatever bytes were already in the freshly
+            // allocated map node, not zero. Verified empirically: 20/20 fresh keys came back
+            // (12345.6789, 12345.6789) on this system. Both reads below (this one and `prev` a
+            // few lines down) go straight into conservative_offset -> anchor_peer, a live safety
+            // constraint, so a garbage seed here corrupted the peer's translated broadcast for
+            // one cycle -- every run, at bring-up, before any peer has ever been anchored. Insert
+            // the zero EXPLICITLY, once, before anything can read a never-written entry; both
+            // later uses of peer_offset_prev_[j] this iteration then hit an already-real entry.
+            if (peer_offset_prev_.find(j) == peer_offset_prev_.end())
+                peer_offset_prev_.emplace(j, Eigen::Vector2d::Zero());
+            // Default: hold. Overwritten below only when this cycle actually produces a fresh,
+            // visible observation.
             off[j] = peer_offset_prev_[j];
             const auto tb = truth.find(j);
             if (tb == truth.end()) continue;   // no observation channel heard from j at all
@@ -749,6 +761,8 @@ private:
             if (!admm::visible(self_p, *obs, arena_obs_, obs_range_)) continue;
             const Eigen::Vector2d noisy =
                 *obs + admm::obs_noise(slot, self_id_, j, trust_.sigma, obs_noise_seed_);
+            // Guaranteed to already exist (seeded to Zero() above if this is j's first
+            // iteration ever) -- operator[] here can never again value-init a fresh Eigen key.
             auto& prev = peer_offset_prev_[j];
             off[j] = admm::conservative_offset(self_p, kv.second.head<2>(), noisy,
                                                3.0 * trust_.sigma, admm::MAX_VX * ts_, prev);

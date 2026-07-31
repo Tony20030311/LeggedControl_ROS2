@@ -395,6 +395,24 @@ int main() {
             assert(o.size() == od.size() && "forging an unheard-of peer must not add an entry");
         }
     }
+    {
+        // Review-found bug fix (admm_agent_node.cpp updatePeerOffsets): std::map<K,V>::
+        // operator[]'s "value-init a fresh key" guarantee zero-initializes a scalar V (why
+        // resid_[j]/l_self_[j] elsewhere in that file are safe) but NOT an Eigen::Vector2d --
+        // Eigen's default constructor is a deliberate no-op for performance, so operator[] on a
+        // never-written key returns whatever bytes were already in the freshly allocated map
+        // node, not zero. peer_offset_prev_[j] fed that garbage straight into
+        // conservative_offset -> anchor_peer, a live safety constraint, on every peer's first
+        // touch. This exercises the REAL map type (not a hand-zeroed local, which is why the
+        // existing anchor test at test_trust.cpp:435 could not have caught this) with a key that
+        // has genuinely never been written, against the fixed idiom updatePeerOffsets now uses.
+        std::map<int, Eigen::Vector2d> prev;
+        assert(prev.find(7) == prev.end() && "key must be genuinely absent before the fix runs");
+        if (prev.find(7) == prev.end()) prev.emplace(7, Eigen::Vector2d::Zero());
+        assert(prev.at(7) == Eigen::Vector2d(0.0, 0.0)
+               && "a never-written peer's held offset must be exactly zero, not whatever bytes "
+                  "were already in the freshly allocated map node");
+    }
     std::cout << "test_false_signal: all cases passed\n";
     return 0;
 }
