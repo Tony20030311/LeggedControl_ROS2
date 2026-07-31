@@ -95,6 +95,8 @@ add_executable(test_corpse_keepout test/test_corpse_keepout.cpp)
 target_link_libraries(test_corpse_keepout admm_core)
 add_executable(test_false_signal test/test_false_signal.cpp)
 target_link_libraries(test_false_signal admm_core)
+add_executable(test_trust test/test_trust.cpp)
+target_link_libraries(test_trust admm_core)
 
 # register the gates with ctest so `colcon test` actually runs them (they used to be
 # build-only; the D_MIN 1.0->1.3 change shipped with nothing re-running them)
@@ -104,5 +106,6 @@ add_test(NAME agent_timeout COMMAND test_agent_timeout)
 add_test(NAME agent_failover COMMAND test_agent_failover)
 add_test(NAME corpse_keepout COMMAND test_corpse_keepout)
 add_test(NAME false_signal COMMAND test_false_signal)
+add_test(NAME trust COMMAND test_trust)
 
 ament_package()
