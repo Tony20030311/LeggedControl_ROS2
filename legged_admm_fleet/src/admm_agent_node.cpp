@@ -144,6 +144,11 @@ public:
         // untrusted peer's keep-out. Off restores the pre-2026-07-30 constant-reference behaviour.
         evade_boost_ = declare_parameter<bool>("evade_boost", true);
         evade_range_ = declare_parameter<double>("evade_range", 0.5);
+        // Task 4b spike: each agent's OWN local pairwise safety net against every peer it can
+        // observe, independent of edge_owner (see agent_core.hpp AgentCore ctor). Fixes obstacle
+        // slot count at construction, so this is launch-time only — no dynamic re-toggle.
+        // Default OFF: this is a feasibility spike, not yet the shipped behaviour.
+        enable_peer_keepout_ = declare_parameter<bool>("enable_peer_keepout", false);
         follow_cone_cos_ = std::cos(declare_parameter<double>("follow_cone_deg", 60.0) * M_PI / 180.0);
         // Direction-aware body footprint (Vision60 base box 0.83 x 0.25 -> half 0.415 x 0.125).
         // The inter-agent clearance the node-layer safety enforces depends on how the two long
@@ -201,7 +206,8 @@ public:
         }
         agent_ = std::make_unique<admm::AgentCore>(self_id_, dogs_, edges_, formation_.get(),
                                                    w_form_, arena_obs_, arena_walls_, hard_through_,
-                                                   transport_.get(), robot_margin_);
+                                                   transport_.get(), robot_margin_,
+                                                   enable_peer_keepout_);
         // Declared unconditionally: these bounds are "the ground this fleet operates on", which
         // Gate 1 needs whether or not A* is planning on it. (declare_parameter is once-only.)
         const double ax_min = declare_parameter<double>("astar_x_min", 0.0);
@@ -575,6 +581,9 @@ private:
         { std::lock_guard<std::mutex> l(mu_); truth = peer_truth_; }
         const auto seen = transport_->last_seen();
         std::map<int, Eigen::Vector2d> off;
+        // task 4b: same observation, same slot alignment, same noise -- the local pairwise
+        // keep-out is not a second sensor, it is a second constraint reading the first one.
+        std::map<int, Eigen::Vector2d> keepout_pos;
         for (const auto& kv : agent_->peer_xnow()) {
             const int j = kv.first;
             if (j == self_id_) continue;
@@ -590,8 +599,10 @@ private:
             off[j] = admm::conservative_offset(self_p, kv.second.head<2>(), noisy,
                                                3.0 * trust_.sigma, admm::MAX_VX * ts_, prev);
             prev = off[j];
+            keepout_pos[j] = noisy;
         }
         agent_->set_peer_offsets(off);
+        agent_->set_peer_keepout(keepout_pos);
     }
     // THE CONTRACT: goals live inside the A* map. The planner already clamps an outside goal
     // and walks the last leg straight, but leaving the contract implicit is what let a demo
@@ -1079,7 +1090,7 @@ private:
         const auto obs = allObstacles();
         agent_ = std::make_unique<admm::AgentCore>(
             self_id_, dogs_, edges_, has_shape ? formation_.get() : nullptr, w_form_, obs,
-            arena_walls_, hard_through_, transport_.get(), robot_margin_);
+            arena_walls_, hard_through_, transport_.get(), robot_margin_, enable_peer_keepout_);
 
         // The stack's obstacle contract is CBF + A* detour: a straight REFERENCE through a
         // keep-out linearizes into an l>u bound box -> the (now guarded) QP fails loudly and
@@ -1163,6 +1174,7 @@ private:
     bool inj_ignore_corpses_ = false;  // hostile mode: evict without fencing (demo/threat model)
     bool evade_boost_ = true;          // ask for MAX_VX while evading a keep-out (followSpeed)
     double evade_range_ = 0.5;
+    bool enable_peer_keepout_ = false;  // task 4b spike: local pairwise safety net, off by default
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
 
     std::unique_ptr<admm::LaplacianFormation> formation_;

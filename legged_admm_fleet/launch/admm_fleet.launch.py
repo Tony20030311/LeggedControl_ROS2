@@ -61,6 +61,8 @@ def _distributed_agents(context, *_a, **_k):
                 'astar_x_max': float(LaunchConfiguration('astar_x_max').perform(context)),
                 'astar_y_min': float(LaunchConfiguration('astar_y_min').perform(context)),
                 'astar_y_max': float(LaunchConfiguration('astar_y_max').perform(context)),
+                'enable_peer_keepout': LaunchConfiguration('enable_peer_keepout').perform(
+                    context).lower() in ('true', '1'),
             }],
             remappings=[
                 # The observation channel is the observer's own sensor, subscribed under a LOCAL
@@ -104,6 +106,10 @@ def generate_launch_description():
         # before/after can be measured with ONE binary. The node warns loudly if it is not 10.
         DeclareLaunchArgument('corpse_anchor_knot', default_value='10'),
         DeclareLaunchArgument('formation', default_value='V'),
+        # task 4b spike: each agent's own local pairwise safety net against every peer it can
+        # observe, bypassing edge_owner entirely (see AgentCore ctor in agent_core.hpp). Default
+        # off -- this is a feasibility spike, not yet the shipped behaviour.
+        DeclareLaunchArgument('enable_peer_keepout', default_value='false'),
         Node(
             package='legged_admm_fleet',
             executable='fleet_centralized_node',

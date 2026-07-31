@@ -33,7 +33,8 @@ double secs_since(std::chrono::steady_clock::time_point t0) {
 AgentCore::AgentCore(int self_id, std::vector<int> dogs, std::vector<EdgeKey> edges,
                      const LaplacianFormation* formation, double w_form,
                      std::vector<Obstacle> obstacles, std::vector<Wall> walls,
-                     int hard_through, Transport* transport, double robot_margin)
+                     int hard_through, Transport* transport, double robot_margin,
+                     bool enable_peer_keepout)
     : self_id_(self_id),
       dogs_(std::move(dogs)),
       edges_(std::move(edges)),
@@ -48,6 +49,20 @@ AgentCore::AgentCore(int self_id, std::vector<int> dogs, std::vector<EdgeKey> ed
             my_edges_.push_back(e);
             neighbors_.push_back(other(e, self_id_));
         }
+    // LOCAL PAIRWISE SAFETY NET (task 4b spike, see agent_core.hpp). One fixed obstacle slot
+    // per peer, parked far outside any arena until an observation moves it — never binds, the
+    // same inactivity idiom an out-of-range arena obstacle already relies on. radius mirrors
+    // corpse_keepout's static case exactly (r_eff = radius + robot_margin == D_MIN); soft_k0
+    // for the same reason a corpse gets it — this can be observed already violated (a noisy
+    // first sample right after spawn) and a hard k=0 row would mean infeasible, forever.
+    if (enable_peer_keepout) {
+        constexpr double kParkFar = 1000.0;
+        const double r = std::max(0.10, D_MIN - robot_margin);
+        for (const int j : neighbors_) {
+            peer_keepout_idx_[j] = obstacles.size();
+            obstacles.push_back({Eigen::Vector2d(kParkFar, kParkFar), r, /*soft_k0=*/true});
+        }
+    }
     node_ = std::make_unique<NodeSubproblem>(
         obstacles, walls, robot_margin, /*q_pos=*/10.0, /*q_v=*/1.0, /*r_accel=*/0.5,
         /*w_pred=*/20.0, /*n=*/N, RHO, static_cast<int>(neighbors_.size()), w_form_);

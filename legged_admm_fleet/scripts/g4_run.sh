@@ -24,6 +24,9 @@ GOAL_X=${GOAL_X:-2.0}
 DEADLINE=${DEADLINE:-20}        # per-hop recv deadline [ms]
 DMIN_ABORT=${DMIN_ABORT:-0.87}  # contact line (base half-diag 0.433 x2); see g3_run.sh
 SOAK=${SOAK:-0}                 # if >0: after reaching goal, keep running this many more sec
+# task 4b spike A/B: each agent's own local pairwise safety net (see admm_fleet.launch.py).
+# Default false == byte-identical to the pre-spike run.
+ENABLE_PEER_KEEPOUT=${ENABLE_PEER_KEEPOUT:-false}
 
 say() { echo "[g4 $(date +%H:%M:%S)] $*" | tee -a "$LOGD/g4.log"; }
 die() { say "FAIL: $*"; exit 1; }
@@ -114,7 +117,8 @@ gz_deactivated() { tail -n +$((GZMARK + 1)) "$LOGD/gazebo.log" | grep -q "Deacti
 IDS="[${ROBOTS// /, }]"
 say "phase 3: distributed agents (ids=$IDS v=$V deadline=${DEADLINE}ms)"
 setsid ros2 launch legged_admm_fleet admm_fleet.launch.py mode:=distributed \
-  robot_ids:="$IDS" v:=$V hop_deadline_ms:=$DEADLINE > "$LOGD/admm.log" 2>&1 &
+  robot_ids:="$IDS" v:=$V hop_deadline_ms:=$DEADLINE \
+  enable_peer_keepout:=$ENABLE_PEER_KEEPOUT > "$LOGD/admm.log" 2>&1 &
 setsid python3 $WS/src/legged_fleet/legged_admm_fleet/scripts/g3_dist_logger.py \
   "$ROBOTS" "$LOGD/dist.csv" 1.3 --ros-args -p use_sim_time:=true > "$LOGD/dist_logger.log" 2>&1 &  # 1.3 = admm::D_MIN
 DLPID=$!

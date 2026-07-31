@@ -266,10 +266,22 @@ public:
     // NodeSubproblem for itself and the EdgeSubproblem for the one edge it owns. `formation`
     // is shared read-only (each agent computes the full grad and keeps its own row — the
     // deterministic-replication contract, plan §67).
+    // enable_peer_keepout (task 4b spike, design §4/Decision 2026-07-31): when true, adds ONE
+    // fixed obstacle slot per peer to THIS agent's own node QP, modelled on corpse_keepout —
+    // same D_MIN standoff, same soft_k0 (may be observed already violated). It is the local,
+    // unilateral counterpart to edge ownership: edge_owner decides who LINEARIZES a pair's ADMM
+    // barrier, but when the owner is the one lying, its own view of that edge is the only view
+    // that ever reaches it. This constraint bypasses ownership entirely, the same way the arena
+    // obstacle CBF and corpse_keepout already do — each agent fences every peer it can see,
+    // regardless of who owns the edge to it.
+    // Default false, and the loopback parity harness (test_distributed_parity) never passes
+    // true, so `obstacles` there is untouched and node_'s QP is byte-for-byte what it always
+    // was — the constraint does not merely happen to be inactive, the code path never runs.
     AgentCore(int self_id, std::vector<int> dogs, std::vector<EdgeKey> edges,
               const LaplacianFormation* formation, double w_form,
               std::vector<Obstacle> obstacles, std::vector<Wall> walls, int hard_through,
-              Transport* transport, double robot_margin = 0.30);
+              Transport* transport, double robot_margin = 0.30,
+              bool enable_peer_keepout = false);
 
     // One control cycle for THIS robot. Broadcasts AgentState, barriers on peers, runs the
     // P_ITERS node/edge/dual loop over the transport, returns this robot's xi (6N) plus its
@@ -298,6 +310,22 @@ public:
     // the arithmetic is untouched. That is why the loopback parity harness, which has no
     // observation channel at all, stays bit-identical.
     void set_peer_offsets(const std::map<int, Eigen::Vector2d>& d) { peer_offset_ = d; }
+    // LOCAL PAIRWISE SAFETY NET (task 4b spike): move peer j's dedicated keep-out circle to
+    // where THIS agent's own sensor currently believes it is — the same observed, noised
+    // position updatePeerOffsets already computes for conservative anchoring (no second
+    // observation path). Enforced in THIS agent's own node QP unconditionally, independent of
+    // edge_owner: it stands even when the edge to that peer is linearised by the peer itself.
+    // A peer absent from `pos` this cycle (no fresh observation) is left wherever it last was —
+    // the far-away park default before the first observation ever arrives — the same
+    // "no evidence -> no correction" contract set_peer_offsets already implements, and the same
+    // "never binds" inactivity an out-of-range arena obstacle already relies on.
+    // No-op when enable_peer_keepout was false at construction (peer_keepout_idx_ empty).
+    void set_peer_keepout(const std::map<int, Eigen::Vector2d>& pos) {
+        for (const auto& kv : pos) {
+            const auto it = peer_keepout_idx_.find(kv.first);
+            if (it != peer_keepout_idx_.end() && node_) node_->set_obstacle_pos(it->second, kv.second);
+        }
+    }
     // Move an already-registered obstacle. The node layer owns WHY an obstacle moves (a peer
     // that broadcasts garbage is still walking, so its keep-out has to follow its odom); this
     // is only the route to the node QP, which holds the obstacle set. No rebuild, no cold start
@@ -318,6 +346,9 @@ private:
     std::map<int, Eigen::Vector4d> peer_xnow_;      // cached from last step() (followSpeed)
     std::map<int, Eigen::VectorXd> peer_xibar_;     // cached from last step() (safe_prefix)
     std::map<int, Eigen::Vector2d> peer_offset_;    // conservative anchoring; empty = no observations
+    // task 4b: peer robot id -> its dedicated keep-out obstacle's index in node_'s obstacle
+    // list. Empty when enable_peer_keepout was false at construction (set_peer_keepout no-ops).
+    std::map<int, std::size_t> peer_keepout_idx_;
     std::vector<int> dogs_;
     std::vector<EdgeKey> edges_;        // full edge list (for neighbor/owner bookkeeping)
     std::vector<EdgeKey> my_edges_;     // edges incident to self_id_
