@@ -164,14 +164,17 @@ void test_neutral_belief_does_not_fence_the_spawn_formation() {
 
 void test_detection_fits_the_safety_margin() {
     const TrustParams p = params();
-    // The physics, not a slot count. D_MIN 1.3 minus the 0.867 m contact line leaves 0.433 m,
-    // and the accumulator plus one slot of eviction patience must fit inside it at the
-    // divergence rate the design claims to cover. Raising the assert to make this pass is
-    // forbidden: it would ship a detector slower than the damage it prevents.
+    // The physics, not a slot count. A lie growing at a constant divergence rate produces NO
+    // negative evidence until the residual passes d_lie/2 -- below that trust_llr is still
+    // positive, pushing belief UP, not down. So by the time the fence appears the lie has already
+    // spent d_lie/2 (the undetectable phase) PLUS (slots+1)*TS*v_div (the detect-and-evict phase),
+    // and that SUM must fit inside D_MIN 1.3 minus the 0.867 m contact line = 0.433 m. Raising the
+    // assert to make this pass is forbidden: it would ship a detector slower than the damage it
+    // prevents.
     int slots = 0;
     for (double L = p.l_max; !trust_fences_peer(L, p) && slots < 200; ++slots)
         L = trust_step_self(L, -p.clamp_step, p);
-    const double v_div_covered = 0.433 / ((slots + 1) * TS);
+    const double v_div_covered = (0.433 - p.d_lie / 2.0) / ((slots + 1) * TS);
     std::printf("detection: %d slots, covers divergence up to %.3f m/s\n", slots, v_div_covered);
     assert(v_div_covered >= 0.25);
 }
@@ -392,6 +395,21 @@ void test_anchoring_reaches_the_barrier_and_buys_back_the_lie() {
     assert(std::abs(seen_plain[0] - claimed[0]) < 1e-12);
 }
 
+void test_credit_ratio_scales_the_unsaturated_positive_branch() {
+    const TrustParams p = params();
+    // The existing llr tests all probe residuals (0, d_lie/2, 50) that saturate to +-clamp_step
+    // regardless of credit_ratio, so they cannot tell a correct scaling from a dropped one. r=0.149
+    // sits just inside d_lie/2=0.15, where the raw (pre-ratio) log-likelihood is a modest 0.75 --
+    // comfortably inside (0, clamp_step) both before and after scaling, so nothing here is clamped.
+    // Hand computed: raw l = -d_lie*(2r-d_lie)/(2*sigma^2) = -0.30*(0.298-0.30)/(2*0.02^2)
+    //              = -0.30*(-0.002)/0.0008 = 0.0006/0.0008 = 0.75
+    //              credited  = 0.75 * credit_ratio(0.25) = 0.1875
+    // A regression that dropped the scaling would read 0.75 here; one that scaled the PENALTY
+    // branch instead of the credit branch would read a negative number.
+    const double got = trust_llr(0.149, p.sigma, p.d_lie, p.clamp_step, p.credit_ratio);
+    assert(std::abs(got - 0.1875) < 1e-9);
+}
+
 void test_duty_cycled_lying_is_still_convicted() {
     const TrustParams p = params();
     // Symmetric credit gives an alternating attacker a fixed point near +1.0: it lies half the
@@ -426,6 +444,7 @@ int main() {
     test_belief_decays_toward_neutral();
     test_neutral_belief_does_not_fence_the_spawn_formation();
     test_detection_fits_the_safety_margin();
+    test_credit_ratio_scales_the_unsaturated_positive_branch();
     test_duty_cycled_lying_is_still_convicted();
     test_offset_pulls_a_distant_claim_back_to_the_observation();
     test_offset_ignores_a_claim_that_is_already_closer();

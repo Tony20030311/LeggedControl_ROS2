@@ -105,6 +105,17 @@ public:
             throw std::runtime_error("trust_d_lie/2 must stay under the 0.433 m safety buffer");
         if (!(trust_.l_max < -trust_.l_evict))
             throw std::runtime_error("trust_l_max >= |l_evict|: hearsay could evict alone");
+        // A peer that lies every other slot settles at the fixed point of one lie step (-clamp_step)
+        // and one credit step (+clamp_step*credit_ratio) each decayed by lambda:
+        //   L* = clamp_step*(credit_ratio - lambda) / (1 - lambda^2)
+        // Eviction requires L* < l_evict, i.e. credit_ratio < lambda + l_evict*(1-lambda^2)/clamp_step.
+        // At or above that breakeven the duty-cycled liar this parameter exists to catch converges
+        // to a positive plateau and is never convicted -- silently, since this is launch-time-only
+        // like its siblings above.
+        if (!(trust_.credit_ratio <
+              trust_.lambda + trust_.l_evict * (1.0 - trust_.lambda * trust_.lambda) / trust_.clamp_step))
+            throw std::runtime_error(
+                "trust_credit_ratio at/above the duty-cycle breakeven: an alternating liar would never be evicted");
         // ARMED BY DEFAULT. This was true — measure first, block later — and that was right while
         // the gate was being calibrated. It is not right to ship: a fleet that only starts
         // checking when somebody flips a parameter is a fleet that runs unprotected every time
