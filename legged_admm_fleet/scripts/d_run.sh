@@ -135,7 +135,11 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
         die "pairwise $M < $DMIN_ABORT (collision guard)"
       fi
     fi
-    gz_deactivated && die_infra "WBC deactivated mid-walk"
+    # NOT die_infra: this fires on every poll of every walk_until call, most of which happen
+    # AFTER the lie/silence has landed. gz_deactivated only sees "Deactivating" in gazebo.log --
+    # it cannot tell the pre-existing upstream activation race from an attacker's ram genuinely
+    # destabilising a robot hard enough to trip the WBC. Cannot distinguish -> fail closed.
+    gz_deactivated && die "WBC deactivated mid-walk"
     [ "$(python3 -c "print(1 if $D<0.45 else 0)")" = 1 ] && return 0
     # A SLOT can be inside the corpse keep-out, and then the centroid can never reach the goal.
     # Measured (late kill at x=15.3): corpse at (16.16,-0.55), COL2 rear slot at (17.24,-0.02) is
@@ -583,27 +587,55 @@ python3 "$SCRIPTS/dist_summary.py" "$LOGD/dist.csv" || DIRTY=1
 # positive box gap therefore cannot prove the legs missed; it can only prove the bodies did.
 # Anything under 0.15 is reported as unproven rather than passed.
 if [ -s "$LOGD/phys_gap.csv" ]; then
-  GAPV=$(python3 - "$LOGD/phys_gap.csv" <<'PY'
+  # Per PAIR, not per run: GAPV_S is the worst surface gap ever seen between two SURVIVORS,
+  # GAPV_V the worst involving $VICTIM. gap_min/pair (the run-wide worst) conflates them, and a
+  # live attacker being steered into the fleet can legitimately drive its own pair's gap far
+  # below a survivor-survivor gap that never moved -- downgrading on the WHOLE ARM instead of
+  # the PAIR would silently accept a genuine survivor-survivor overlap too. Reuses the same
+  # gap_{i}_{j} columns the TRUE BODY GAP printer below already reads per pair.
+  read GAPV_V GAPV_VPAIR GAPV_S GAPV_SPAIR <<< "$(python3 - "$LOGD/phys_gap.csv" "$VICTIM" <<'PY'
 import csv, sys
 rows = list(csv.DictReader(open(sys.argv[1])))
-print('%.4f' % min(float(r['gap_min']) for r in rows) if rows else 'nan')
+victim = sys.argv[2]
+if not rows:
+    print("nan none nan none")
+    sys.exit()
+pair_cols = [c for c in rows[0] if c.startswith("gap_") and c != "gap_min"]
+worst_v, worst_v_pair = 99.0, "none"
+worst_s, worst_s_pair = 99.0, "none"
+for c in pair_cols:
+    i, j = c.split("_")[1], c.split("_")[2]
+    g = min(float(r[c]) for r in rows)
+    if i == victim or j == victim:
+        if g < worst_v:
+            worst_v, worst_v_pair = g, "%s-%s" % (i, j)
+    elif g < worst_s:
+        worst_s, worst_s_pair = g, "%s-%s" % (i, j)
+print("%.4f %s %.4f %s" % (worst_v, worst_v_pair, worst_s, worst_s_pair))
 PY
-)
-  case "$GAPV" in
+)"
+  case "$GAPV_V" in
     nan) say "WARNING: no body-gap samples — 'did they touch' is UNANSWERED for this run" ;;
     *)
-      if [ "$(python3 -c "print(1 if $GAPV <= 0 else 0)")" = 1 ]; then
-        # A live, deaf attacker steered INTO the fleet can genuinely make contact — that is the
-        # attack's effect, not a script defect, and an undefended (or weakly-defended) arm
-        # exists specifically to measure how bad it gets. Dying here would erase that arm's own
-        # verdict before the counterfactual summary below ever runs. A lie-free run has no
-        # attacker to blame, so overlap there stays what it always was: a real failure.
+      # Survivor-survivor overlap is ALWAYS fatal, LIE or not: nobody attacked THAT pair, it is
+      # exactly the false-positive-shaped failure this whole detector exists to avoid, and centre
+      # distance (the SVMIN gate) has already been measured to miss real contact by up to 0.68 m
+      # -- this surface gap must not be softened for it.
+      [ "$(python3 -c "print(1 if $GAPV_S <= 0 else 0)")" = 1 ] \
+        && die "BODIES OVERLAPPED (survivors $GAPV_SPAIR): true surface gap ${GAPV_S} m"
+      if [ "$(python3 -c "print(1 if $GAPV_V <= 0 else 0)")" = 1 ]; then
+        # A live, deaf attacker steered INTO the fleet can genuinely make contact with a survivor
+        # -- that is the attack's effect, not a script defect, and an undefended (or
+        # weakly-defended) arm exists specifically to measure how bad it gets. Dying here would
+        # erase that arm's own verdict before the counterfactual summary below ever runs. A
+        # lie-free run has no attacker to blame, so overlap there stays a real failure.
         if [ -n "${LIE:-}" ]; then
-          say "WARNING: BODIES OVERLAPPED: true surface gap ${GAPV} m"
+          say "WARNING: BODIES OVERLAPPED (robot$VICTIM pair $GAPV_VPAIR): true surface gap ${GAPV_V} m"
         else
-          die "BODIES OVERLAPPED: true surface gap ${GAPV} m"
+          die "BODIES OVERLAPPED (robot$VICTIM pair $GAPV_VPAIR): true surface gap ${GAPV_V} m"
         fi
       fi
+      GAPV=$(python3 -c "print(min($GAPV_V, $GAPV_S))")
       [ "$(python3 -c "print(1 if $GAPV < 0.15 else 0)")" = 1 ] \
         && say "WARNING: closest body surfaces ${GAPV} m — boxes cleared, LEGS NOT PROVEN CLEAR"
       ;;
