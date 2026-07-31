@@ -469,6 +469,30 @@ void test_anchoring_reaches_the_barrier_and_buys_back_the_lie() {
     assert(std::abs(seen_plain[0] - claimed[0]) < 1e-12);
 }
 
+void test_belief_residual_ignores_the_anchoring_offset() {
+    // Task 6, item 6: the belief layer's residual is |observation - peer_xnow()|. If the
+    // anchored (corrected) position leaked into peer_xnow(), that residual would read ~0 exactly
+    // when a peer starts lying -- the correction would erase the evidence for the thing it is
+    // correcting. Apply a FULL correcting offset (claimed -> observed exactly, the strongest case)
+    // and confirm the residual computed from peer_xnow() is still the whole 1 m lie, not ~0.
+    const std::vector<int> dogs = {1, 2};
+    const std::vector<EdgeKey> edges = {{1, 2}};
+    const Eigen::Vector2d claimed(3.0, 0.0), observed(2.0, 0.0);   // peer lies by 1 m
+    ScriptedPeer tp(1, claimed);
+    AgentCore ag(2, dogs, edges, nullptr, 0.0, {}, {}, 1, &tp);
+    Eigen::Vector4d xnow(0.0, 0.0, 0.0, 0.0);
+    Eigen::MatrixX2d wp(2, 2);
+    wp.row(0) = xnow.head<2>().transpose();
+    wp.row(1) = Eigen::RowVector2d(5.0, 0.0);
+    const Eigen::MatrixXd xdes = build_reference(xnow.head<2>(), wp);
+    std::map<int, Eigen::Vector2d> off{{1, observed - claimed}};   // the anchoring offset in full
+    ag.set_peer_offsets(off);
+    const StepResult r = ag.step(xnow, xdes, 0);
+    assert(!r.hold && r.xi.allFinite());
+    const double residual = (observed - ag.peer_xnow().at(1).head<2>()).norm();
+    assert(std::abs(residual - (observed - claimed).norm()) < 1e-9);   // still 1.0, not ~0
+}
+
 void test_credit_ratio_scales_the_unsaturated_positive_branch() {
     const TrustParams p = params();
     // The existing llr tests all probe residuals (0, d_lie/2, 50) that saturate to +-clamp_step
@@ -514,6 +538,48 @@ void test_duty_cycled_lying_is_still_convicted() {
     assert(trust_fences_peer(L, p));
 }
 
+// --- trust_step_observed (Task 6): the belief accumulator that replaces gate2's single-shot
+// verdict for one peer, one slot. Both gating properties below (decay-only-if-unblocked, no
+// evidence without a fresh claim) are exactly the two failure modes the task exists to close,
+// so each gets its own test rather than being folded into a scenario that could pass by luck.
+
+void test_trust_step_observed_blocked_peer_is_untouched() {
+    const TrustParams p = params();
+    // Blocking is latched (dds_transport.hpp's block_peer only ever inserts into blocked_; no
+    // unblock path exists anywhere). Decaying a convicted peer's belief back toward neutral would
+    // make the belief disagree with a transport that is still refusing its messages -- worse than
+    // not decaying at all. A blocked peer's L must not move, no matter how damning the evidence.
+    const double L = -20.0;   // already deep in convicted territory
+    const double got = trust_step_observed(L, /*blocked=*/true, /*claim_fresh=*/true,
+                                           Eigen::Vector2d(5.0, 0.0), Eigen::Vector2d(0.0, 0.0), p);
+    assert(got == L);
+}
+
+void test_trust_step_observed_no_fresh_claim_decays_only() {
+    const TrustParams p = params();
+    // "No fresh claim" is what a HOLD slot looks like from here: peer_xnow_ is frozen (only
+    // assigned when this agent's own AgentState barrier actually completes) while last_seen_
+    // keeps advancing on every message this process commits, so a frozen claim differenced
+    // against a live observation would fabricate a residual nobody produced. That must read
+    // exactly like "cannot see you": decay, no evidence -- even with an observed/claimed pair
+    // that would otherwise scream "lying".
+    const double L = -3.0;
+    const double got = trust_step_observed(L, /*blocked=*/false, /*claim_fresh=*/false,
+                                           Eigen::Vector2d(5.0, 0.0), Eigen::Vector2d(0.0, 0.0), p);
+    assert(std::abs(got - trust_step_self(L, 0.0, p)) < 1e-12);
+}
+
+void test_trust_step_observed_fresh_claim_uses_the_residual() {
+    const TrustParams p = params();
+    const Eigen::Vector2d observed(0.30, 0.0), claimed(0.0, 0.0);   // r = d_lie exactly
+    const double L = 0.0;
+    const double got = trust_step_observed(L, /*blocked=*/false, /*claim_fresh=*/true, observed, claimed, p);
+    const double expect = trust_step_self(
+        L, trust_llr((observed - claimed).norm(), p.sigma, p.d_lie, p.clamp_step, p.credit_ratio), p);
+    assert(std::abs(got - expect) < 1e-12);
+    assert(got < L);   // r = d_lie sits on the lying side of the zero crossing at d_lie/2
+}
+
 }  // namespace
 
 int main() {
@@ -557,6 +623,10 @@ int main() {
     test_anchor_translates_the_whole_trajectory();
     test_anchor_ignores_a_malformed_plan();
     test_anchoring_reaches_the_barrier_and_buys_back_the_lie();
+    test_belief_residual_ignores_the_anchoring_offset();
+    test_trust_step_observed_blocked_peer_is_untouched();
+    test_trust_step_observed_no_fresh_claim_decays_only();
+    test_trust_step_observed_fresh_claim_uses_the_residual();
     std::cout << "test_trust: OK\n";
     return 0;
 }

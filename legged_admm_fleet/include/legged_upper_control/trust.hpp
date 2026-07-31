@@ -259,6 +259,36 @@ inline double trust_total(double L_self, const std::map<int, double>& relay) {
     return L;
 }
 
+// One peer, one slot: the belief accumulator that replaces gate2's single-shot verdict (task 6).
+// Two gates, in order:
+//   blocked      Blocking is latched (dds_transport.hpp's block_peer only ever inserts into
+//                blocked_; nothing anywhere erases it). Decaying a convicted peer's belief back
+//                toward neutral would make the belief disagree with a transport that is still
+//                refusing its messages -- worse than not decaying. So L is left untouched, not
+//                just un-decayed: this is the ONLY branch that skips trust_step_self entirely.
+//   claim_fresh  peer_xnow() (agent_core.cpp) is assigned exactly once per cycle, right after
+//                this agent's own AgentState barrier completes, and stays frozen on a barrier-
+//                miss HOLD. last_seen_ (dds_transport.hpp) advances on every message this process
+//                commits regardless of whether THIS agent's own barrier for the current slot ever
+//                finished, so a peer can look fresh by last_seen_ while its cached claim is
+//                actually several slots stale. Differencing that frozen claim against a live
+//                observation fabricates a residual nobody produced -- "no fresh claim" must read
+//                exactly like "cannot see you": decay, no evidence. The caller (admm_agent_node's
+//                beliefStep) decides claim_fresh from whether its OWN step() actually refreshed
+//                peer_xnow() this slot, not from last_seen_ alone.
+// `observed`/`claimed` must both be the RAW, un-anchored values (AgentCore::peer_xnow(), never
+// the conservative-anchoring-corrected position) -- see test_belief_residual_ignores_the_
+// anchoring_offset for the property this depends on.
+inline double trust_step_observed(double L, bool blocked, bool claim_fresh,
+                                  const Eigen::Vector2d& observed, const Eigen::Vector2d& claimed,
+                                  const TrustParams& p) {
+    if (blocked) return L;
+    double llr = 0.0;
+    if (claim_fresh)
+        llr = trust_llr((observed - claimed).norm(), p.sigma, p.d_lie, p.clamp_step, p.credit_ratio);
+    return trust_step_self(L, llr, p);
+}
+
 // Belief -> geometry, and the ONLY place a peer stops being treated as a cooperating agent.
 // FLAT over the trusted range by construction: above the threshold a peer is fenced exactly as
 // today (pairwise CBF, no corpse circle). It cannot be otherwise — the fleet spawns 1.40 m apart

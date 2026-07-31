@@ -74,9 +74,26 @@ public:
         // experiment D: consecutive missing slots of a peer's AgentState before it is
         // declared dead and evicted (10 slots = 1 s sim). 0 disables eviction.
         evict_after_ = declare_parameter<int>("evict_after_misses", 10);
+        // TASK 6: which detector is armed for THIS run. false (default) keeps the existing
+        // single-shot EMA residual gate (gate2()) running byte-for-byte unchanged -- it is
+        // experiment arm A1's mechanism, and the whole reason it is not deleted is that deleting
+        // it would make A1 identical to A2 (belief) and acceptance criterion 1 unfalsifiable
+        // (design doc section 9, protocol discipline item 1). true swaps in the belief
+        // accumulator (beliefStep()) for every call site gate2() used to own alone. Logged once,
+        // loudly, so a results table can cite exactly which detector produced a given run's
+        // numbers instead of assuming the binary was armed the way the launch command intended.
+        obs_gate2_ = declare_parameter<bool>("obs_gate2", false);
+        RCLCPP_INFO(get_logger(), "[agent%d] detector armed: %s", self_id_,
+                    obs_gate2_ ? "belief accumulator (beliefStep, obs_gate2=true)"
+                               : "single-shot EMA residual gate (gate2, obs_gate2=false)");
         // Silence needs patience — it might be a network hiccup. A lie is POSITIVE evidence and
         // does not: waiting the full 10 slots hands a hostile peer another 0.55 m of approach.
-        evict_after_lying_ = declare_parameter<int>("evict_after_lying", 3);
+        // A belief-triggered block already spent ~8 slots accumulating that evidence -- the exact
+        // debounce depth evict_after_lying_'s patience exists to provide -- so stacking gate2's
+        // shorter 3-slot allowance on top of it just hands an already-convicted liar more free
+        // approach time. Only the DEFAULT tracks the armed detector; an experiment script may
+        // still override it explicitly (the on-set-parameters callback keeps it runtime-settable).
+        evict_after_lying_ = declare_parameter<int>("evict_after_lying", obs_gate2_ ? 1 : 3);
         corpse_anchor_knot_ = declare_parameter<int>("corpse_anchor_knot", admm::K_SEND);
         if (corpse_anchor_knot_ != admm::K_SEND)
             RCLCPP_WARN(get_logger(),
@@ -740,7 +757,9 @@ private:
             // (measured 2026-07-28, d_0728_095209: "GATE2 would" fired 0 times across a dead run).
             // trackMobileCorpses() moves here for the same reason: a keep-out circle that stops
             // following its body while we are held is fencing yesterday's position.
-            gate2(slot);
+            // res.n_timeouts==0 tells detect()/beliefStep whether peer_xnow() was actually
+            // refreshed this slot (see beliefStep's comment) -- gate2 ignores the flag entirely.
+            detect(slot, res.n_timeouts == 0);
             trackMobileCorpses();
             if (res.hold) maybeEvict(slot);
             publishStats(slot, res, t_cycle_wall);
@@ -754,7 +773,7 @@ private:
         // dog it is not allowed to evict. Measured 2026-07-28 (d_0728_045133): 51 straight
         // "NOT ARMED", peer silent 370 slots, zero evictions, run dead.
         evict_armed_ = true;
-        gate2(slot);
+        detect(slot, res.n_timeouts == 0);
         trackMobileCorpses();
 
         // ADAPT: translate xi to estimator frame, build 24-D target, yaw latch, publish.
@@ -935,6 +954,79 @@ private:
                 transport_->block_peer(j, "gate2 odom residual");
             }
         }
+    }
+
+    // BELIEF ACCUMULATOR (task 6) — the observation-sourced replacement for gate2's single-shot
+    // residual, armed by obs_gate2=true. Same reason gate2 does not compare against a peer's own
+    // /controller/odom here: that channel is authored by the same suspect, so a peer that forges
+    // both agrees with itself and no residual ever appears. This differences the RAW claim
+    // (agent_->peer_xnow(), never the conservative-anchoring-corrected position — see
+    // test_belief_residual_ignores_the_anchoring_offset) against peer_truth_, the stand-in sensor
+    // channel a compromised planning/comms layer cannot author.
+    //
+    // claims_fresh: whether agent_->peer_xnow() was actually refreshed THIS slot, i.e. whether
+    // this agent's own AgentState barrier completed this cycle. res.n_timeouts==0 is the exact
+    // test for that: peer_xnow_ is assigned exactly once per step(), right after the barrier
+    // succeeds (agent_core.cpp), and every path that reaches that assignment -- the ordinary
+    // solved cycle AND the fleet-reset-sync HOLD gate2 was moved onto HOLD to keep catching (see
+    // gate2's own comment: a liar that jams the barrier by spamming reset must still be judged) --
+    // leaves n_timeouts at 0. Only the TransportTimeout early-return, which returns before that
+    // assignment runs, leaves it above 0. transport_->last_seen()[j] cannot substitute for this:
+    // it advances on every message this process commits regardless of whether OUR OWN barrier for
+    // the current slot ever completed, so a peer talking exactly on time can still show a frozen,
+    // stale claim here — differencing that against a live observation fabricates up to 0.11 m of
+    // residual against a 0.15 m decision boundary.
+    void beliefStep(std::uint64_t slot, bool claims_fresh) {
+        if (!evict_armed_) return;
+        std::map<int, std::deque<admm::ObsSample>> truth;
+        { std::lock_guard<std::mutex> l(mu_); truth = peer_truth_; }
+        const auto seen = transport_->last_seen();
+        for (const auto& kv : agent_->peer_xnow()) {
+            const int j = kv.first;
+            if (j == self_id_) continue;
+            const bool blocked = transport_->blocked(j);
+            bool fresh = false;
+            Eigen::Vector2d observed = Eigen::Vector2d::Zero();
+            if (!blocked && claims_fresh) {
+                const auto sit = seen.find(j);
+                const auto tb = truth.find(j);
+                if (sit != seen.end() && tb != truth.end()) {
+                    // Align to the SLOT THE CLAIM IS FROM, not to "now" -- the same reasoning
+                    // updatePeerOffsets and gate2 already use: comparing two different instants
+                    // manufactures a discrepancy nobody's claim produced.
+                    if (const auto obs =
+                            admm::interp_at(tb->second, static_cast<double>(sit->second) * ts_)) {
+                        observed = *obs + admm::obs_noise(slot, self_id_, j, trust_.sigma, obs_noise_seed_);
+                        fresh = true;
+                    }
+                }
+            }
+            double& L = l_self_[j];
+            L = admm::trust_step_observed(L, blocked, fresh, observed, kv.second.head<2>(), trust_);
+            if (blocked) continue;   // already latched off; nothing left to decide
+            // Logged unconditionally, same discipline as gate2's residual line: this IS the
+            // calibration procedure for trust_.sigma / trust_.d_lie.
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+                                 "[agent%d] belief robot%d L=%.3f fresh=%d evict<%.2f",
+                                 self_id_, j, L, int(fresh), trust_.l_evict);
+            if (!admm::trust_fences_peer(L, trust_)) continue;
+            if (log_only_) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                                     "[agent%d] BELIEF would reject robot%d (L=%.3f < %.2f) — "
+                                     "log_only, message still accepted",
+                                     self_id_, j, L, trust_.l_evict);
+            } else {
+                transport_->block_peer(j, "belief threshold");
+            }
+        }
+    }
+
+    // Single dispatch point for both of gate2()'s call sites (HOLD path and SOLVED path), so the
+    // selector lives in exactly one place instead of being duplicated at each call site. See the
+    // constructor's startup log for which detector a given run actually armed.
+    void detect(std::uint64_t slot, bool claims_fresh) {
+        if (obs_gate2_) beliefStep(slot, claims_fresh);
+        else gate2(slot);
     }
 
     void maybeEvict(std::uint64_t slot) {
@@ -1211,9 +1303,12 @@ private:
     std::map<int, double> resid_;                   // low-passed |odom - claimed|, cycle() only
     double resid_alpha_ = 0.2, resid_gate_ = 0.5;
     bool log_only_ = true;                          // measure before you block; see calibration
-    // Belief layer (trust.hpp). Every default is derived; wiring the accumulator maps into
-    // cycle()'s per-slot update is a later task (belief replaces the single-shot gate2 verdict).
+    // Belief layer (trust.hpp). Every default is derived. obs_gate2_ selects gate2() vs
+    // beliefStep() at every call site (see detect()); l_self_ is beliefStep()'s per-peer state.
+    // l_relay_ is wired by a later task (evidence sharing, second-hand terms) -- declared here,
+    // unused until then.
     admm::TrustParams trust_;
+    bool obs_gate2_ = false;                        // false=gate2() (A1), true=beliefStep() (A2)
     std::map<int, double> l_self_;                  // first-hand log-odds per peer (trust_step_self)
     std::map<int, std::map<int, double>> l_relay_;  // l_relay_[i][j]: i's relayed belief about j
     int obs_noise_seed_ = 0;                        // must vary per run -- see admm::obs_noise
