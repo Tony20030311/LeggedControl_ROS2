@@ -330,7 +330,48 @@ which is the case the mechanism was designed for and which N = 3 cannot construc
 Incidental: one `REJECTED AgentState from robot2 — non-finite` (Gate 1) on each survivor, a
 single message out of thousands, unrelated to the smear path. Recorded, not explained.
 
-⏳ *Remaining smear reps, duty and forged_obs pending.*
+**Reproduced across all three reps** (`d_0801_053552`, `054458`, `054738`):
+
+| | agent3 → smearer | agent3 → target |
+|---|---|---|
+| `l_self` min | **−11.200 (the floor), all three** | 3.578 / 4.600 / 3.763 |
+| `l_total` min | −7.797 / −7.646 / −8.806 | **3.416, identical to three decimals in all three** |
+
+The smear check is not marginal — it **saturates**, every run. And the honest peer's positive
+relay holds `l_total` 0.4–1.6 above the threshold, every run. The target's belief does not move
+at all. This is a structural outcome, not a tuning question.
+
+### 4.2 duty — the arithmetic is exact, and the prediction asked the wrong question
+
+`P = 2` (`d_0801_055250`). Measured `l_self`, identical on both observers:
+
+| t (s) | residual | `l_self` | model |
+|---|---|---|---|
+| 59.82 | 0.4057 | 2.875 | — |
+| 59.92 | 0.0097 | 3.234 | 0.951·2.875 + 0.5 = **3.234** ✓ |
+| 60.02 | 0.4270 | 1.075 | 0.951·3.234 − 2.0 = **1.075** ✓ |
+| 60.12 | 0.0155 | 1.523 | 0.951·1.075 + 0.5 = **1.522** ✓ |
+| 60.22 | 0.4222 | −0.552 | 0.951·1.523 − 2.0 = **−0.552** ✓ |
+| 60.32 | 0.0635 | −0.052 | −0.552 + 0.5 (no decay below 0) = **−0.052** ✓ |
+| 60.42 | 0.4433 | −2.052 | −0.052 − 2.0 = **−2.052** ✓ |
+
+**The trust arithmetic reproduces to three decimals at every step.** `credit_ratio = 0.25` and
+the decay asymmetry both do exactly what their derivations say: net −1.5 per two-slot period.
+
+**But the registered prediction measured the wrong quantity.** It gave fixed points of −14.67
+(P = 2) and −12.13 (P = 10), both past `l_evict` — true given unlimited time, and irrelevant.
+Duty halves the accumulation rate (−0.75/slot against −2.0/slot for a continuous liar), so the
+belief layer needs ~2.7× longer, and **roster-exclusion arrives at ~11 slots and wins**: `l_self`
+stopped at −3.552 and `l_total` at −7.175, neither past −9.2, and the peer was then blocked by
+the silence path (abstain → 1).
+
+**So the duty arm's answer is neither "it works" nor "list it as a limitation".** The asymmetry is
+correct; the binding constraint is the *same race* as §3.4, and duty simply makes it easier for
+the attacker to win by halving how fast evidence accumulates. The duty arm, the a2 race-loss and
+the `corpseAnchor` decision are **one structural problem, not three**, and the useful fix is at
+the race rather than at `credit_ratio`.
+
+⏳ *duty P = 10, forged_obs, occl and the LIE_DEAF=0 control pending.*
 
 **Registered in advance for `duty`** (so that a surprise is recognisable as one): `dutyLying` is
 a fixed 50 % duty cycle — it lies for the first half of every `P`-slot window — so `P` changes
