@@ -1117,5 +1117,31 @@ if [ "${SOAK_S:-0}" != 0 ]; then
     die "soak produced $N_EV eviction(s) and $N_BL block(s) over ${SOAK_E}s with NO attacker present"
   fi
   say "soak: ${SOAK_E}s of sim walking over $LAP lap(s) — zero evictions, zero detector blocks"
+  # SEPARATION OVER THE SOAK, and it has to be reported HERE. The RESULT / TRUE BODY GAP summary
+  # above runs BEFORE this block, so on a soak run it describes only the outbound-and-home leg and
+  # says nothing about the ten-plus minutes of lapping that follow -- which is where the worst
+  # excursions actually are. Measured: the a1 soak printed "0.257 m worst" at 07:24:28 and then
+  # walked until 07:36:44, during which the fleet reached 0.1878 m.
+  #
+  # Reported, NOT enforced. The 0.90 abort is sampled once per 5 s poll while dist.csv is written
+  # at 20 Hz, and the excursions last about a second, so which runs trip it is mostly which polls
+  # happen to land -- turning that into a verdict here would re-score every earlier run in the
+  # matrix against a stricter rule than the one they were run under. That is an owner decision.
+  python3 - "$LOGD/dist.csv" "$LOGD/phys_gap.csv" "$SOAK_T0" "$DMIN_ABORT" <<'PY' | tee -a "$LOGD/$TAG.log"
+import csv, sys
+dist, phys, t0, thr = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
+d = [r for r in csv.DictReader(open(dist)) if float(r["t"]) >= t0]
+p = [r for r in csv.DictReader(open(phys)) if float(r["t"]) >= t0]
+if d:
+    w = min(d, key=lambda r: float(r["min_pair"]))
+    under = [r for r in d if float(r["min_pair"]) < thr]
+    print("  soak separation, over EVERY logged row (not the 5 s poll):")
+    print("    worst centre distance %s at t=%s  [%d of %d rows below the %.2f abort]"
+          % (w["min_pair"], w["t"], len(under), len(d), thr))
+if p:
+    q = min(p, key=lambda r: float(r["gap_min"]))
+    print("    worst TRUE body gap   %s at t=%s (pair %s)  -- contact is 0"
+          % (q["gap_min"], q["t"], q["pair"]))
+PY
 fi
 say "D PASS (rejoin=$REJOIN): victim=robot$VICTIM, evicted by $N_EVICT, home reached, arrive_dist=$ARRIVE_DIST, mission_denied=$MISSION_DENIED; logs $LOGD"

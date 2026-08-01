@@ -732,9 +732,36 @@ so counting evictions alone would miss precisely the near-misses this criterion 
 |---|---|---|---|---|---|
 | `d_0801_072156` | **a1** (gate2) | **675.3 s** | 8 | **0** | **0** |
 
-Zero and zero, over the whole log rather than only the soak window. Criterion 3 holds for a1 —
-**but read §6.2 before quoting that as a clean pass**, because the a2 soak found the mechanism
-that a1 escaped by four slots.
+Zero and zero, over the whole log rather than only the soak window. **Criterion 3, as written,
+holds for a1** — it asks about spurious *detector verdicts*, and there were none.
+
+⚠️ **It is not a statement that the fleet held separation, and it must not be quoted as one.**
+Two things were wrong with reading it that way, and both are mine:
+
+1. **The run's safety summary predates the soak.** `RESULT` / `TRUE BODY GAP` print *before* the
+   soak block, so the a1 run's cheerful "0.257 m worst" is stamped 07:24:28 and describes the
+   outbound-and-home leg only. The soak then walked until 07:36:44. Reading every logged row of
+   that window instead: **worst centre distance 0.8815 m, worst true body gap 0.1878 m.**
+2. **Every soak dipped below the abort threshold; only some got caught.**
+
+| soak | sim | worst `min_pair` | rows below the 0.90 abort | worst **true body gap** | verdict |
+|---|---|---|---|---|---|
+| a1 `d_0801_072156` | 802.5 s | 0.8815 | 20 / 13828 | **0.1878 m** | passed |
+| a2 #1 `d_0801_075028` | 668.6 s | 0.8624 | — | **0.1832 m** | partitioned (§6.2) |
+| a2 #2 `d_0801_082228` | 234.6 s | 0.8415 | 21 / 4163 | **0.2421 m** | aborted on the guard |
+
+The guard samples once per **5 s** poll; `dist.csv` is written at **20 Hz**; the excursions last
+about **1 s** (a1's ran t = 317.95–318.90). So which run trips the guard is mostly which polls
+happen to land — a1's excursion fell between two of them. The three runs' separation behaviour is
+the same; their verdicts are not.
+
+This is exactly the hazard §0 rule 2 exists for, and the harness was still sampling. `d_run.sh`
+now prints the soak's own worst separation over every logged row. Deliberately **reported, not
+enforced**: turning it into a verdict would re-score every earlier run in the matrix against a
+stricter rule than the one it was run under, which is an owner decision.
+
+**And read §6.2 before quoting a1 as a clean pass on the eviction question too** — the a2 soak
+found a partition mechanism that a1 escaped by four slots.
 
 ### 6.2 The a2 soak partitioned the fleet with no attacker in it — and it was not the belief layer
 
