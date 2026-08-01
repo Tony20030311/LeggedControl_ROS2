@@ -16,7 +16,7 @@ Spec §9's eight criteria, each of which was required to be *able* to fail. Seve
 | 2 | conservative anchoring keeps the body gap from shrinking | ⚠️ **does not cover the corpse anchor** (registered Task 13). A2's advantage comes from *winning a race*, and the harness under-models the attacker on that path, so its numbers are a **lower bound** |
 | 3 | NO_KILL soak, zero false positives | ❌ **a2 partitioned the fleet with no attacker** — not the belief layer (`L` flat at 4.600 vs −9.20) but a correlated barrier stall the *silence* rule resolves by eviction (§6.2). a1's 675.3 s pass had **4 slots of margin** on the same mechanism |
 | 4 | occlusion: abstention positively recorded, `L` unchanged, resumption | ✅ **and the criterion's wording is wrong** — see §5.1, it should read "suspicion does not decay" |
-| 5 | smear: honest peer never evicted, smearer caught | **half.** Target never blocked (3/3) ✅; smearer never convicted ❌ — spec §10's declared N = 3 blind spot, not a tuning failure |
+| 5 | smear: honest peer never evicted, smearer caught | **half, and the recorded reason was wrong.** Target never blocked (3/3 at N=3, 1/1 at N=5) ✅; smearer never convicted ❌ — **not** an N = 3 blind spot but an inequality between three constants, `floor + l_max = −6.6 > −9.2 = l_evict`, so a peer honest about *itself* is structurally unconvictable at **any** N. N = 5 is strictly **worse** (§8b.1) |
 | 6 | asymmetric credit convicts an intermittent liar | ❌ **evades when the lying burst is shorter than the conviction depth** (P = 2: 0/3; P = 10: 1/3) |
 | 7 | the fixed-point correction stops the stale-vote deadlock | ❌ **it does not** — `majority_excluded` has no fixed point on the symmetric input and the loop bound returns the maximally wrong answer, wedging the fleet (§6) |
 | 8 | regression: 44 oracle + ctest + G1 bit-identical | ✅ 44 passed, 6/6, `worst max\|delta\| = 0` |
@@ -917,7 +917,7 @@ the quoted figure would have been an ADMM convergence difference of 0.05 rounds.
 
 ---
 
-## 8b. Five dogs ⏳
+## 8b. Five dogs ✅
 
 Owner-approved, and the reason it is worth the runs is criterion 5. The smear arm half-failed at
 N = 3 — the target was never blocked (3/3) but the smearer was never convicted — and spec §10
@@ -981,7 +981,73 @@ and both loggers all work at five, and the belief layer produces no false positi
 out-and-back. It does **not** yet say anything about the N = 3 blind spot, which needs the smear
 arm.
 
-⏳ *`ARM=smear` at N = 5 in progress — that is the run this section exists for.*
+### 8b.1 The smear result — and the N = 3 explanation on record is **wrong**
+
+`d_0801_081301`, `ARM=smear` at N = 5. robot2 keeps its own position honest and fabricates a
+0.30 m (0.4243 m displaced) sighting of robot1, with **three** third-party observers that do not
+exist at N = 3.
+
+| | result |
+|---|---|
+| harness verdict | **`D PASS`**, `arrive_dist` 0.266, worst true body gap **0.433 m** |
+| criterion 5(a) — smeared peer never blocked | ✅ `plan covers 5 robot(s)` on both legs; robot1 never evicted or rejected |
+| criterion 5(b) — smearer convicted | ❌ **no**, and not for the reason on record |
+| smear-check coverage | **100 %** — 8667–8715 relayed reports per agent, every one independently checkable |
+| `n_refuted` | **0** across all five agents (correct: a 0.42 m displaced position is still geometrically *plausible*) |
+
+**The throttled log cannot answer this, and nearly cost the diagnosis.** `belief robotJ …` is a
+single `RCLCPP_INFO_THROTTLE` statement, so within each 1 s window only the first peer in
+iteration order prints — always the agent's lowest-id peer. Every agent's view of robot2 is
+invisible in the log except agent1's, and agent1 is the smeared peer, which *skips* reports about
+itself (`if (j == self_id_ || j == i) continue`). The answer comes from the unthrottled per-peer
+telemetry in `stats.csv`'s `tel` column (`peer:residual:L_self:total:abstain`).
+
+**Belief in the smearer, minimum over each run:**
+
+| run | observer | first-hand `L_self` | `total` | threshold |
+|---|---|---|---|---|
+| N = 3 `d_0801_054738` | agent3 (third party) | **−11.200** | −8.806 | −9.2 |
+| N = 3 `d_0801_055013` | agent3 (third party) | **−11.200** | −7.433 | −9.2 |
+| N = 5 `d_0801_081301` | agent3 | **−11.200** | **−6.600** | −9.2 |
+| N = 5 | agent4 | **−11.200** | **−6.600** | −9.2 |
+| N = 5 | agent5 | **−11.200** | **−6.600** | −9.2 |
+
+**The smear check works perfectly.** Every third party drives its first-hand belief to the floor,
+at every fleet size. What blocks conviction is the *total*.
+
+**And more witnesses made it worse.** At N = 3 the smearer came within **0.394** of conviction; at
+N = 5 it sits **2.600** away. Adding two independent witnesses moved it 2.2 units *further* from
+being caught.
+
+#### Why — three constants, and an inequality that cannot be satisfied
+
+```
+L_self floor            = l_evict − clamp_step = −9.2 − 2.0 = −11.2   (trust.hpp:273)
+max relay sum           = +l_max               =        +4.6          (trust.hpp:298)
+worst achievable total  = −11.2 + 4.6          =        −6.6
+conviction threshold    = l_evict              =        −9.2
+                          −6.6 > −9.2  ⟹  NOT CONVICTABLE
+```
+
+`trust_total` adds the first-hand belief to a relay sum clamped to ±`l_max`. The smearer's *own*
+position is honest, so every agent's sighting of it corroborates its own claim and every relay
+entry about it is **positive**. First-hand suspicion saturates at the floor; corroboration of its
+honest self-report is then added on top, up to +4.6.
+
+The measured N = 5 minimum is **−6.600**, matching `floor + l_max` **exactly, to three decimals**,
+on all three third parties independently.
+
+So criterion 5(b) **cannot pass with these constants, at any fleet size**. It is not a blind spot
+of N = 3 — larger N makes it strictly tighter, because more reporters saturate the +4.6 cap
+sooner. At N = 3 the relay sum happened not to saturate, which is the only reason those runs got
+within 0.4 of the threshold and made the fleet-size story look plausible.
+
+**A peer that lies only about others, while keeping its own position honest and corroborated, is
+structurally immune to conviction.** Making it convictable needs `l_max ≤ clamp_step` (2.0, from
+4.6), or a floor below −13.8 — a calibration change to the system under test, so it is registered
+as an owner decision rather than applied here. The `l_max = 4.6` cap exists for a stated reason
+(trust.hpp:289–294: stopping N−1 hearsay accusers from evicting on pure hearsay at N ≥ 4), so the
+two requirements are in direct tension and the resolution is a design call, not a retune.
 
 ---
 
