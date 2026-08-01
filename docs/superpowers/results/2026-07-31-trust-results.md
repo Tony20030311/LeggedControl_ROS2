@@ -1102,4 +1102,8 @@ sees what it produced.
 
 | `d_0801_075028` | a2 soak | **FAIL — recorded as an outcome, not excluded** | The fleet partitioned with no attacker in it. One missed 20 ms exchange left the three agents waiting on three different barrier phases and they never resynchronised; robot2's silence counter tripped first and evicted the other two, who then rejected its roster by design and evicted it back. **Belief never convicted anybody** (`L` flat at 4.600 vs −9.20) and there was no WBC deactivation. Full mechanism in §6.2. Its first 355 s of clean three-agent traffic are what §8.3's A/B is computed from. |
 
+| `d_0801_080532` | N=5 a2 `NO_KILL` | **REJECTED — harness** | Collision guard read `min_pair` from column 8 by position, which at N = 5 is `x4`. Aborted on `pairwise 0.8108 < 0.90` at the instant robot4 was at x = 0.8108; the run's worst real `min_pair` was 1.4468 and its worst body gap 0.6007 m. §9 #7. |
+| `d_0801_080904` | N=5 a2 `NO_KILL` | **PASS** | `shape=V5 -> plan for 5 dog(s)`, both legs, `arrive_dist` 0.382, worst body gap 0.4432 m, zero evictions, zero blocks. §8b. |
+| `d_0801_081301` | N=5 `smear` | **PASS (harness) / criterion 5(b) fails** | Smeared peer never blocked; smearer never convicted, and the telemetry shows why it never could be: `floor + l_max = −6.6 > −9.2`. §8b.1. |
+
 ⏳ *Matrix attempts appended as they complete.*
