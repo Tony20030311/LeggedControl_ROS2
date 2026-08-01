@@ -19,7 +19,7 @@ data**; criterion 2's is a lower bound rather than a settled value, for the reas
 | 2 | conservative anchoring keeps the body gap from shrinking | ⚠️ **does not cover the corpse anchor** (registered Task 13). A2's advantage comes from *winning a race*, and the harness under-models the attacker on that path, so its numbers are a **lower bound** |
 | 3 | NO_KILL soak, zero false positives | ❌ **a2 partitioned the fleet with no attacker** — not the belief layer (`L` flat at 4.600 vs −9.20) but a correlated barrier stall the *silence* rule resolves by eviction (§6.2). a1's 675.3 s pass had **4 slots of margin** on the same mechanism, and separately is **not** evidence the fleet held separation: all three soaks reached body gaps of 0.18–0.24 m (§6.1) |
 | 4 | occlusion: abstention positively recorded, `L` unchanged, resumption | ✅ **and the criterion's wording is wrong** — see §5.1, it should read "suspicion does not decay" |
-| 5 | smear: honest peer never evicted, smearer caught | **half, and the recorded reason was wrong.** Target never blocked (3/3 at N=3, 1/1 at N=5) ✅; smearer never convicted ❌ — **not** an N = 3 blind spot but an inequality between three constants, `floor + l_max = −6.6 > −9.2 = l_evict`, so a peer honest about *itself* is structurally unconvictable at **any** N. N = 5 is strictly **worse** (§8b.1) |
+| 5 | smear: honest peer never evicted, smearer caught | **criterion rewritten, then met.** The recorded reason was wrong — not an N = 3 blind spot but `floor + l_max = −6.6 > −9.2 = l_evict` (§8b.1). **Fixed in `153429e`** by splitting actor trust from reporter reputation: the smearer is deliberately *not* evicted (its position is honest, so it is not a collision risk) and is instead **silenced** — measured testimony weight **0.000** on every third party, target never blocked (§8c) |
 | 6 | asymmetric credit convicts an intermittent liar | ❌ **evades when the lying burst is shorter than the conviction depth** (P = 2: 0/3; P = 10: 1/3) |
 | 7 | the fixed-point correction stops the stale-vote deadlock | ❌ as measured — `majority_excluded` had no fixed point on the symmetric input and the loop bound returned the maximally wrong answer, wedging the fleet (§6). **Fixed in `c308787`** (exclude nobody on non-convergence); the matrix results above predate the fix |
 | 8 | regression: 44 oracle + ctest + G1 bit-identical | ✅ 44 passed, 6/6, `worst max\|delta\| = 0` |
@@ -1085,6 +1085,76 @@ structurally immune to conviction.** Making it convictable needs `l_max ≤ clam
 as an owner decision rather than applied here. The `l_max = 4.6` cap exists for a stated reason
 (trust.hpp:289–294: stopping N−1 hearsay accusers from evicting on pure hearsay at N ≥ 4), so the
 two requirements are in direct tension and the resolution is a design call, not a retune.
+
+---
+
+## 8c. The fix, and what it measures ✅
+
+Two of the failures above are now fixed, both after the matrix was complete, so **every result in
+§§3–8b predates them**. Neither changes a number above; both are listed here with the evidence.
+
+### 8c.1 `majority_excluded` — `c308787`
+
+Non-convergence returned whichever parity the loop bound stopped on, which at n = 3 was "exclude
+everybody". Now it excludes **nobody**: self-contradictory ballots are not evidence.
+
+Checked case by case against the old function over all **20 assertions** in the suite — **old wrong
+on 3, new wrong on 0, behaviour changed on exactly those 3.** At **n = 4 the old code was
+accidentally right**, because the alternation's parity differs with fleet size; both parities are
+now pinned, alongside a genuine unanimous verdict so the guard cannot swallow a real eviction.
+
+### 8c.2 The actor / reporter split — `153429e`
+
+One scalar carried three roles: what a peer did, how good a witness it is, and how much its
+testimony counts. Splitting it follows **Zikratov's own Definitions 1 and 2** — trust is about the
+*object* of a vote, reputation is about the *voter* — and follows the **harm**:
+
+> **Lying about where *you* are shrinks the barrier and can put a body into another robot, so it
+> stays evictable. Lying about where *someone else* is cannot — the barrier uses positions, and
+> this peer's position is honest — so the answer is to stop counting its testimony, not to remove
+> a working robot and leave a keep-out disc in the peg field.**
+
+`l_act_` takes the first-hand position residual and decides eviction; `l_rep_` takes the smear
+check and weights relayed testimony.
+
+**Measured live** (six-field `tel` column, minimum over each run):
+
+| run | observer | `l_act` | `l_rep` | testimony weight | evicted? |
+|---|---|---|---|---|---|
+| smear N=3 `d_0801_183640` | agent3 (third party) | +2.059 | **−11.200** | **0.000** | no |
+| | agent1 (the smeared peer) | +1.862 | +2.059 | 2.059 | no |
+| smear N=5 `d_0801_184209` | agent3 | +4.600 | **−11.200** | **0.000** | no |
+| | agent4 | +4.375 | **−11.200** | **0.000** | no |
+| | agent5 | +4.600 | **−11.200** | **0.000** | no |
+| | agent1 (the smeared peer) | +4.375 | +4.160 | 4.160 | no |
+
+`l_rep` floors at exactly **−11.200** = `l_evict − clamp_step`, on every third party, at both fleet
+sizes. Testimony weight is exactly **0.000**, not merely small. agent1 is unaffected because it
+skips reports about itself — by design, and the reason N = 3 has only one third party at all.
+
+The smeared peer **robot1 was never convicted by anyone** (`total` ≥ +8.975 against −9.2), and both
+runs are `D PASS` with **zero evictions and zero blocks**.
+
+**The headline result is untouched**, which is the regression that mattered:
+
+| | before the split | after |
+|---|---|---|
+| a2 conviction latency | 5 slots | **5 slots** (`d_0801_183953`, agent1 and agent3, 0.50 s each) |
+
+### 8c.3 Two errors in my own analysis, both caught before the code changed
+
+Recorded because the method is the point: an independent model of the arithmetic was written and
+run **before** touching the node, and it caught both.
+
+1. **The first model hardcoded the relay term as positive corroboration.** That made the a2
+   position-forgery arm come out *not convicted*, contradicting a measured 5-slot result — which is
+   how the error surfaced. The relayed residual is ‖i's sighting of j − j's own claim‖, so it
+   tracks the **position** lie, not the smear.
+2. **With that fixed, a regression I had already reported turned out not to exist.** I had claimed
+   a combined sub-threshold position lie plus smearing would escape conviction after the split.
+   The current design does not convict that case either (−6.6, identical to a pure smear). Across
+   six scenarios the eviction verdict is **identical before and after**; the only thing that moves
+   is the smearer's testimony weight.
 
 ---
 
