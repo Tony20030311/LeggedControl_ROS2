@@ -247,6 +247,28 @@ measures *time*-to-evict and how much of the 0.433 m buffer the intermittent lie
 not whether conviction happens. A non-conviction would falsify the `credit_ratio = 0.25`
 derivation.
 
+**Registered in advance for `smear`.** The attacker keeps its own position honest and fabricates a
+0.30 m false sighting of survivor 1 (offset in x and y, so a 0.4243 m discrepancy). Each survivor
+that independently observed the target at the reported slot runs `smear_llr`, which is
+`trust_llr` of that discrepancy charged **to the reporter** — 0.4243 m is far past the 0.15 m
+decision boundary, so it saturates at the full −2.0 every checked report, exactly like a position
+lie. From the +4.6 ceiling that is 4.6 → 2.375 → 0.259 → −1.754 → −3.754 → −5.754 → −7.754 →
+−9.754, i.e. **conviction of the smearer at step 7 on first-hand evidence alone, and sooner once
+the two survivors relay about each other** (§3.3a measured that acceleration at ~1.0 per slot).
+Meanwhile the relay term the smear is trying to plant on survivor 1 is capped at the smearer's
+own credibility, which is collapsing, so it should shrink to nothing.
+
+Predicted: **smearer convicted, target never blocked.** A blocked target would falsify
+acceptance criterion 5.
+
+⚠️ This arm **must run with `LIE_DEAF=0`**, and that was found by reading the evidence path rather
+than by spending runs on it. A deafened attacker's `peer_xnow()` empties, so its outgoing
+`ev_peer` array is empty, and `applyFakeEvidence` corrupts a sighting *already in* the message
+rather than fabricating one — the smear channel would transmit nothing and the arm would report
+"no honest peer was evicted" for entirely the wrong reason. That is the same shape of error
+review round 2 caught once already (I3′, where the smear attacker was also sending the position
+lie).
+
 **`forged_obs` runs in both GID-pin orderings.** The late impostor loses the latch and is
 rejected; the first mover wins it and the genuine publisher is dropped instead. The second is
 **not a bug to be hidden** — it is the honest boundary of a trust-on-first-use pin and must be
