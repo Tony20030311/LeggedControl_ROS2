@@ -162,24 +162,40 @@ send_formation_goal() {
 }
 
 fleet_centroid() {  # echoes "cx cy" over the LIVE-or-not robots given as $1 (space separated)
-  # A robot we could not read is DROPPED from the mean, not substituted. It used to default to
-  # (99,99), and `ros2 topic echo --once` losing the DDS discovery race is a documented flake
-  # here — so one missed read moved the centroid to ~34 m and every "have we passed x=N yet"
-  # test in the callers fired instantly. Measured 2026-07-29: 2 of 7 LIE runs began their attack
-  # while the fleet was still at x~2, and nothing in dist.csv records where the attack started,
-  # so the runs looked normal and their numbers were quietly incomparable.
-  # Unknown must fail a threshold, never pass it: with no robot readable this echoes nan, which
-  # loses every `>=` and leaves the caller waiting (and eventually timing out loudly).
-  local POSLINE="" C
-  for r in $1; do
-    C=($(odom_field /robot$r/controller/odom))
-    [ -n "${C[0]:-}" ] || C=($(odom_field /robot$r/controller/odom))   # one retry for the race
-    [ -n "${C[0]:-}" ] && POSLINE="$POSLINE ${C[0]} ${C[1]}"
-  done
-  python3 -c "
-v=[float(x) for x in '''$POSLINE'''.split()]; pts=list(zip(v[::2],v[1::2]))
-print(f'{sum(p[0] for p in pts)/len(pts):.3f} {sum(p[1] for p in pts)/len(pts):.3f}' if pts
-      else 'nan nan')"
+  # Read from dist.csv, the same source min_pair() below already uses, NOT from three
+  # `ros2 topic echo --once` processes. Two reasons, both measured:
+  #
+  #   CORRECTNESS. Each echo pays its own DDS discovery and can lose the race; the previous
+  #   version worked around that with a retry and by DROPPING unreadable robots from the mean
+  #   (it used to substitute (99,99), which moved the centroid to ~34 m and fired every
+  #   "have we passed x=N yet" test instantly -- 2 of 7 LIE runs on 2026-07-29 began their
+  #   attack while the fleet was still at x~2, and the runs looked normal afterwards).
+  #
+  #   LATENCY, which turned out to be the same bug wearing a different hat. Three echoes with
+  #   a 5 s timeout each can take ~15 s, and the fleet walks 6 m in that time: on 2026-08-01
+  #   a run asked for KILL_AT_X=3.0 and triggered at centroid x=6.9. Where the attack lands
+  #   decides what the run tests, so a centroid that takes 15 s to read is not fit for the job.
+  #   The dist logger already writes every robot's position at 20 Hz.
+  #
+  # Staleness is a real failure mode (a dead logger would otherwise freeze the centroid at a
+  # position that silently passes every threshold), so a file older than 2 s is treated as
+  # unreadable. Unknown must FAIL a threshold, never pass it: this echoes nan, which loses
+  # every `>=` and leaves the caller waiting and eventually timing out loudly.
+  python3 - "$LOGD/dist.csv" $1 <<'PY'
+import csv, os, sys, time
+path, ids = sys.argv[1], sys.argv[2:]
+try:
+    if time.time() - os.path.getmtime(path) > 2.0:
+        raise OSError("stale")
+    with open(path) as f:
+        row = None
+        for row in csv.DictReader(f):
+            pass
+    pts = [(float(row["x%s" % i]), float(row["y%s" % i])) for i in ids]
+    print("%.3f %.3f" % (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)))
+except Exception:
+    print("nan nan")
+PY
 }
 
 min_pair() {  # newest min pairwise centre distance from the dist logger (col 8 == 3 robots)

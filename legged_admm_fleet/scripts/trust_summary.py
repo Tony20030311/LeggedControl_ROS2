@@ -174,12 +174,37 @@ for r in st:
             tel.append((fnum(r["t"]), r["robot"], p[0], fnum(p[1]), fnum(p[2]),
                         fnum(p[3]), int(fnum(p[4], 0))))
 
-# Attack onset in SIM time: the first sample whose residual is past anything clean flight ever
-# produced (0.0890 m, calibration doc). Not the throttled COMPROMISED log line, which is wall
-# clock, and not d_run.sh's own timestamp, which is the moment it ASKED for the lie.
+# Attack onset in SIM time, per observer: the first of ONSET_RUN consecutive samples whose
+# residual is past anything clean flight produced (0.0890 m, calibration doc). Not the throttled
+# COMPROMISED log line, which is wall clock, and not d_run.sh's own timestamp, which is the
+# moment it ASKED for the lie.
+#
+# CONSECUTIVE, not a single sample, and the reason is measured rather than precautionary: in
+# a2 rep 2 agent3 recorded one isolated residual of 0.1160 at t=66.35 with its neighbours at
+# 0.012-0.026, i.e. 2.9 s before the attack, which a single-sample rule read as onset and turned
+# agent3's true 0.5 s eviction latency into a reported 3.37 s -- a fabricated 6.7x spread
+# between two observers of the same attack. The belief layer itself convicts only on a run of
+# consecutive full penalties, so requiring a run here matches what it is measuring.
 CLEAN_MAX = 0.0890
-onset = min((t for t, _o, p, r_, *_ in tel if p == victim and r_ > CLEAN_MAX),
-            default=float("nan"))
+ONSET_RUN = 3
+
+
+def onset_of(seq):
+    """First t starting a run of ONSET_RUN consecutive over-threshold residuals."""
+    hits = 0
+    for t, r_ in seq:
+        if r_ == r_ and r_ > CLEAN_MAX:
+            hits += 1
+            if hits == ONSET_RUN:
+                return t - (ONSET_RUN - 1) * 0.1
+        else:
+            hits = 0
+    return None
+
+
+onset = min((o for o in
+             (onset_of(sorted([(x[0], x[3]) for x in tel if x[2] == victim and x[1] == ob]))
+              for ob in {x[1] for x in tel}) if o is not None), default=float("nan"))
 # v_div: how fast claim and truth diverge. The harness injects a STEP, so this is a difference
 # quotient across the step, not a ramp rate -- reported for the record and flagged as such.
 #
@@ -200,13 +225,18 @@ v_div_step = float("nan")
 for obs_id in {x[1] for x in tel}:
     seq = sorted([x for x in tel if x[2] == victim and x[1] == obs_id and x[3] == x[3]],
                  key=lambda x: x[0])
+    # Anchored on the SAME confirmed onset time-to-evict uses, not on the first single sample to
+    # cross the threshold. Anchoring on a bare crossing picked up the isolated 0.1160 m noise
+    # spike described above and reported v_div_step = 0.306 m/s -- a number that looks like it
+    # sits just inside the 0.31 m/s design envelope while measuring nothing but noise.
+    t_on = onset_of([(x[0], x[3]) for x in seq])
     for a, b in zip(seq, seq[1:]):
         dt = b[0] - a[0]
         if dt < 0.05:    # one slot is 0.1 s; anything shorter is a duplicate publish, not a step
             continue
         q = abs(b[3] - a[3]) / dt
         v_div_max = q if v_div_max != v_div_max else max(v_div_max, q)
-        if a[3] <= CLEAN_MAX < b[3] and v_div_step != v_div_step:
+        if t_on is not None and abs(b[0] - t_on) < 0.05 and v_div_step != v_div_step:
             v_div_step = q
 
 # TIME-TO-EVICT, per survivor, in SIM time, exactly (spec §9 protocol item 5). Both ends come
@@ -222,7 +252,7 @@ for obs_id in {x[1] for x in tel}:
 tte = {}
 for obs_id in {x[1] for x in tel}:
     seq = sorted([x for x in tel if x[2] == victim and x[1] == obs_id], key=lambda x: x[0])
-    t_on = next((t for t, _o, _p, r_, *_ in seq if r_ == r_ and r_ > CLEAN_MAX), None)
+    t_on = onset_of([(x[0], x[3]) for x in seq])
     t_blk = next((t for t, _o, _p, _r, _ls, _lt, ab in seq if ab == 1 and (t_on is None or t >= t_on)),
                  None)
     if t_on is not None and t_blk is not None:
@@ -291,3 +321,41 @@ for o in sorted(tx_rate):
           (o, f(tx_rate[o], 0), f(rx_rate[o], 0), comm_window[o]))
 print("belief telemetry %d per-(slot,observer,peer) samples%s" %
       (len(tel), "" if tel else "   <- none: beliefStep never ran (A0/A1 broadcast no evidence)"))
+
+# ---- occlusion (spec §9 protocol item 6): a POSITIVE record, never an absence of log lines ----
+# Reported for every arm that has belief telemetry, not only the occl probe: incidental occlusion
+# happens in the peg field and a reader is entitled to see it. The acceptance question is
+# specifically about the LONGEST window in which EVERY observer abstained with code 5, because
+# one blind observer is the ordinary case and proves nothing.
+ABSTAIN = {0: "evidence", 1: "peer_blocked", 2: "no_fresh_claim", 3: "no_obs_buffer",
+           4: "out_of_range", 5: "occluded"}
+if tel:
+    observers = sorted({x[1] for x in tel})
+    by_t = {}
+    for t, o, p, _r, l_self, _lt, ab in tel:
+        if p == victim:
+            by_t.setdefault(round(t, 1), {})[o] = (ab, l_self)
+    best, cur = [], []
+    for t in sorted(by_t):
+        v = by_t[t]
+        if len(v) == len(observers) and all(a == 5 for a, _ in v.values()):
+            cur.append((t, v))
+        else:
+            if len(cur) > len(best):
+                best = cur
+            cur = []
+    if len(cur) > len(best):
+        best = cur
+    hist = {}
+    for _t, o, p, _r, _ls, _lt, ab in tel:
+        if p == victim:
+            hist[ABSTAIN[ab]] = hist.get(ABSTAIN[ab], 0) + 1
+    print("abstain codes    %s   [about robot%s, every observer, whole run]" % (hist, victim))
+    if best:
+        span = best[-1][0] - best[0][0]
+        moved = {o: max(abs(w[o][1] - best[0][1][o][1]) for _t, w in best) for o in observers}
+        print("OCCLUSION window %.2f s (%d slots) with EVERY observer at code 5; |dL_self| over it: "
+              "%s   <- must be 0.000: suspicion does not decay while unobservable" %
+              (span, len(best), ", ".join("agent%s %.3f" % (o, m) for o, m in sorted(moved.items()))))
+    else:
+        print("OCCLUSION window none (no slot had every observer reporting code 5)")

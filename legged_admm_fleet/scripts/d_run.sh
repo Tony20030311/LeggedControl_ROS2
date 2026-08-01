@@ -27,6 +27,10 @@ DMIN_ABORT=${DMIN_ABORT:-0.90}
 # arm plants a keep-out that can trip that one) -- a number is comparable across arms, a boolean
 # that can mean two different things is not.
 ARRIVE_DIST=99
+# Set by walk_until when the goal turns out to be inside a corpse keep-out. A COUNTED OUTCOME,
+# not something to be inferred later from a failure message: "the lie moved a 1.63 m exclusion
+# disc onto our own goal" is a result the table has to be able to tally.
+MISSION_DENIED=0
 REJOIN=${REJOIN:-0}
 SURVIVORS=$(echo $ROBOTS | tr ' ' '\n' | grep -vx "$VICTIM" | tr '\n' ' ')
 
@@ -44,15 +48,49 @@ case "$ARM" in
   smear)      OBS_GATE2=true  ;;   # A2 + attacker fabricates a sighting of an honest peer
   duty)       OBS_GATE2=true  ;;   # A2 + attacker lies only every other window (inject_duty_cycle)
   forged_obs) OBS_GATE2=true  ;;   # A2 + attacker also impersonates a peer's observation channel
-  *) die_infra "unknown ARM='$ARM' (want a0|a1|a2|smear|duty|forged_obs)" ;;
+  # The occlusion probe (spec §9 protocol item 6 / acceptance 4). A2's detector, but log-only:
+  # the attacker has to SURVIVE long enough to be walked behind a pillar, and A2 convicts in
+  # 5 slots. Slowing the lie instead is not an option -- the graded band is 5.33 mm wide, so
+  # any lie a noise floor of sigma=0.02 does not swallow already earns the full -2.0 penalty.
+  # Nor can the probe use an honest peer: an unsuspected peer sits at the +4.6 ceiling, and a
+  # saturated value is "numerically unchanged" whether or not evidence is arriving, so it cannot
+  # discriminate. The peer must be MID-DESCENT when it hides, which needs blocking disarmed.
+  occl)       OBS_GATE2=true  ;;
+  *) die_infra "unknown ARM='$ARM' (want a0|a1|a2|smear|duty|forged_obs|occl)" ;;
 esac
 # a0 must survive its own breach (design spec protocol item 3): its own detector still computes
 # and logs a verdict, but is forced never to act on it, for the whole run, not just from the
 # trigger -- the same "measure before you block" default admm_agent_node.cpp ships if unset.
 # NOTE: there is no EXPECT_EVICT here anymore (review round 2, C1/C2) -- see the eviction-check
 # block below for why "will an EVICT line appear" is not a per-arm question at all.
-if [ "$ARM" = a0 ]; then DETECT_LOG_ONLY=true
+if [ "$ARM" = a0 ] || [ "$ARM" = occl ]; then DETECT_LOG_ONLY=true
 else DETECT_LOG_ONLY=false; fi
+# Deafness is the DEFAULT because a liar that still runs its own avoidance is a "cooperative
+# liar" and the separation that survives is then partly its doing. Two arms need it off, and in
+# both cases it is a property of what the arm measures, not a convenience:
+#   smear -- a deafened attacker's peer_xnow() empties, so its outgoing ev_peer array is empty,
+#            and applyFakeEvidence corrupts a sighting ALREADY IN the message rather than
+#            fabricating one. The smear channel would transmit nothing and the arm would report
+#            "no honest peer was evicted" for entirely the wrong reason.
+#   occl  -- deafness makes the attacker announce a roster excluding the survivors, they block
+#            it as "left the consensus" (a path detection_log_only does not gate), evidence
+#            stops with abstain=1, and there is nothing left to observe going behind a pillar.
+# Overridable, so the LIE_DEAF=0 control arm can also be run against a0/a2 (see the eviction
+# block below for why that configuration is the only genuinely undefended control).
+case "$ARM" in
+  smear|occl) LIE_DEAF=${LIE_DEAF:-0} ;;
+  *)          LIE_DEAF=${LIE_DEAF:-1} ;;
+esac
+# forged_obs, FIRST-MOVER case (FORGED_FIRST=1). Task 10 item 4: one knob, two cases separated
+# only by WHEN it is set. Set at runtime (the default path, in the arm_attack.py dispatch) the
+# attacker arrives after the real Gazebo publisher and the GID pin rejects it -- the defence's
+# coverage case. Given at CONSTRUCTION it publishes first, WINS the pin, and the genuine
+# publisher is the one dropped. That second outcome is the honest limit of trust-on-first-use
+# and has to be run and reported, not designed around.
+if [ "${FORGED_FIRST:-0}" = 1 ]; then
+  [ "$ARM" = forged_obs ] || die_infra "FORGED_FIRST=1 only means anything with ARM=forged_obs"
+  LAUNCH_EXTRA="forged_obs_attacker:=$VICTIM forged_obs_target:=${FORGED_TARGET:-1} $LAUNCH_EXTRA"
+fi
 # Task 11 item 7: must vary per run, or a false-positive/refutation-rate measurement is n=1 in
 # the only dimension that produces one (admm::obs_noise). $RANDOM is bash's own PRNG.
 OBS_NOISE_SEED=${OBS_NOISE_SEED:-$RANDOM}
@@ -132,6 +170,25 @@ print('%.4f' % min(math.hypot(float(r['x%d' % i]) - float(r['x%d' % j]),
 PY
 }
 
+# Is the commanded goal inside a corpse keep-out this run actually built? Echoes "anchor r_eff"
+# and returns 0 when it is. Both numbers come from the EVICT line the AGENTS logged ("corpse CBF
+# at predicted rest (x,y) r=1.03"), so the only constant duplicated here is robot_margin, which
+# the agent adds on top of that radius.
+ROBOT_MARGIN=${ROBOT_MARGIN:-0.60}   # admm_agent_node.cpp's robot_margin (swing-foot FK envelope)
+goal_fenced() {  # $1,$2 = goal
+  python3 - "$LOGD/admm.log" "$1" "$2" "$ROBOT_MARGIN" <<'PY' 2>/dev/null
+import math, re, sys
+txt = open(sys.argv[1], errors="replace").read()
+gx, gy, margin = float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+for x, y, r in re.findall(r"corpse CBF at predicted rest \(([-\d.]+),([-\d.]+)\) r=([\d.]+)", txt):
+    reff = float(r) + margin
+    if math.hypot(float(x) - gx, float(y) - gy) < reff:
+        print("anchor (%s,%s) r_eff %.2f" % (x, y, reff))
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
 walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
   # `local` is load-bearing: without it this clobbered the caller's saved home coordinates and
   # the return leg became "walk to where you already are" — a PASS that tested nothing.
@@ -169,19 +226,31 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
     # destabilising a robot hard enough to trip the WBC. Cannot distinguish -> fail closed.
     gz_deactivated && die "WBC deactivated mid-walk"
     [ "$(python3 -c "print(1 if $D<0.45 else 0)")" = 1 ] && return 0
-    # A SLOT can be inside the corpse keep-out, and then the centroid can never reach the goal.
+    # A GOAL can be inside the corpse keep-out, and then the centroid can never reach it.
     # Measured (late kill at x=15.3): corpse at (16.16,-0.55), COL2 rear slot at (17.24,-0.02) is
-    # 1.20 m away against an effective 1.30 m (r 0.70 + robot_margin 0.60) -- unreachable BY
-    # DESIGN. The fleet parked at 0.48 m for 2.5 min, safe and still tracking; hand-sending the
-    # next goal made it walk off immediately, so this is arrival, not a freeze.
-    # The bound is derived, not tuned: one blocked dog is displaced by at most the effective
-    # radius 1.30 m, which moves a two-dog centroid by at most half of that. Past 0.65 m no
-    # blocked slot explains it and the fleet really is stuck -- keep failing there.
+    # 1.20 m away against an effective 1.30 m -- unreachable BY DESIGN. The fleet parked at
+    # 0.48 m for 2.5 min, safe and still tracking; hand-sending the next goal made it walk off
+    # immediately, so this is arrival, not a freeze.
+    #
+    # This used to be a distance BOUND: accept below 0.65 m, "half the 1.30 m effective corpse
+    # radius". Two things were wrong with it. 1.30 is the STATIC corpse (D_MIN - robot_margin
+    # = 0.70, plus the agent's own 0.60); a peer evicted for LYING is still walking, so
+    # corpse_keepout adds MAX_VX*TAU_REACT and the radius is 1.63 -- every LIE arm was being
+    # judged by the wrong number. And the corrected bound would have been 0.815 against a run
+    # that finished at 0.820 (d_0801_041928), which is a 5 mm miss and a sign that a worst-case
+    # bound is the wrong SHAPE of question entirely.
+    #
+    # So ask the question the run can actually answer. The agents log the anchor and the radius
+    # they chose; the goal is right here. If the goal is inside the disc it is unreachable, no
+    # threshold required, and if it is not then no amount of stalling should be forgiven. One
+    # rule, read off this run's own geometry, with the constant deleted rather than re-derived.
     if [ "$(python3 -c "print(1 if $BEST-$D > 0.03 else 0)")" = 1 ]; then BEST=$D; STALE=0
     else STALE=$((STALE + 1)); fi
-    if [ "$STALE" -ge 6 ] && [ "$(python3 -c "print(1 if $D<0.65 else 0)")" = 1 ]; then
-      say "  converged at dist=$D (>0.45) with no progress for ${STALE} polls — a slot is inside a"
-      say "  keep-out; accepting as arrived (bound 0.65 = half the 1.30 m effective corpse radius)"
+    if [ "$STALE" -ge 6 ] && FENCE=$(goal_fenced "$1" "$2"); then
+      say "  no progress for ${STALE} polls and the goal ($1,$2) is INSIDE a corpse keep-out"
+      say "  [$FENCE] — unreachable by construction. MISSION DENIED BY THE FENCE; accepting as"
+      say "  converged at dist=$D so the run still reports its safety numbers."
+      MISSION_DENIED=1
       return 0
     fi
     sleep 5
@@ -461,8 +530,13 @@ if [ -n "${LIE:-}" ]; then
       ;;
     forged_obs)
       FORGED_TARGET=${FORGED_TARGET:-${SURVIVORS%% *}}
-      SPECS="$SPECS /admm_agent_$VICTIM:inject_forged_obs:int:$FORGED_TARGET"
-      say "  forged_obs: robot$VICTIM impersonates robot$FORGED_TARGET's observation channel"
+      if [ "${FORGED_FIRST:-0}" = 1 ]; then
+        say "  forged_obs: robot$VICTIM's impersonating publisher was created at CONSTRUCTION"
+        say "  (first-mover case) — it already holds the GID pin; nothing to fire here"
+      else
+        SPECS="$SPECS /admm_agent_$VICTIM:inject_forged_obs:int:$FORGED_TARGET"
+        say "  forged_obs: robot$VICTIM impersonates robot$FORGED_TARGET's observation channel"
+      fi
       ;;
   esac
   # DEAF as well as lying (LIE_DEAF=1, the default). A liar that still runs its own avoidance is
@@ -583,10 +657,25 @@ fi
 # REASON dds_transport.hpp already logs -- "REJECTED AgentState from robotN -- <reason>", thrown
 # by block_peer() the first time a peer's messages start being rejected for that reason.
 if [ -n "${LIE:-}" ]; then
-  N_EVICT=$(wait_for_log "EVICT robot$VICTIM" 2 60)
-  [ "$N_EVICT" -ge 2 ] \
-    || die_infra "only $N_EVICT survivor(s) evicted robot$VICTIM within 60s -- roster-exclusion (LIE_DEAF=${LIE_DEAF:-1}) should do this regardless of ARM; if it didn't, the lab flaked, not the experiment"
-  say "EVICT seen on $N_EVICT survivor(s) (roster-exclusion sanity check -- NOT proof any detector fired)"
+  if [ "${LIE_DEAF:-1}" = 1 ]; then
+    N_EVICT=$(wait_for_log "EVICT robot$VICTIM" 2 60)
+    [ "$N_EVICT" -ge 2 ] \
+      || die_infra "only $N_EVICT survivor(s) evicted robot$VICTIM within 60s -- roster-exclusion (LIE_DEAF=1) should do this regardless of ARM; if it didn't, the lab flaked, not the experiment"
+    say "EVICT seen on $N_EVICT survivor(s) (roster-exclusion sanity check -- NOT proof any detector fired)"
+  else
+    # LIE_DEAF=0 -- the attacker still HEARS the fleet, so its own silence timeout never fires,
+    # it never broadcasts a roster excluding the survivors, and the roster-exclusion path that
+    # evicts it "regardless of ARM" is ABSENT BY CONSTRUCTION. That is the entire point of this
+    # configuration: it is the only way to get a genuinely undefended control, since the recorded
+    # 0.557 vs 0.866 comparison was measured with that path blocking the liar in BOTH arms and so
+    # measured about a second of exposure rather than defence versus none. Here "nobody evicted
+    # the liar" is the RESULT, and asserting against it would write the hypothesis into the
+    # harness. The smear arm needs this too: a deafened attacker's peer_xnow() empties, so its
+    # ev_peer array is empty and applyFakeEvidence -- which corrupts a sighting already in the
+    # message and never fabricates one -- has nothing to corrupt.
+    N_EVICT=$(count_distinct_agents "EVICT robot$VICTIM")
+    say "LIE_DEAF=0 (true control): $N_EVICT survivor(s) evicted robot$VICTIM -- recorded, not required"
+  fi
   grep_agents "EVICT robot$VICTIM" | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
 
   N_G2=$(count_distinct_agents "REJECTED AgentState from robot$VICTIM.*gate2 odom residual")
@@ -608,9 +697,22 @@ if [ -n "${LIE:-}" ]; then
     a2)
       # The flagship defended arm: LIE is well past d_lie/2 (undetectable band is only +-2.7mm
       # around d_lie/2 -- see the calibration doc), so a miss here IS a real defence failure.
+      # MEASURED 2026-08-01 (d_0801_043929): it misses about one run in three, and not because
+      # the residual was ambiguous. The belief layer needs five consecutive evidence-bearing
+      # slots; the attacker's own deafness stalls the AgentState barrier that sets claims_fresh,
+      # and roster-exclusion blocks the peer at ~9 slots regardless. Lose two slots to a barrier
+      # hold and the accumulator is FROZEN where it stood (trust_step_observed returns L
+      # unchanged once blocked) at about half the threshold. Kept as a `die` on purpose: this is
+      # a real defence failure and must be visible as one, not softened into a note.
       [ "$N_BEL" -ge 1 ] \
         || die "ARM=a2: no survivor's belief layer ever blocked robot$VICTIM -- only roster-exclusion fired, so this run proves nothing about detection"
       say "ARM=a2: belief layer caught the lie on $N_BEL survivor(s)"
+      ;;
+    occl)
+      # Blocking is disarmed here by construction, so a block would mean log-only did not take.
+      [ "$((N_G2 + N_BEL))" = 0 ] \
+        || die "ARM=occl runs log-only so the attacker survives to be occluded, but $((N_G2 + N_BEL)) survivor(s) blocked it anyway"
+      say "ARM=occl: no detector-attributed block (as required) -- the attacker stays alive to hide"
       ;;
     smear|duty|forged_obs)
       # Recorded, not enforced: EXPECT_EVICT=1 here would write the hypothesis into the harness
@@ -629,6 +731,34 @@ else
   grep_agents "EVICT robot$VICTIM" | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
 fi
 grep_agents "REBUILD" | tail -2 | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
+
+# ---------- phase 5c/5d: the occlusion probe (ARM=occl) ----------
+# Spec §9 protocol item 6 / acceptance 4. Blocking is disarmed for this arm, so the attacker is
+# alive and MID-DESCENT -- L sits somewhere it would keep moving if evidence kept arriving, which
+# is exactly what makes "numerically unchanged" a discriminating observation rather than a
+# restatement of saturation. Walk it behind cover, hold, walk it back out.
+#
+# hide_spot.py picks a position occluded from EVERY survivor while still inside obs_range: code 4
+# (out_of_range) and code 5 (occluded) both come from visible() returning false, and only the
+# second says anything about occlusion. Its geometry mirrors admm::visible() but is not
+# authoritative -- what the run reports is the abstain code the C++ itself wrote into CycleStats,
+# so a stale mirror can only send the attacker somewhere less useful, never falsify a result.
+if [ "$ARM" = occl ]; then
+  HIDE=$(python3 "$SCRIPTS/hide_spot.py" "$LOGD/dist.csv" "$VICTIM" $SURVIVORS) \
+    || die_infra "no position is occluded from every survivor while still inside obs_range -- there is nothing to probe from where the fleet currently stands"
+  say "phase 5c: walking robot$VICTIM to ($HIDE) — occluded from every survivor, still in range"
+  timeout 4 ros2 topic pub -r 5 --qos-durability transient_local \
+    /robot$VICTIM/goal geometry_msgs/msg/PoseStamped \
+    "{header: {frame_id: world}, pose: {position: {x: ${HIDE% *}, y: ${HIDE#* }, z: 0.5}}}" \
+    >/dev/null 2>&1
+  sleep "${HIDE_T:-30}"
+  say "phase 5d: robot$VICTIM comes back out — abstention must end and L must resume moving"
+  read RX RY <<< "$(fleet_centroid "$SURVIVORS")"
+  timeout 4 ros2 topic pub -r 5 --qos-durability transient_local \
+    /robot$VICTIM/goal geometry_msgs/msg/PoseStamped \
+    "{header: {frame_id: world}, pose: {position: {x: $RX, y: $RY, z: 0.5}}}" >/dev/null 2>&1
+  sleep "${SHOW_T:-20}"
+fi
 
 
 # survivors must keep going to the ORIGINAL goal, routing around the corpse
@@ -861,4 +991,4 @@ if [ "${LIE_LOGONLY:-0}" = 1 ]; then
     say "  (the survivors never breached D_MIN against the GHOST — only against the real body)"
   fi
 fi
-say "D PASS (rejoin=$REJOIN): victim=robot$VICTIM, evicted by $N_EVICT, home reached, arrive_dist=$ARRIVE_DIST; logs $LOGD"
+say "D PASS (rejoin=$REJOIN): victim=robot$VICTIM, evicted by $N_EVICT, home reached, arrive_dist=$ARRIVE_DIST, mission_denied=$MISSION_DENIED; logs $LOGD"
