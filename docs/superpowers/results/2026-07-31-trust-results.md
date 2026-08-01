@@ -432,6 +432,36 @@ This also means the fix sketched in the handoff — "add a parameter making rele
 rise" — is **not** the one the data asks for: `credit_ratio = 0.25` already makes the net
 negative (−1.5 per P = 2 period). The binding constraint is the race, for the third time.
 
+### 4.4 duty, complete at n = 3 per period
+
+| period | burst | belief convicted | ghost offset (m) |
+|---|---|---|---|
+| P = 2 | 1 slot | **0 / 3** | 0.419, 0.422, **0.003** |
+| P = 10 | 5 slots | **1 / 3** | **0.001**, 0.423, **0.004** |
+
+⚠️ **Correction.** §4.3 stated "P = 10 convicts" from a single run. At n = 3 it is 1 of 3:
+conviction needs five consecutive lying slots *available from the moment evidence starts
+accumulating*, so it also requires the trigger to align with the start of a lying burst, not
+merely a long enough burst.
+
+**The ghost-offset distribution is the more important result.** Four of the six duty runs landed
+at 1–4 mm and only two at 0.42 — and **three of those four had no belief conviction at all**.
+`corpseAnchor` fences the *last* `AgentState` received, and a duty-cycled liar's final broadcast
+falls in its honest half about half the time. So the keep-out position for an intermittent liar
+has three outcomes:
+
+| outcome | runs | anchor lands on | ghost offset |
+|---|---|---|---|
+| belief convicts | 1 / 6 | odom | mm |
+| no conviction, last slot honest | 3 / 6 | an honest claim | mm |
+| no conviction, last slot lying | 2 / 6 | **the lie** | 0.42 m |
+
+**This is bad news, not good news.** The attacker *chooses* the phase of its final broadcast. It
+does not need to beat the detector at all — it only needs to tell its last lie before being cut
+off, which turns that 50 % into 100 %. **The apparent improvement in the duty ghost offsets is an
+artefact of an uncontrolled attacker, not a property of the defence**, and it would be a serious
+misreading to quote the 1–4 mm figures as duty-arm performance.
+
 ⏳ *forged_obs, occl and the LIE_DEAF=0 control pending.*
 
 **Registered in advance for `duty`** (so that a surprise is recognisable as one): `dutyLying` is
