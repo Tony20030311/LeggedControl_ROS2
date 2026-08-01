@@ -196,7 +196,14 @@ PY
 # half-extent, computed from the slots the coordinator ACTUALLY PUBLISHED -- no constant, and it
 # tracks whatever shape the live count resolved to. 0 when no plan is readable, which is strict.
 form_half_extent() {
-  timeout 6 ros2 topic echo /formation/plan --once 2>/dev/null | python3 -c "
+  # --qos-durability transient_local is LOAD-BEARING, not tidiness. The coordinator publishes the
+  # plan ONCE per goal and latches it; `ros2 topic echo` defaults to VOLATILE, which receives
+  # nothing at all unless a fresh message happens to arrive while it is subscribed. walk_until
+  # runs long after the goal was sent, so without this the read returns empty, half-extent
+  # resolves to 0, and the acceptance clause below can never fire -- every converged-but-not-
+  # arrived run is then scored as a failure to reach. Measured live on d_0801_053826: 45 polls
+  # sitting at 0.51 m against a 0.808 m half-extent that should have accepted it at poll 7.
+  timeout 6 ros2 topic echo /formation/plan --once --qos-durability transient_local 2>/dev/null | python3 -c "
 import re, sys, math
 t = sys.stdin.read()
 m = re.search(r'goals:\n((?:- [-\d.e]+\n)*)', t)
@@ -900,8 +907,8 @@ say "phase 8: new /formation/goal back HOME to ($HX,$HY) — must route around t
 send_formation_goal "$HX" "$HY"
 sleep 3
 say "current /formation/plan:"
-timeout 6 ros2 topic echo /formation/plan --once 2>/dev/null | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
-N_PLAN=$(timeout 6 ros2 topic echo /formation/plan --once 2>/dev/null | python3 -c "
+timeout 6 ros2 topic echo /formation/plan --once --qos-durability transient_local 2>/dev/null | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
+N_PLAN=$(timeout 6 ros2 topic echo /formation/plan --once --qos-durability transient_local 2>/dev/null | python3 -c "
 import sys,re
 t=sys.stdin.read()
 m=re.search(r'robot_ids:\n((?:- \d+\n)*)', t)
