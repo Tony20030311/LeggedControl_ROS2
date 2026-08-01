@@ -189,10 +189,31 @@ sys.exit(1)
 PY
 }
 
+# How far the CENTROID can legitimately sit from the goal once everyone is on station. A
+# formation has extent: a dog cannot be on its slot and on the goal at the same time, so with
+# COL2 (slots 1.5 m apart along the path) the centroid lands on the goal only if both dogs
+# straddle it exactly, and any lag leaves a residual no amount of walking removes. Echoes that
+# half-extent, computed from the slots the coordinator ACTUALLY PUBLISHED -- no constant, and it
+# tracks whatever shape the live count resolved to. 0 when no plan is readable, which is strict.
+form_half_extent() {
+  timeout 6 ros2 topic echo /formation/plan --once 2>/dev/null | python3 -c "
+import re, sys, math
+t = sys.stdin.read()
+m = re.search(r'goals:\n((?:- [-\d.e]+\n)*)', t)
+v = [float(x) for x in re.findall(r'- ([-\d.e]+)', m.group(1))] if m else []
+p = list(zip(v[::2], v[1::2]))
+if not p:
+    print('0'); sys.exit()
+cx, cy = sum(a for a, _ in p) / len(p), sum(b for _, b in p) / len(p)
+print('%.3f' % max(math.hypot(a - cx, b - cy) for a, b in p))" 2>/dev/null || echo 0
+}
+
 walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
   # `local` is load-bearing: without it this clobbered the caller's saved home coordinates and
   # the return leg became "walk to where you already are" — a PASS that tested nothing.
   local wx wy D M i BEST=99 STALE=0
+  # Read once, not per poll: it is a topic echo, and the shape does not change mid-leg.
+  local HALF=$(form_half_extent)
   for i in $(seq 1 "$4"); do
     read wx wy <<< "$(fleet_centroid "$3")"
     D=$(python3 -c "import math;print(f'{math.hypot($wx-$1, $wy-$2):.3f}')")
@@ -246,12 +267,23 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
     # rule, read off this run's own geometry, with the constant deleted rather than re-derived.
     if [ "$(python3 -c "print(1 if $BEST-$D > 0.03 else 0)")" = 1 ]; then BEST=$D; STALE=0
     else STALE=$((STALE + 1)); fi
-    if [ "$STALE" -ge 6 ] && FENCE=$(goal_fenced "$1" "$2"); then
-      say "  no progress for ${STALE} polls and the goal ($1,$2) is INSIDE a corpse keep-out"
-      say "  [$FENCE] — unreachable by construction. MISSION DENIED BY THE FENCE; accepting as"
-      say "  converged at dist=$D so the run still reports its safety numbers."
-      MISSION_DENIED=1
-      return 0
+    if [ "$STALE" -ge 6 ]; then
+      # Two things the run's own geometry can explain, either of which means "as arrived as this
+      # fleet is going to get". Neither is a tuned threshold: the first is the published slot
+      # geometry, the second is the keep-out the agents logged.
+      if FENCE=$(goal_fenced "$1" "$2"); then
+        say "  no progress for ${STALE} polls and the goal ($1,$2) is INSIDE a corpse keep-out"
+        say "  [$FENCE] — unreachable by construction. MISSION DENIED BY THE FENCE; accepting as"
+        say "  converged at dist=$D so the run still reports its safety numbers."
+        MISSION_DENIED=1
+        return 0
+      fi
+      if [ "$(python3 -c "print(1 if $D < ${HALF:-0} else 0)")" = 1 ]; then
+        say "  no progress for ${STALE} polls at dist=$D, within the formation's own half-extent"
+        say "  ${HALF} m (from the published slots) — everyone is on station and the centroid"
+        say "  cannot get closer. Accepting as arrived."
+        return 0
+      fi
     fi
     sleep 5
   done
@@ -844,7 +876,11 @@ if [ "$REJOIN" = 1 ]; then
   grep_agents "corpse of robot$VICTIM removed" | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
   WATCH="$ROBOTS"
 else
-  WATCH="$SURVIVORS"
+  # Whom to watch home: the fleet that still exists. With LIE_DEAF=0 -- which the true-control
+  # arm, smear and occl all require -- nothing evicts the attacker, so it is still a member, the
+  # coordinator still plans for it, and demanding a survivors-only plan below would fail the run
+  # for the absence of an eviction those configurations are specifically designed not to cause.
+  if [ "${N_EVICT:-0}" -ge 1 ]; then WATCH="$SURVIVORS"; else WATCH="$ROBOTS"; fi
 fi
 
 fi   # end NO_KILL branch
