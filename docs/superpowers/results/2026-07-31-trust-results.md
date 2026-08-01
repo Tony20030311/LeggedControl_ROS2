@@ -568,6 +568,31 @@ reported as the defence's limit.
 
 ---
 
+## 4b. The true control — what the belief layer is worth on its own
+
+The recorded 0.557 vs 0.866 comparison was **not** defence versus none: the transport's EXIT rule
+fenced the liar in *both* arms, so that pair measured about a second of exposure difference. With
+`LIE_DEAF=0` the attacker keeps hearing the fleet, its silence timeout never fires, it never
+broadcasts an excluding roster, and **nothing incidental can remove it**. `a0` then has no
+defence at all, and `a2` has only the belief layer.
+
+| | `a0` undefended (n = 3) | **`a2` belief layer alone (n = 3)** |
+|---|---|---|
+| removal events | **0 / 0 / 0** | **4 / 4 / 4** |
+| convicted | — | **3 / 3, both survivors each time** |
+| time-to-evict | — | **6 slots: 0.57 / 0.60 / 0.56 s** |
+| ghost offset | — (no keep-out is ever drawn) | **0.009 / 0.009 / 0.008 m** |
+| **survivor body gap** | **0.2727 / 0.2713 / 0.2376 m** | **0.3600 / 0.3519 / 0.3512 m** |
+| false positives | 0 | **0** |
+
+**The two groups do not overlap.** `a2`'s minimum (0.3512) exceeds `a0`'s maximum (0.2727) by
+78 mm, and `a2`'s spread across three runs is 8.8 mm.
+
+**Detection latency here is 6 slots, one more than the 5 measured with `LIE_DEAF=1`** — and this
+is the more honest figure. A deafened attacker stops responding, and its silence accelerates the
+survivors' verdict; here it participates in consensus normally and the belief layer must convict
+purely on observation residual. **Quote 6 slots for the layer in isolation.**
+
 ## 5. Occlusion ⏳
 
 *Pending.*
