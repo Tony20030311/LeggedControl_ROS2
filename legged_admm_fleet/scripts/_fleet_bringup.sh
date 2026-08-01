@@ -18,7 +18,12 @@ source $WS/install/setup.bash
 set -u
 
 ROBOTS=${ROBOTS:-"1 2 3"}
-ROSTER=$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/fleet_robots.yaml
+# Roster follows the fleet SIZE by default, so `ROBOTS="1 2 3 4 5"` picks up fleet_robots_5.yaml
+# without the caller having to know the filename -- and, more to the point, without it being
+# possible to ask for five dogs and silently get the three-dog spawn poses. Overridable for a
+# roster that is not just "the default layout at size n".
+ROSTER=${ROSTER:-$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/fleet_robots$(
+  [ "$(echo $ROBOTS | wc -w)" = 3 ] || echo "_$(echo $ROBOTS | wc -w)").yaml}
 CTRL_YAML=$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/vision60_fleet_controller.yaml
 V=${V:-0.4}
 DEADLINE=${DEADLINE:-20}
