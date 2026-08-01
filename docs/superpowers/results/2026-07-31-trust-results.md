@@ -251,9 +251,58 @@ Two things established before running it:
 
 ---
 
-## 6. Stale-vote deadlock and the no-attacker soak ⏳
+## 6. Stale-vote deadlock — reproduced, and the fix does not cover it
 
-*Pending.* The soak walks a goal; a stationary soak cannot show drift-driven false positives.
+This was scheduled as a scenario to run deliberately. It arrived on its own, in batch 2's first
+attempt (`d_0801_044738`), and the answer to "does the fixed-point correction stop the fleet
+deadlocking" is **no, not for this input**.
+
+**Chain of events, from the logs:**
+
+1. 59 s after the attack, with the two survivors parked at the outbound goal, agent3 evicted
+   robot1 as "silent 10 slots" and agent1 then evicted robot3 as "silent 3 slots". **Neither had
+   done anything wrong.** This is the false-positive shape already on this project's record
+   (2026-07-28: two healthy agents evicted each other after a single bad broadcast).
+2. Both rebuilt solo, leaving the coordinator with `views = {1:[1], 2:[2], 3:[3]}`.
+3. `admm::majority_excluded` has **no fixed point** on that input. Transcribed exactly and run:
+
+   | pass | `excluded` | → `next` |
+   |---|---|---|
+   | 0 | {} | {1,2,3} |
+   | 1 | {1,2,3} | {} |
+   | 2 | {} | {1,2,3} |
+   | 3 | {1,2,3} | {} |
+
+   Period 2, forever. The loop is bounded at `views.size() + 1` = 4 passes and exits holding
+   `excluded = {}`, so `excluded_by(i, {})` is **true for every i**.
+4. The coordinator saw **zero live dogs** and logged `FLEET WEDGED: goal DROPPED — every dog is
+   majority-excluded, so nobody is live` once a second for the rest of the run. The survivors
+   never moved again.
+
+The comment above that loop bound says it "keeps a pathological, fully-symmetric input (every
+robot's roster contains only itself) from spinning forever instead of returning". It does
+return — with the maximally wrong answer. **Converting a hang into a silent wrong answer is not a
+fix, and the symmetric input is not hypothetical: step 1 produces it.**
+
+**This is Task 9's code (`e92671c`) — the only task on this branch that never received an
+independent review.** The ledger records why: the reviewing attention went to the `NDEBUG`
+discovery the same agent surfaced. `test_false_signal.cpp` has eight `majority_excluded` cases —
+unanimous 2-0, a 1-1 split, empty-roster abstention, silence, no views at all, an
+attacker-plus-misjudgment case at n=4, and the two-pass case that motivated the fixed point — and
+**not one with a symmetric roster.** The uncovered case is the one that wedges the fleet.
+
+The intended behaviour is intact: `views = {1:[1,3], 2:[2], 3:[1,3]}` still excludes only
+robot2. The defect is confined to inputs with no fixed point.
+
+**Proposed fix (owner decision, not applied):** non-convergence means the ballots are
+self-contradictory, and for *liveness* the conservative answer is to exclude **nobody**. A fleet
+that keeps planning for a dog that may be gone is recoverable; a wedged fleet is not. One
+condition — if the loop exhausts its passes without `next == excluded`, return false — plus a
+test for `{1:[1], 2:[2], 3:[3]}`.
+
+### 6.1 No-attacker soak ⏳
+
+*Pending.* Walks a goal continuously; a stationary soak cannot show drift-driven false positives.
 
 ---
 
@@ -281,6 +330,26 @@ The measurement is a genuine A/B rather than an analytic estimate: `beliefStep()
 producer of `ev_peer`/`ev_pos`, and it runs only when `obs_gate2 = true`, so arms `a0`/`a1`
 broadcast empty evidence arrays and the `a1` → `a2` difference in bytes/second **is** what the
 defence costs on the wire.
+
+**Method, and why the attack runs cannot answer it.** `bytes_tx`/`bytes_rx` are read-and-reset by
+`take_bytes()` at every `publishStats`, so each `stats.csv` row carries the traffic since that
+robot's previous row. The rate is therefore a sum over intervals, not a first-to-last span:
+the first row holds everything since node start (all of bring-up), and `g5_logger`'s
+subscriptions do not all establish at once — in one run two robots had a 37.5 s hole in their
+stream while the third simply started 37.6 s in, which a span-based rate turned into a spurious
+1.4× difference between two identically-configured agents. Intervals longer than 1 s are dropped
+from both numerator and denominator. After that correction the three agents in a run agree to
+0.2 %, with the deafened attacker correctly lower.
+
+⚠️ **The a0/a1/a2 attack runs are not a valid A/B for this.** Traffic is dominated by
+`EdgeXi`/`EdgeZ`, which scale with `achieved_rounds`, and the arms converge differently — a2
+measured *lower* than a1 in one pair of runs, which is a statement about ADMM convergence and
+not about what evidence costs. Worse, the fleet's topology changes mid-run when the attacker is
+evicted. The A/B therefore comes from the **`NO_KILL` soaks**, where nothing is evicted, nobody
+is deafened, and the only difference between the two runs is whether `beliefStep` is producing
+evidence.
+
+⏳ *Soak measurement pending.*
 
 ---
 
