@@ -133,21 +133,35 @@ if ko_anchor and d and victim:
 # per-agent rate. Summing the raw column as if it were cumulative would be wrong.
 st = rows("stats.csv")
 ar = [fnum(r["achieved_rounds"]) for r in st if r.get("achieved_rounds")]
-per_robot_bytes, per_robot_span = {}, {}
+# Rate from INTERVALS, not from first-to-last span. take_bytes() exchanges the counters to zero
+# at every publishStats, so each row's bytes belong to the gap since that robot's PREVIOUS row --
+# which makes the honest denominator the sum of those gaps, and makes the first row (everything
+# since node start, i.e. all of bring-up) unusable as a numerator.
+#
+# It also has to survive holes in the recording. g5_logger's subscriptions do not all establish
+# at once: in a2 rep 1 robot1 and robot2 had a 37.5 s hole while robot3's stream simply started
+# at 37.6 s, so a first-to-last span read 124.2 s for two robots and 86.6 s for the third and
+# put robot3's apparent rate 1.4x above robot1's for no physical reason. Intervals longer than
+# 1 s are dropped from both numerator and denominator: across a hole the counter did keep
+# accumulating in the node, but the row that closes it is one publish's worth, not the hole's.
+per_robot = {}
 for r in st:
     rid = r.get("robot")
-    if rid is None:
-        continue
-    tx, rx, t = fnum(r["bytes_tx"], 0), fnum(r["bytes_rx"], 0), fnum(r["t"])
-    b = per_robot_bytes.setdefault(rid, [0.0, 0.0])
-    b[0] += tx
-    b[1] += rx
-    s = per_robot_span.setdefault(rid, [t, t])
-    s[0], s[1] = min(s[0], t), max(s[1], t)
-tx_rate = {k: v[0] / max(per_robot_span[k][1] - per_robot_span[k][0], 1e-9)
-           for k, v in per_robot_bytes.items()}
-rx_rate = {k: v[1] / max(per_robot_span[k][1] - per_robot_span[k][0], 1e-9)
-           for k, v in per_robot_bytes.items()}
+    if rid is not None:
+        per_robot.setdefault(rid, []).append(
+            (fnum(r["t"]), fnum(r["bytes_tx"], 0), fnum(r["bytes_rx"], 0)))
+tx_rate, rx_rate, comm_window = {}, {}, {}
+for rid, seq in per_robot.items():
+    seq.sort()
+    tx = rx = dur = 0.0
+    for (ta, _, _), (tb, btx, brx) in zip(seq, seq[1:]):
+        dt = tb - ta
+        if 0 < dt <= 1.0:
+            tx += btx
+            rx += brx
+            dur += dt
+    if dur > 0:
+        tx_rate[rid], rx_rate[rid], comm_window[rid] = tx / dur, rx / dur, dur
 
 # tel = "peer:resid:l_self:l_total:abstain" groups, '|'-joined. Empty for A0/A1 (beliefStep
 # never runs there), which is itself the measurement: those arms broadcast no evidence, so the
@@ -273,8 +287,7 @@ print("attack onset     t=%s s (sim)   v_div_step=%s m/s   v_div_max=%s m/s "
       "[STEP injection: quotients, not ramp rates; v_div_max floor on a clean run is 0.726]"
       % (f(onset, 2), f(v_div_step, 3), f(v_div_max, 3)))
 for o in sorted(tx_rate):
-    print("comm robot%s      tx=%s B/s  rx=%s B/s  (sim span %.1f s)" %
-          (o, f(tx_rate[o], 0), f(rx_rate[o], 0),
-           per_robot_span[o][1] - per_robot_span[o][0]))
+    print("comm robot%s      tx=%s B/s  rx=%s B/s  (over %.1f s of recorded intervals)" %
+          (o, f(tx_rate[o], 0), f(rx_rate[o], 0), comm_window[o]))
 print("belief telemetry %d per-(slot,observer,peer) samples%s" %
       (len(tel), "" if tel else "   <- none: beliefStep never ran (A0/A1 broadcast no evidence)"))
