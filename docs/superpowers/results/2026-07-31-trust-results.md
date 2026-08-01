@@ -8,23 +8,30 @@ Calibration this builds on: `2026-07-31-trust-calibration.md`.
 
 ## Acceptance criteria at a glance
 
-Spec §9's eight criteria, each of which was required to be *able* to fail. Six have data.
+Spec §9's eight criteria, each of which was required to be *able* to fail. Seven have data.
 
 | # | criterion | outcome |
 |---|---|---|
 | 1 | A2 catches what A1 structurally cannot | ✅ a1: **0 detector-attributed blocks in 5 runs**; a2: convicted in 5 runs, **0.50 s / 5 slots** every time |
 | 2 | conservative anchoring keeps the body gap from shrinking | ⚠️ **does not cover the corpse anchor** (registered Task 13). A2's advantage comes from *winning a race*, and the harness under-models the attacker on that path, so its numbers are a **lower bound** |
-| 3 | NO_KILL soak, zero false positives | a1 ✅ **675.3 s of sim walking, 8 laps, 0 evictions, 0 blocks**; a2 ⏳ — and **zero false positives across all attack runs** |
+| 3 | NO_KILL soak, zero false positives | ❌ **a2 partitioned the fleet with no attacker** — not the belief layer (`L` flat at 4.600 vs −9.20) but a correlated barrier stall the *silence* rule resolves by eviction (§6.2). a1's 675.3 s pass had **4 slots of margin** on the same mechanism |
 | 4 | occlusion: abstention positively recorded, `L` unchanged, resumption | ✅ **and the criterion's wording is wrong** — see §5.1, it should read "suspicion does not decay" |
 | 5 | smear: honest peer never evicted, smearer caught | **half.** Target never blocked (3/3) ✅; smearer never convicted ❌ — spec §10's declared N = 3 blind spot, not a tuning failure |
 | 6 | asymmetric credit convicts an intermittent liar | ❌ **evades when the lying burst is shorter than the conviction depth** (P = 2: 0/3; P = 10: 1/3) |
 | 7 | the fixed-point correction stops the stale-vote deadlock | ❌ **it does not** — `majority_excluded` has no fixed point on the symmetric input and the loop bound returns the maximally wrong answer, wedging the fleet (§6) |
 | 8 | regression: 44 oracle + ctest + G1 bit-identical | ✅ 44 passed, 6/6, `worst max\|delta\| = 0` |
 
-**Three of the six settled criteria did not pass.** Each failure is mechanistically traced, and
+**Four of the seven settled criteria did not pass.** Each failure is mechanistically traced, and
 criteria 6 and 7 plus the caveat on 2 all reduce to **one structural problem**: the belief
 accumulator races against roster-exclusion, and whatever loses that race decides where the
 corpse keep-out gets anchored.
+
+Criterion 3 is the exception, and it is worth separating: **it failed on something that is not
+this branch's**. The belief layer never convicted anybody in that run; a correlated stall in the
+G4 consensus barrier made every agent look silent to every other, and the eviction rule — written
+for silence as a property of *one* peer — resolved it by letting the first counter to trip evict
+the rest (§6.2). It is in this document because the soak found it, not because the trust layer
+caused it.
 
 ---
 
@@ -729,10 +736,56 @@ so counting evictions alone would miss precisely the near-misses this criterion 
 |---|---|---|---|---|---|
 | `d_0801_072156` | **a1** (gate2) | **675.3 s** | 8 | **0** | **0** |
 
-Zero and zero, over the whole log rather than only the soak window. Criterion 3 holds for a1.
+Zero and zero, over the whole log rather than only the soak window. Criterion 3 holds for a1 —
+**but read §6.2 before quoting that as a clean pass**, because the a2 soak found the mechanism
+that a1 escaped by four slots.
 
-The a2 half is what §8 also needs, and it took three attempts to get a clean one — neither of the
-first two was a false positive, and both are in §9 and §10 rather than dropped.
+### 6.2 The a2 soak partitioned the fleet with no attacker in it — and it was not the belief layer
+
+`d_0801_075028`, `ARM=a2 NO_KILL=1`. Two things it was **not**:
+
+- **Not the belief layer.** `L_total` sat flat at **4.600** against `l_evict = −9.20` for the
+  entire run. The accumulator never convicted anybody, before or after.
+- **Not the WBC.** Zero `Deactivating` lines in `gazebo.log`, unlike `d_0801_074359`.
+
+What actually happened, from `stats.csv`:
+
+| sim t | event |
+|---|---|
+| 355.622 | all three at `achieved_rounds = 20`, healthy |
+| **355.724** | **all three time out in the same slot, each on a *different* barrier phase** — robot1 waiting on `z`, robot2 on `xi`, robot3 on `xi` |
+| 355.8 – 356.7 | the phases **lock in**: r1 pinned on `z` at the full 20 ms every slot, r3 on `xi`, r2 on `state`. They never resynchronise |
+| ~356.7 | robot2's silence counter reaches 10 first → `EVICT robot1`, `EVICT robot3` |
+| ~356.8 | robots 1 and 3 reject robot2's `AgentState` — *"its roster excludes us"*, which is by design |
+| ~357.0 | robots 1 and 3 `EVICT robot2 (silent 3 slots)`. The split is now self-sealing |
+| 357.156 | robots 1 + 3 resume at 20 rounds as a pair; robot2 runs alone at 0 for the next 117 s |
+
+**It is not clock drift and not the mailbox prune window.** Slot counters stayed in exact lockstep
+— `cycle == t / TS` for all three agents, checked at 11 points between t = 300 and t = 470 — so
+the 8-slot `pruneOld()` window never came into it.
+
+**And this is what it does to the a1 result.** Both soaks stall fleet-wide; they differ only in
+how long:
+
+| soak | episodes where all three were at `achieved_rounds = 0` | total slots | longest |
+|---|---|---|---|
+| a1 (`d_0801_072156`) | 2 | 7 | **0.50 s / 6 slots** |
+| a2 (`d_0801_075028`) | 4 | 22 | **1.20 s / 13 slots** |
+
+The eviction rule trips at **10 slots**. So a1 did not pass because it is immune to this — it
+passed with **four slots of margin** on a mechanism that would have partitioned it too. Reporting
+the a1 PASS without this table would be reporting the margin as if it were the mechanism.
+
+`n = 1` run per arm, so **no rate is claimed** and nothing here says the belief layer makes stalls
+longer. Both soaks ran the *same binaries* — every change made this session is in shell — so the
+only configured difference is `obs_gate2`, and one run each cannot separate that from luck.
+
+**The defect is pre-existing and belongs to the G4 barrier, not to this branch.** One missed 20 ms
+exchange is enough to leave three agents waiting on three different phases; from there each looks
+silent to every other, and the *silence* rule — which assumes silence is a property of one peer —
+resolves a *correlated* stall by letting whichever counter trips first evict everybody else.
+Registered as a finding rather than fixed here: it is upstream of the trust layer, and a fix is a
+change to the consensus barrier, which this project's rules put behind a derivation with the owner.
 
 ---
 
@@ -751,7 +804,7 @@ them out and "ctest all pass" was not evidence for `test_trust`, `test_false_sig
 
 ---
 
-## 8. Communication cost (G5) ⏳
+## 8. Communication cost (G5) ✅
 
 *Pending.* Folded in here rather than run separately, because the trust layer adds fields to
 `AgentState` and measuring G5 first would have measured a system about to change.
@@ -833,9 +886,34 @@ robots had a 37.5 s hole while the third started 37.6 s in, which a span-based r
 spurious 1.4× difference between two identically-configured agents. Intervals longer than 1 s are
 dropped from both numerator and denominator.
 
-#### 8.3 A/B result — does the defence cost anything beyond its payload?
+#### 8.3 A/B result — does the defence cost anything beyond its payload? **No.**
 
-⏳ *a2 soak in progress.*
+Both soaks ran the **same binaries** (every change made in this session is in shell), nothing is
+evicted in either, nobody is deafened, and the only configured difference is `obs_gate2`. Compared
+over a **matched sim-time window, t ∈ [100, 350] s**, so that both cover walking laps and the a2
+run is read entirely from before its partition (§6.2):
+
+| | a1 `d_0801_072156` | a2 `d_0801_075028` | Δ |
+|---|---|---|---|
+| tx (mean of 3 agents) | 787 955 B/s | 790 096 B/s | **+2141** |
+| rx (mean of 3 agents) | 798 479 B/s | 801 006 B/s | **+2527** |
+| `achieved_rounds` (mean) | 19.861 | 19.912 | +0.0514 |
+
+The raw Δ is **5.4× the payload**, and almost all of the excess is convergence, not evidence:
+
+| component of the +2141 B/s tx | B/s | share |
+|---|---|---|
+| evidence payload (§8.1, closed form) | +400 | 19 % |
+| `achieved_rounds` +0.0514, at 3914 B/round | +2011 | 94 % |
+| **unexplained residual** | **−269** | **−0.034 % of baseline** |
+
+The residual is **negative and 0.03 % of the total** — indistinguishable from zero at this
+instrument's resolution. So the answer to the question the A/B exists for is: the belief layer
+costs its payload and **nothing else**. No extra messages, no extra rounds attributable to it.
+
+And this is the concrete form of the warning in §8.2. Had the raw +2141 B/s been reported as "what
+the defence costs on the wire", it would have overstated it by a factor of five, and four fifths of
+the quoted figure would have been an ADMM convergence difference of 0.05 rounds.
 
 ---
 
