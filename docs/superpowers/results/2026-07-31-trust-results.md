@@ -152,6 +152,31 @@ copy inside `gate2()` only, so the member `peer_odom_` stays honest and `corpseA
 reads a channel the dual-channel threat model says is compromised. **Every a2 ghost-offset number
 here is a lower bound** on what a real dual-channel attacker could do to the corpse keep-out.
 
+### 3.3a Conviction lands in 5 slots, not the 7 the design derives — and the extra 2 are hearsay
+
+The design's debounce arithmetic gives 7 consecutive full-penalty steps
+(4.6 → 2.375 → 0.258 → −1.754 → −3.754 → −5.754 → −7.754 → −9.754, crossing at step 7). Measured
+conviction is 5 slots. The telemetry says why — agent1's trace from run 8, sim time, one row per
+slot:
+
+| t (s) | residual | `l_self` | `l_total` |
+|---|---|---|---|
+| 69.22 | 0.4521 | 2.875 | 5.269 |
+| 69.32 | 0.3771 | 0.734 | 1.031 |
+| 69.42 | 0.4164 | −1.302 | −3.000 |
+| 69.52 | 0.4115 | −3.302 | −6.897 |
+| 69.62 | 0.3985 | −5.302 | **−9.902** ← crosses −9.2 |
+| 69.72 | — | −5.302 | −9.677 (abstain = peer_blocked) |
+
+`l_self` falls at 2.000 per slot — exactly `clamp_step`, i.e. the residual is far enough past the
+decision boundary to saturate every step, as the 5.33 mm graded band predicts. `l_total` falls at
+~3.0 per slot. **The extra ~1.0 per slot is the other survivor's relayed evidence**, and it is
+what turns a 7-slot first-hand conviction into a 5-slot one.
+
+That is the second-hand channel doing exactly the job it was built for, and it is also why the
+`trust_total` sum clamp matters: the same mechanism that accelerates a true conviction is what a
+smear arm tries to abuse, which is what §4's arms exist to test.
+
 ### 3.4 A2 loses that race one run in three, and the mechanism is measurable
 
 Run 9 is not a flake and not a borderline residual. Tracing it:
