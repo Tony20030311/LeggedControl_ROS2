@@ -965,4 +965,6 @@ itself is now fixed (§9 #5) so that this decision is made by the script from th
 configuration rather than by me from its outcome; every later run is classified before anyone
 sees what it produced.
 
+| `d_0801_075028` | a2 soak | **FAIL — recorded as an outcome, not excluded** | The fleet partitioned with no attacker in it. One missed 20 ms exchange left the three agents waiting on three different barrier phases and they never resynchronised; robot2's silence counter tripped first and evicted the other two, who then rejected its roster by design and evicted it back. **Belief never convicted anybody** (`L` flat at 4.600 vs −9.20) and there was no WBC deactivation. Full mechanism in §6.2. Its first 355 s of clean three-agent traffic are what §8.3's A/B is computed from. |
+
 ⏳ *Matrix attempts appended as they complete.*
