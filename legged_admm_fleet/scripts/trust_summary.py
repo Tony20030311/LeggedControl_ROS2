@@ -142,12 +142,51 @@ onset = min((t for t, _o, p, r_, *_ in tel if p == victim and r_ > CLEAN_MAX),
             default=float("nan"))
 # v_div: how fast claim and truth diverge. The harness injects a STEP, so this is a difference
 # quotient across the step, not a ramp rate -- reported for the record and flagged as such.
-vic_tel = sorted([x for x in tel if x[2] == victim], key=lambda x: x[0])
-v_div = float("nan")
-for a, b in zip(vic_tel, vic_tel[1:]):
-    dt = b[0] - a[0]
-    if dt > 1e-6:
-        v_div = max(v_div if v_div == v_div else 0.0, abs(b[3] - a[3]) / dt)
+#
+# PER OBSERVER, and skipping abstained rows. Pooling both observers into one time-ordered list
+# differences observer A's residual against observer B's at nearly the same timestamp, so the
+# denominator is the two agents' publish skew (~1 ms) and the numerator is their independent
+# noise draws: that read 25.1 m/s on a clean NO_KILL run with no attacker at all. A residual is
+# a property of one observer's view; only consecutive samples from the SAME observer are a rate.
+#
+# TWO numbers, because the obvious one is useless on its own. `v_div_max` (the largest quotient
+# anywhere in the run) has a NOISE FLOOR: consecutive residuals are independent Rayleigh(sigma)
+# draws one slot apart, so a clean NO_KILL run with no attacker measured 0.726 m/s -- 2.3x the
+# 0.31 m/s design envelope. Comparing that statistic to the envelope would "exceed" it on every
+# honest run ever recorded. `v_div_step` is the quotient across the onset transition itself,
+# which is what the injection actually does.
+v_div_max = float("nan")
+v_div_step = float("nan")
+for obs_id in {x[1] for x in tel}:
+    seq = sorted([x for x in tel if x[2] == victim and x[1] == obs_id and x[3] == x[3]],
+                 key=lambda x: x[0])
+    for a, b in zip(seq, seq[1:]):
+        dt = b[0] - a[0]
+        if dt < 0.05:    # one slot is 0.1 s; anything shorter is a duplicate publish, not a step
+            continue
+        q = abs(b[3] - a[3]) / dt
+        v_div_max = q if v_div_max != v_div_max else max(v_div_max, q)
+        if a[3] <= CLEAN_MAX < b[3] and v_div_step != v_div_step:
+            v_div_step = q
+
+# TIME-TO-EVICT, per survivor, in SIM time, exactly (spec §9 protocol item 5). Both ends come
+# from CycleStats, which carries the sim clock -- so no wall-to-sim conversion and no RTF
+# estimate enters this number. Onset is that observer's first non-abstained residual past
+# anything clean flight produced; the block is its first row where the peer reads abstain=1
+# (peer_blocked), which beliefStep writes only after block_peer has actually latched.
+#
+# Only arms that run beliefStep (obs_gate2=true) can report this. A0/A1 have no belief
+# telemetry at all and their attacker leaves via roster-exclusion, a different mechanism on a
+# different clock -- reporting an RTF-converted wall delta beside an exact sim figure would
+# invite exactly the comparison it cannot support, so those arms report "n/a (no belief path)".
+tte = {}
+for obs_id in {x[1] for x in tel}:
+    seq = sorted([x for x in tel if x[2] == victim and x[1] == obs_id], key=lambda x: x[0])
+    t_on = next((t for t, _o, _p, r_, *_ in seq if r_ == r_ and r_ > CLEAN_MAX), None)
+    t_blk = next((t for t, _o, _p, _r, _ls, _lt, ab in seq if ab == 1 and (t_on is None or t >= t_on)),
+                 None)
+    if t_on is not None and t_blk is not None:
+        tte[obs_id] = t_blk - t_on
 
 # ---- detector attribution and eviction -----------------------------------------------------
 def distinct(pat):
@@ -195,8 +234,12 @@ print("blocked victim   gate2=%s belief=%s roster=%s   EVICT=%s" %
        ",".join(blk_roster) or "-", ",".join(evicted) or "-"))
 print("FALSE POSITIVES  %s" % (", ".join("agent%s blocked robot%s" % x for x in false_pos) or "none"))
 print("refutations      %d refuted / %d checked" % (refuted, checked))
-print("attack onset     t=%s s (sim)   v_div=%s m/s  [STEP injection: difference quotient, "
-      "not a ramp rate]" % (f(onset, 2), f(v_div, 3)))
+print("time-to-evict    %s   [sim seconds, both ends from CycleStats' own clock]" %
+      (", ".join("agent%s %ss (%.0f slots)" % (o, f(v, 2), round(v / 0.1)) for o, v in sorted(tte.items()))
+       or "n/a (no belief path in this arm)"))
+print("attack onset     t=%s s (sim)   v_div_step=%s m/s   v_div_max=%s m/s "
+      "[STEP injection: quotients, not ramp rates; v_div_max floor on a clean run is 0.726]"
+      % (f(onset, 2), f(v_div_step, 3), f(v_div_max, 3)))
 for o in sorted(tx_rate):
     print("comm robot%s      tx=%s B/s  rx=%s B/s  (sim span %.1f s)" %
           (o, f(tx_rate[o], 0), f(rx_rate[o], 0),
