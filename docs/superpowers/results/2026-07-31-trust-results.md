@@ -14,7 +14,7 @@ Spec §9's eight criteria, each of which was required to be *able* to fail. Six 
 |---|---|---|
 | 1 | A2 catches what A1 structurally cannot | ✅ a1: **0 detector-attributed blocks in 5 runs**; a2: convicted in 5 runs, **0.50 s / 5 slots** every time |
 | 2 | conservative anchoring keeps the body gap from shrinking | ⚠️ **does not cover the corpse anchor** (registered Task 13). A2's advantage comes from *winning a race*, and the harness under-models the attacker on that path, so its numbers are a **lower bound** |
-| 3 | NO_KILL soak, zero false positives | ⏳ soak pending — but **zero false positives across 18 attack runs** |
+| 3 | NO_KILL soak, zero false positives | a1 ✅ **675.3 s of sim walking, 8 laps, 0 evictions, 0 blocks**; a2 ⏳ — and **zero false positives across all attack runs** |
 | 4 | occlusion: abstention positively recorded, `L` unchanged, resumption | ✅ **and the criterion's wording is wrong** — see §5.1, it should read "suspicion does not decay" |
 | 5 | smear: honest peer never evicted, smearer caught | **half.** Target never blocked (3/3) ✅; smearer never convicted ❌ — spec §10's declared N = 3 blind spot, not a tuning failure |
 | 6 | asymmetric credit convicts an intermittent liar | ❌ **evades when the lying burst is shorter than the conviction depth** (P = 2: 0/3; P = 10: 1/3) |
@@ -712,9 +712,27 @@ that keeps planning for a dog that may be gone is recoverable; a wedged fleet is
 condition — if the loop exhausts its passes without `next == excluded`, return false — plus a
 test for `{1:[1], 2:[2], 3:[3]}`.
 
-### 6.1 No-attacker soak ⏳
+### 6.1 No-attacker soak — a1 ✅
 
-*Pending.* Walks a goal continuously; a stationary soak cannot show drift-driven false positives.
+The soak **walks**. A stationary fleet cannot produce a drift-driven false positive at all: the
+odom residual the old gate watches and the observation-vs-claim disagreement the belief layer
+watches both only move when the dogs do, so a soak that parks three robots and waits proves
+nothing. This one flies the same out-and-back legs the rest of the matrix uses, and counts sim
+time from `dist.csv` — the clock every other number here is on — rather than wall clock divided
+by an assumed RTF.
+
+It asserts on **two** counters, because they are different code paths and only one of them is an
+eviction. A detector block that has not yet aged into an eviction is *already* a false positive,
+so counting evictions alone would miss precisely the near-misses this criterion exists to find.
+
+| run | arm | sim walked | laps | `EVICT robot` | `REJECTED AgentState` |
+|---|---|---|---|---|---|
+| `d_0801_072156` | **a1** (gate2) | **675.3 s** | 8 | **0** | **0** |
+
+Zero and zero, over the whole log rather than only the soak window. Criterion 3 holds for a1.
+
+The a2 half is what §8 also needs, and it took three attempts to get a clean one — neither of the
+first two was a false positive, and both are in §9 and §10 rather than dropped.
 
 ---
 
@@ -738,10 +756,18 @@ them out and "ctest all pass" was not evidence for `test_trust`, `test_false_sig
 *Pending.* Folded in here rather than run separately, because the trust layer adds fields to
 `AgentState` and measuring G5 first would have measured a system about to change.
 
-The measurement is a genuine A/B rather than an analytic estimate: `beliefStep()` is the only
-producer of `ev_peer`/`ev_pos`, and it runs only when `obs_gate2 = true`, so arms `a0`/`a1`
-broadcast empty evidence arrays and the `a1` → `a2` difference in bytes/second **is** what the
-defence costs on the wire.
+**Two questions, and only one of them is an A/B.** `beliefStep()` is the only producer of
+`ev_peer`/`ev_pos` and it runs only when `obs_gate2 = true` (`admm_agent_node.cpp:1405`), so `a1`
+broadcasts empty evidence arrays for the whole run and the `a1`/`a2` soak pair isolates the
+defence exactly. But the two questions it isolates want different instruments:
+
+- *What does the evidence payload cost?* — **closed form**, because `wire_bytes()` is
+  deterministic in the array lengths. No run needed, and no run can beat it for precision.
+- *Does the defence cost anything else?* — extra messages, extra ADMM rounds, retries, a fatter
+  `xibar`. **That** is what the A/B is for, and nothing else can answer it.
+
+Reporting the first from the A/B would have been a mistake, and the size of that mistake is
+measurable — see the noise floor below.
 
 **Method, and why the attack runs cannot answer it.** `bytes_tx`/`bytes_rx` are read-and-reset by
 `take_bytes()` at every `publishStats`, so each `stats.csv` row carries the traffic since that
@@ -761,14 +787,62 @@ evicted. The A/B therefore comes from the **`NO_KILL` soaks**, where nothing is 
 is deafened, and the only difference between the two runs is whether `beliefStep` is producing
 evidence.
 
-⏳ *Soak measurement pending.*
+#### 8.1 What the payload costs, in closed form
+
+`dds_transport.hpp`'s `wire_bytes()` counts CDR payload — 8 B per `float64`/`uint64`, 4 B per
+`int32`, 4 B per array length prefix, 1 B per `bool` — and excludes RTPS/UDP framing. At N = 20,
+a 3-robot roster, and both peers observed:
+
+| `AgentState` variant | bytes | vs. pre-spec |
+|---|---|---|
+| pre-spec peer (no evidence fields at all) | 1037 | — |
+| **a1** — fields exist, arrays always empty | 1053 | **+16** (two length prefixes + `ev_slot`) |
+| **a2** — 2 peers observed | 1093 | **+56** |
+
+One `AgentState` per agent per cycle at `TS = 0.10 s`, and each agent receives its two peers':
+
+- **tx: +40 B/cycle = +400 B/s** per agent
+- **rx: +80 B/cycle = +800 B/s** per agent
+
+The 16 B an `a1` agent pays is the price of the fields *existing*; it is unavoidable once the
+message carries them, and it is why `a1` is the right baseline rather than a pre-spec build.
+
+#### 8.2 What that is against, and why the A/B cannot resolve it
+
+Measured from `d_0801_072156` (a1 soak, 772 s of recorded intervals, `achieved_rounds` mean 19.91):
+
+| | robot1 | robot2 | robot3 |
+|---|---|---|---|
+| tx | 789 123 B/s | 789 223 B/s | 788 941 B/s |
+| rx | 799 642 B/s | 799 720 B/s | 799 467 B/s |
+
+So the evidence payload is **+0.051 % tx / +0.100 % rx**. Traffic is dominated by `EdgeXi`/`EdgeZ`
+at ~3.9 kB per ADMM round, 20 rounds per cycle, 10 cycles/s.
+
+And that ratio is the finding, because it is also the reason the A/B cannot measure it: **a shift
+of 0.01 in mean `achieved_rounds` moves the total by ~390 B/s** — the same size as the entire
+effect. The three agents in a single run already differ by 0.02 in that mean. Quoting an `a1` → `a2`
+byte delta as "the cost of the defence" would have been quoting ADMM convergence noise with a
+decimal point on it.
+
+**Method (unchanged, and it matters).** `bytes_tx`/`bytes_rx` are read-and-reset by `take_bytes()`
+at every `publishStats`, so each `stats.csv` row carries the traffic since that robot's previous
+row. The rate is a sum over intervals, not a first-to-last span: the first row holds everything
+since node start, and `g5_logger`'s subscriptions do not all establish at once — in one run two
+robots had a 37.5 s hole while the third started 37.6 s in, which a span-based rate turned into a
+spurious 1.4× difference between two identically-configured agents. Intervals longer than 1 s are
+dropped from both numerator and denominator.
+
+#### 8.3 A/B result — does the defence cost anything beyond its payload?
+
+⏳ *a2 soak in progress.*
 
 ---
 
 ## 9. What the harness got wrong, and when
 
 Every number above depends on the harness being right about what it was measuring. It was not,
-three times, and each correction changed which runs counted. Recording it here because a results
+six times, and each correction changed which runs counted. Recording it here because a results
 table that hides its own instrument history is not checkable.
 
 | # | what was wrong | how it was found | effect |
@@ -776,6 +850,8 @@ table that hides its own instrument history is not checkable.
 | 1 | `inject_odom_fake` was **never set at all**. Task 10 built both halves of the dual-channel forgery; the arm selector wired only the claim half. | reading the arm selector against Task 10's report before the first run | every arm would have faced a single-channel attack — the one A1 catches trivially. Acceptance criterion 1 could neither have passed nor failed honestly. |
 | 2 | Three `ros2 param set` calls do not land together. Measured skew **2.78 s**. | pilot run `d_0801_035833`: agent1 blocked the attacker 0.61 s into its own single-channel window | "A1 caught the lie on 1/2 survivors" was measuring the harness. Fixed by `arm_attack.py` (one process, one discovery, all requests back to back → **93 µs**). |
 | 3 | `KILL_AT_X` was decorative — the attack fired 2.8–3.9 m past where it was staged, by an amount that depends on RTF. | comparing the requested and actual trigger positions across runs | where the attack lands decides what the run tests, so runs were not comparable. Two causes: a pre-arm block that ran while the fleet walked, and `fleet_centroid` costing ~15 s per call. Now fires at **x = 3.125** for a requested 3.0. |
+| 6 | `form_half_extent` read the latched `/formation/plan` **once**, with a 6 s timeout, and printed **`0`** when the read came up empty — which no distance is ever below, so `walk_until`'s acceptance clause was silently dead. | the a2 soak sat 25 polls at 0.516 m against a half-extent that had accepted an identical **0.517 m** in the a1 run fifteen minutes earlier | a converged fleet standing on station was scored **"never reached the outbound goal"**. The read fails by *run state* — a fresh subscription has to finish discovery, measured past the timeout after a daemon stop — so it looked fixed right up until it wasn't. Now: 3 attempts, print **nothing** on failure, and `walk_until` aborts as infra rather than evaluating a clause it cannot evaluate. |
+| 5 | The WBC-deactivation guard ran **after** phase 8's plan-coverage assertion, so whichever check sat earlier in the file wrote the diagnosis. | `d_0801_074359`: robots 2 and 3 deactivated 17 ms apart on `QP is infeasible`; the run reported `FleetPlan covers 1 robot(s), expected 3` | an **upstream** QP failure was reported as a defence result, exit 1, which the results protocol forbids re-running. Fixed by `wbc_guard()`: classify on whether the run contains an adversary at all (`NO_KILL` → infra; otherwise fail closed, because with an attacker present a felled robot could be the attacker's doing), and check it **first**. |
 | 4 | The "keep-out blocked" acceptance test, **wrong in both directions**. | batch 1 run 4 wedged at 0.820 against a corrected bound of 0.815 (5 mm); batch 2 run 2 stalled 0.527 m from a 9 m goal with the corpse 4.9 m away | first it forgave any stall below 0.65 m — half a *static* corpse radius, when every lying arm produces a *mobile* one at 1.63 m. Then my replacement asked whether the **goal** was fenced, when the original comment said a **slot** can be. Now: stalled **and** (goal inside a keep-out → mission denied, counted) **or** (centroid inside the formation's published half-extent → arrived). Both read off the run's own geometry; the constant is gone. |
 
 Two measurement bugs in the analysis script were also found and fixed, both of which had produced
@@ -798,5 +874,17 @@ plausible-looking numbers:
 |---|---|---|---|
 | `d_0801_035833` | a1 | **REJECTED — harness** | Arming skew 2.78 s. The three forgery knobs were set by three separate `ros2 param set` processes; agent1's odom half landed 2.78 s after the claim half and it blocked the attacker 0.61 s into that single-channel window. Measured the harness, not the detector. Cause of the `arm_attack.py` rewrite. |
 | `d_0801_040522` | a1 | **pilot, accepted as a wiring check only** | Arming skew 93 µs (agents' own log stamps). gate2 caught the lie on 0/2 survivors — the structural miss the design predicts. Not counted toward `n`: it ran before the `KILL_AT_X` staging fix, so its attack fired at x = 5.77 instead of the requested x = 3.0. |
+
+| `d_0801_073719` | a2 soak | **REJECTED — harness** | `form_half_extent` returned empty, `walk_until` read it as a half-extent of 0, and 25 polls at a converged 0.516 m were scored "never reached the outbound goal". The a1 run had accepted an identical 0.517 m fifteen minutes earlier. §9 #6. |
+| `d_0801_074359` | a2 soak | **REJECTED — infra (reclassified after the fact, see note)** | Robots 2 and 3 hit `Premature homotopy termination because QP is infeasible` and their controllers deactivated **17 ms apart** at sim t ≈ 115.9, immediately after the phase-8 goal reversal. Their odom stopped, both agents logged *"inputs stale … holding OFF the wire so peers can evict me instead of waiting forever"* — by design — and agent1 evicted them for silence that was entirely real. **Belief never convicted anybody**: totals stayed 4.6–9.2 against `evict < −9.20`. Two robots genuinely fell over; no false positive. |
+
+⚠️ **`d_0801_074359` exited 1, not 2, and the pre-registered rule says exit 2 is the only
+automatic exclusion.** I am reclassifying it by hand, so it is worth being exact about what that
+does and does not rest on. It rests on log evidence that is not a judgement call — an upstream QP
+solver failing in `legged_stack`, which this project does not modify, in a run configured with no
+adversary in it at all. It does not rest on the run having been inconvenient. The classifier
+itself is now fixed (§9 #5) so that this decision is made by the script from the run's own
+configuration rather than by me from its outcome; every later run is classified before anyone
+sees what it produced.
 
 ⏳ *Matrix attempts appended as they complete.*
