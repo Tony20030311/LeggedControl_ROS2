@@ -108,13 +108,18 @@ class G5Logger(Node):
     def on_stats(self, m):
         t = self.get_clock().now().nanoseconds * 1e-9
         hist = "|".join(f"{x:.6g}" for x in m.r_prim_hist)
-        # Task 11 item 1: parallel arrays (tel_peer/tel_resid/tel_l_self/tel_l_total/tel_abstain),
+        # Task 11 item 1: parallel arrays (tel_peer/tel_resid/tel_l_act/tel_l_rep/tel_l_total/tel_abstain),
         # same convention as r_prim_hist above -- '|'-joined groups, one per peer judged this
         # cycle. Empty under obs_gate2=false (A1 arm never populates these; see CycleStats.msg).
+        # SIX fields per peer since 2026-08-02 (was five): l_self split into l_act (position,
+        # decides eviction) and l_rep (smear check, decides testimony weight). The field was
+        # RENAMED rather than reused so a stale parser fails loudly instead of reading l_act
+        # where it expects the old combined value -- the same silent-wrong-column failure that
+        # min_pair had at N=5.
         tel = "|".join(
-            f"{p}:{r:.6g}:{ls:.6g}:{lt:.6g}:{ab}"
-            for p, r, ls, lt, ab in zip(m.tel_peer, m.tel_resid, m.tel_l_self, m.tel_l_total,
-                                        m.tel_abstain))
+            f"{p}:{r:.6g}:{la:.6g}:{lr:.6g}:{lt:.6g}:{ab}"
+            for p, r, la, lr, lt, ab in zip(m.tel_peer, m.tel_resid, m.tel_l_act, m.tel_l_rep,
+                                            m.tel_l_total, m.tel_abstain))
         self.sf.write(f"{t:.3f},{m.robot_id},{m.cycle_id},{m.achieved_rounds},{m.n_timeouts},"
                       f"{m.t_wait_state:.6g},{m.t_wait_xi:.6g},{m.t_wait_z:.6g},"
                       f"{m.t_cycle_wall:.6g},{m.t_node:.6g},{m.t_edge_solve:.6g},"

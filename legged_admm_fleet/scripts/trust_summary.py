@@ -163,16 +163,37 @@ for rid, seq in per_robot.items():
     if dur > 0:
         tx_rate[rid], rx_rate[rid], comm_window[rid] = tx / dur, rx / dur, dur
 
-# tel = "peer:resid:l_self:l_total:abstain" groups, '|'-joined. Empty for A0/A1 (beliefStep
-# never runs there), which is itself the measurement: those arms broadcast no evidence, so the
-# A1-vs-A2 byte rates above are a real A/B of what the defence costs on the wire.
-tel = []       # (sim_t, observer, peer, resid, l_self, l_total, abstain)
+# tel groups, '|'-joined. Empty for A0/A1 (beliefStep never runs there), which is itself the
+# measurement: those arms broadcast no evidence, so the A1-vs-A2 byte rates above are a real A/B
+# of what the defence costs on the wire.
+#
+# TWO WIDTHS, both live, because runs recorded before 2026-08-02 are still being analysed:
+#   5 fields  peer:resid:l_self:l_total:abstain              (l_self carried position AND smear)
+#   6 fields  peer:resid:l_act:l_rep:l_total:abstain         (split; l_act decides eviction)
+# The old l_self is reported as l_act with l_rep NaN, because that is what it was: the eviction
+# input. It is NOT the same quantity, so nothing may silently average the two across the split --
+# hence l_rep is NaN rather than 0 for old logs, and a mean over it will come out NaN loudly.
+#
+# Any OTHER width is a hard error. The previous code tested `len(p) == 5` and dropped anything
+# else, so a format change would have produced an empty telemetry table and a report full of
+# "no data" that looks exactly like an arm that legitimately produced none.
+tel = []       # (sim_t, observer, peer, resid, l_act, l_rep, l_total, abstain)
+NAN = float("nan")
 for r in st:
-    for g in (r.get("tel") or "").split("|"):
+    raw = (r.get("tel") or "").strip()
+    if not raw:
+        continue
+    for g in raw.split("|"):
         p = g.split(":")
         if len(p) == 5:
-            tel.append((fnum(r["t"]), r["robot"], p[0], fnum(p[1]), fnum(p[2]),
+            tel.append((fnum(r["t"]), r["robot"], p[0], fnum(p[1]), fnum(p[2]), NAN,
                         fnum(p[3]), int(fnum(p[4], 0))))
+        elif len(p) == 6:
+            tel.append((fnum(r["t"]), r["robot"], p[0], fnum(p[1]), fnum(p[2]), fnum(p[3]),
+                        fnum(p[4]), int(fnum(p[5], 0))))
+        else:
+            sys.exit("FATAL: tel group %r has %d fields, expected 5 (pre-split) or 6 (split). "
+                     "Refusing to report on telemetry this script cannot read." % (g, len(p)))
 
 # Attack onset in SIM time, per observer: the first of ONSET_RUN consecutive samples whose
 # residual is past anything clean flight produced (0.0890 m, calibration doc). Not the throttled
@@ -253,8 +274,8 @@ tte = {}
 for obs_id in {x[1] for x in tel}:
     seq = sorted([x for x in tel if x[2] == victim and x[1] == obs_id], key=lambda x: x[0])
     t_on = onset_of([(x[0], x[3]) for x in seq])
-    t_blk = next((t for t, _o, _p, _r, _ls, _lt, ab in seq if ab == 1 and (t_on is None or t >= t_on)),
-                 None)
+    t_blk = next((t for t, _o, _p, _r, _la, _lr, _lt, ab in seq if ab == 1
+                  and (t_on is None or t >= t_on)), None)
     if t_on is not None and t_blk is not None:
         tte[obs_id] = t_blk - t_on
 
@@ -332,9 +353,12 @@ ABSTAIN = {0: "evidence", 1: "peer_blocked", 2: "no_fresh_claim", 3: "no_obs_buf
 if tel:
     observers = sorted({x[1] for x in tel})
     by_t = {}
-    for t, o, p, _r, l_self, _lt, ab in tel:
+    # l_act is the quantity the occlusion criterion is about: it must not move while every
+    # observer is blind. l_rep is deliberately not used here -- a peer that reports nothing
+    # while occluded takes a decay step on l_rep by design, so it is expected to move.
+    for t, o, p, _r, l_act, _lr, _lt, ab in tel:
         if p == victim:
-            by_t.setdefault(round(t, 1), {})[o] = (ab, l_self)
+            by_t.setdefault(round(t, 1), {})[o] = (ab, l_act)
     best, cur = [], []
     for t in sorted(by_t):
         v = by_t[t]
@@ -347,7 +371,7 @@ if tel:
     if len(cur) > len(best):
         best = cur
     hist = {}
-    for _t, o, p, _r, _ls, _lt, ab in tel:
+    for _t, o, p, _r, _la, _lr, _lt, ab in tel:
         if p == victim:
             hist[ABSTAIN[ab]] = hist.get(ABSTAIN[ab], 0) + 1
     print("abstain codes    %s   [about robot%s, every observer, whole run]" % (hist, victim))

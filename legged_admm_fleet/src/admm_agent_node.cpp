@@ -730,7 +730,7 @@ private:
             const int j = kv.first;
             if (j == self_id_) continue;
             // BUG FIX (found in review): std::map::operator[]'s "value-init a fresh key"
-            // guarantee zero-initializes a scalar -- why resid_[j]/l_self_[j] elsewhere in this
+            // guarantee zero-initializes a scalar -- why resid_[j]/l_act_[j] elsewhere in this
             // file are safe -- but Eigen::Vector2d's default constructor is a deliberate no-op
             // for performance (no EIGEN_INITIALIZE_MATRICES_BY_ZERO/NAN in this build), so a
             // never-written key's operator[] returns whatever bytes were already in the freshly
@@ -1184,7 +1184,7 @@ private:
         // Task 11 item 1: this cycle's unthrottled telemetry (CycleStats.tel_*), refilled from
         // scratch every call -- cycle()-thread only, same discipline as ev_out_peer_/ev_out_pos_
         // just below, so no lock needed.
-        tel_peer_.clear(); tel_resid_.clear(); tel_l_self_.clear();
+        tel_peer_.clear(); tel_resid_.clear(); tel_l_act_.clear(); tel_l_rep_.clear();
         tel_l_total_.clear(); tel_abstain_.clear();
 
         // SECOND-HAND EVIDENCE, PART 1: fold in what other peers reported THIS slot (task 7
@@ -1192,10 +1192,10 @@ private:
         //  - review finding 3: a peer is both a first-hand TARGET (below) and, in the same slot,
         //    potentially a second-hand REPORTER whose own credibility just moved. Accumulating
         //    the reporter's contribution here into `smear_contrib` and feeding it to the SAME
-        //    trust_step_observed call below (as `extra_llr`) means l_self_[reporter] is decayed
+        //    trust_step_observed call below means l_rep_[reporter] is decayed
         //    by lambda exactly once this slot, not twice.
         //  - spec 5.3: w_i (how much we weight a relayer) must be "the PREVIOUS slot's" belief in
-        //    that relayer, so trust_step_relay below must read l_self_[i] before this slot's
+        //    that relayer, so trust_step_relay below must read l_rep_[i] before this slot's
         //    first-hand update touches it -- which running this section first guarantees for free.
         // `touched` records every (target, source) pair trust_step_relay actually updated this
         // slot, so the decay pass in part 2 does not decay-then-add the same pair twice.
@@ -1264,12 +1264,12 @@ private:
                     if (cj == agent_->peer_xnow().end()) continue;
                     // Hearsay about j itself: corroborated against j's OWN claim, weighted and
                     // capped by how much WE trust i as of LAST slot (trust_step_relay's own
-                    // invariant; l_self_[i] has not been touched yet this slot -- see above).
+                    // invariant; l_rep_[i] has not been touched yet this slot -- see above).
                     const double r = (z - cj->second.head<2>()).norm();
                     double& C = l_relay_[j][i];
                     C = admm::trust_step_relay(C, admm::trust_llr(r, trust_.sigma, trust_.d_lie,
                                                                   trust_.clamp_step, trust_.credit_ratio),
-                                               l_self_[i], trust_);
+                                               l_rep_[i], trust_);
                     touched.insert({j, i});
                 }
                 if (contrib != 0.0)
@@ -1280,7 +1280,7 @@ private:
                                  self_id_, smear_checks_hit_, smear_checks_total_);
         }
         // SECOND-HAND EVIDENCE, PART 2: decay every relay entry NOT freshly updated above, once
-        // per slot -- the same "decay always, evidence only when fresh" discipline l_self_
+        // per slot -- the same "decay always, evidence only when fresh" discipline l_act_
         // follows below. A blocked reporter's entries are ERASED outright (review finding 2):
         // once fenced, its word about anyone must stop existing, not decay toward neutral over
         // ~2s while still counting toward a target's total -- the same shape of bug as the
@@ -1295,7 +1295,7 @@ private:
                 const int i = it->first;
                 if (transport_->blocked(i)) { it = sources.erase(it); continue; }
                 if (touched.count({j, i})) { ++it; continue; }
-                it->second = admm::trust_step_relay(it->second, 0.0, l_self_[i], trust_);
+                it->second = admm::trust_step_relay(it->second, 0.0, l_rep_[i], trust_);
                 ++it;
             }
         }
@@ -1357,9 +1357,30 @@ private:
             } else if (!blocked) {
                 abstain = kAbstainNoFreshClaim;
             }
-            double& L = l_self_[j];
-            const auto sc = smear_contrib.find(j);
+            // TWO LEDGERS (see l_act_/l_rep_). Each takes exactly one kind of evidence, and the
+            // separation is the whole fix: summing them let a peer's honest self-report buy off
+            // its own smearing, because both landed on the same scalar.
+            //
+            // ACTOR: the first-hand position residual, and nothing else. extra_llr is 0 here --
+            // the smear no longer touches what decides eviction.
+            double& L = l_act_[j];
             L = admm::trust_step_observed(L, blocked, fresh, vis, observed, kv.second.head<2>(),
+                                          0.0, trust_);
+            // REPORTER: the smear check, and nothing else. Passed as extra_llr with the position
+            // pair suppressed (claim_fresh=false), so trust_step_observed contributes only the
+            // smear term while still applying the same decay discipline -- rather than a second
+            // hand-rolled accumulator that could drift from trust_step_self's semantics.
+            //
+            // A peer that reported nothing checkable this slot has no entry in smear_contrib and
+            // therefore takes a pure decay step, which is correct: an unverifiable report is not
+            // evidence of dishonesty, and silence is not evidence of either. It also means a peer
+            // that has never relayed anything sits at 0, where clamp(l_rep, 0, l_max) already
+            // gives its testimony zero weight -- Zikratov's "first time ... minimum reputation",
+            // and identical to the value l_self_ used to hold at start-up.
+            const auto sc = smear_contrib.find(j);
+            double& R = l_rep_[j];
+            R = admm::trust_step_observed(R, blocked, /*claim_fresh=*/false, vis, observed,
+                                          kv.second.head<2>(),
                                           sc != smear_contrib.end() ? sc->second : 0.0, trust_);
             // Task 11 item 1: recorded for EVERY peer, including a blocked one (trust_total is
             // pure and cheap -- the live decision path below still skips it there via `continue`,
@@ -1371,7 +1392,8 @@ private:
             tel_resid_.push_back(abstain == kAbstainNone
                                       ? (observed - kv.second.head<2>()).norm()
                                       : std::numeric_limits<double>::quiet_NaN());
-            tel_l_self_.push_back(L);
+            tel_l_act_.push_back(L);
+            tel_l_rep_.push_back(R);
             tel_l_total_.push_back(total);
             tel_abstain_.push_back(abstain);
             if (blocked) continue;   // already latched off; nothing left to decide
@@ -1644,7 +1666,8 @@ private:
         // between beliefStep calls (it doesn't today, but a copy costs nothing at fleet scale).
         m.tel_peer = tel_peer_;
         m.tel_resid = tel_resid_;
-        m.tel_l_self = tel_l_self_;
+        m.tel_l_act = tel_l_act_;
+        m.tel_l_rep = tel_l_rep_;
         m.tel_l_total = tel_l_total_;
         m.tel_abstain = tel_abstain_;
         // Task 11 item 4: same read-and-reset pattern as n_obs_dropped just above.
@@ -1717,10 +1740,34 @@ private:
     double resid_alpha_ = 0.2, resid_gate_ = 0.5;
     bool log_only_ = true;                          // measure before you block; see calibration
     // Belief layer (trust.hpp). Every default is derived. obs_gate2_ selects gate2() vs
-    // beliefStep() at every call site (see detect()); l_self_ is beliefStep()'s per-peer state.
+    // beliefStep() at every call site (see detect()); l_act_/l_rep_ are its per-peer state.
     admm::TrustParams trust_;
     bool obs_gate2_ = false;                        // false=gate2() (A1), true=beliefStep() (A2)
-    std::map<int, double> l_self_;                  // first-hand log-odds per peer (trust_step_self)
+    // TWO LEDGERS, NOT ONE (2026-08-02). These used to be a single `l_self_` that carried three
+    // roles at once: what a peer did, how good a witness it is, and how much its testimony counts.
+    // A peer that lies only about OTHERS while reporting its own position honestly then became
+    // unconvictable at any fleet size -- everyone's observation corroborates its own claim, so the
+    // relay term is positive and offsets first-hand suspicion that has already saturated at the
+    // floor. Measured: l_self floors at l_evict - clamp_step = -11.2, the relay sum caps at
+    // +l_max = 4.6, and -11.2 + 4.6 = -6.6 never reaches l_evict = -9.2 (§8b.1 of the results;
+    // three independent N=5 observers each measured exactly -6.600).
+    //
+    // Zikratov, Lebedev & Gurtov, "Trust and Reputation Mechanisms for Multi-agent Robotic
+    // Systems" (LNCS 8638, pp. 106-120) -- this project's own reference for the trust layer --
+    // keeps them apart by construction: Definition 1's TRUST is about the object of the vote,
+    // Definition 2's REPUTATION is about the voter, and its conclusion asks an agent "not only to
+    // execute functions for serving a target but also to give a correct feedback on the actions of
+    // other robots". Two requirements, two variables.
+    //
+    // The split follows the harm, which is the reason it is safe to stop trying to convict a
+    // smearer: lying about where YOU are shrinks the barrier and can put a body into another
+    // robot, so it must be evictable. Lying about where SOMEONE ELSE is cannot -- the barrier uses
+    // positions, and this peer's own position is honest -- so the proportionate answer is to stop
+    // counting its testimony, not to remove a working robot and leave a keep-out disc behind.
+    std::map<int, double> l_act_;   // ACTOR trust: first-hand position residual only. Drives
+                                    // eviction via trust_total(l_act_[j], l_relay_[j]).
+    std::map<int, double> l_rep_;   // REPORTER reputation: the smear check only. Weights and caps
+                                    // this peer's relayed testimony; never evicts on its own.
     // l_relay_[j][i]: peer i's relayed contribution to OUR belief about peer j (trust_step_relay),
     // so "all hearsay about j" is the single map l_relay_[j] that trust_total consumes directly.
     std::map<int, std::map<int, double>> l_relay_;
@@ -1728,7 +1775,7 @@ private:
     // and cleared by beliefStep() only -- cycle()-thread only, same as ev_out_peer_/ev_out_pos_.
     // Stay empty for the whole run under obs_gate2=false (gate2() never touches them).
     std::vector<std::int32_t> tel_peer_;
-    std::vector<double> tel_resid_, tel_l_self_, tel_l_total_;
+    std::vector<double> tel_resid_, tel_l_act_, tel_l_rep_, tel_l_total_;
     std::vector<std::int32_t> tel_abstain_;
     // Task 11 item 4: relayed reports refuted as geometrically implausible THIS cycle (the
     // refute_ratio calibration input). Same thread as tel_*_ above -- no atomic needed, unlike

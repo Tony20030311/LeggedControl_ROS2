@@ -36,7 +36,15 @@ bool    reset            # NaN/cold-start cycle: solved but published no target 
 # variants); gate2()'s A1 EMA residual keeps its own, separately-calibrated throttled log.
 int32[]   tel_peer      # peer (target) robot id this row is about
 float64[] tel_resid     # |observed - claimed| this slot; NaN when tel_abstain != 0 (no evidence)
-float64[] tel_l_self    # first-hand log-odds for this peer AFTER this slot's update (l_self_[j])
+float64[] tel_l_act     # ACTOR trust after this slot: the first-hand position residual only
+                         # (l_act_[j]). This is what eviction is decided on. RENAMED from
+                         # tel_l_self, and renamed deliberately rather than reused: its meaning
+                         # narrowed on 2026-08-02 when the smear term moved to tel_l_rep, so a
+                         # parser written against the old field would have kept working while
+                         # silently reading a different quantity.
+float64[] tel_l_rep     # REPORTER reputation after this slot: the smear check only (l_rep_[j]).
+                         # Weights and caps this peer's relayed testimony; never evicts on its
+                         # own. 0 for a peer that has never relayed anything checkable.
 float64[] tel_l_total   # first-hand + capped hearsay (trust_total), computed every row for
                          # telemetry even on a blocked peer, where the live code path skips it
 int32[]   tel_abstain    # why tel_resid carries no evidence this slot:

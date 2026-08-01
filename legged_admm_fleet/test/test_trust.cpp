@@ -854,6 +854,103 @@ void test_trust_step_observed_extra_llr_applies_without_a_fresh_first_hand_check
     assert(std::abs(got - (decayed + extra)) < 1e-12);
 }
 
+
+// --- THE ACTOR / REPORTER SPLIT (2026-08-02) -------------------------------------------------
+// admm_agent_node keeps two ledgers where it used to keep one: l_act_ takes the first-hand
+// position residual and decides eviction, l_rep_ takes the smear check and decides how much this
+// peer's relayed testimony counts. The node itself has no unit test, so what is pinned here is
+// the exact trust.hpp contract the split leans on -- if any of these four change, the node's
+// arithmetic silently changes with them.
+
+// l_act_'s call passes extra_llr = 0. A smear must not move it, however blatant.
+void test_split_actor_ledger_ignores_the_smear_term() {
+    TrustParams p;
+    const Eigen::Vector2d obs(1.0, 0.0), claim(1.0, 0.0);   // position agrees exactly
+    const double honest = trust_step_observed(0.0, false, true, true, obs, claim, 0.0, p);
+    // Same slot, but the peer also fabricated a sighting worth a full penalty. The ACTOR ledger
+    // is called with 0.0 for extra_llr, so it must land in exactly the same place.
+    const double with_smear_suppressed =
+        trust_step_observed(0.0, false, true, true, obs, claim, 0.0, p);
+    assert(std::abs(honest - with_smear_suppressed) < 1e-15
+           && "the actor ledger must be identical whether or not the peer smeared");
+    assert(honest > 0.0 && "an honest position must still earn credit");
+}
+
+// l_rep_'s call passes claim_fresh=false, so the position pair contributes nothing and only the
+// smear term lands. Without this the reporter ledger would inherit position credit and a smearer
+// with an honest position would never lose its voice -- the original bug, one level down.
+void test_split_reporter_ledger_ignores_the_position_residual() {
+    TrustParams p;
+    const Eigen::Vector2d obs(0.0, 0.0), claim(5.0, 5.0);   // wildly disagreeing position
+    const double no_report = trust_step_observed(0.0, false, false, true, obs, claim, 0.0, p);
+    assert(std::abs(no_report - 0.0) < 1e-15
+           && "with no smear evidence the reporter ledger must not move on position alone");
+    const double smeared = trust_step_observed(0.0, false, false, true, obs, claim,
+                                               -p.clamp_step, p);
+    assert(std::abs(smeared - (-p.clamp_step)) < 1e-12
+           && "the reporter ledger must take the smear term and nothing else");
+}
+
+// The point of the whole change: a convicted reporter's testimony is worth exactly nothing, not
+// merely less. trust_step_relay caps at clamp(l_src, 0, l_max), so a negative reputation gives a
+// cap of 0 and the accumulator cannot leave zero however many slots it runs.
+void test_split_a_floored_reporter_carries_exactly_zero_testimony() {
+    TrustParams p;
+    const double floored = p.l_evict - p.clamp_step;        // -11.2, the reporter ledger's floor
+    double C = 0.0;
+    for (int slot = 0; slot < 200; ++slot)                  // a full-penalty accusation, forever
+        C = trust_step_relay(C, -p.clamp_step, floored, p);
+    assert(std::abs(C) < 1e-15 && "a floored reporter must contribute exactly zero, not a little");
+    // And an honest reporter is untouched by the change: full weight, as before.
+    double H = 0.0;
+    for (int slot = 0; slot < 200; ++slot)
+        H = trust_step_relay(H, -p.clamp_step, p.l_max, p);
+    assert(H < -p.l_max + 1e-9 && "an honest reporter must still carry its full weight");
+}
+
+// End to end, against the numbers written down in the reviewed derivation
+// (docs/superpowers/specs/2026-08-02-actor-reporter-split-derivation.md) BEFORE the change was
+// made. Two scenarios decide whether the split did what it claimed:
+//   position liar  -- first-hand AND relayed evidence both point down; must still convict
+//   smearer        -- own position honest, so both point UP; must NOT convict, and must be mute
+void test_split_end_to_end_matches_the_reviewed_derivation() {
+    TrustParams p;
+    auto run = [&p](double r_pos, bool smears, double* out_total, double* out_rep) {
+        double l_act = 0.0, l_rep = 0.0;
+        std::map<int, double> relay;
+        const Eigen::Vector2d claim(0.0, 0.0);
+        const Eigen::Vector2d obs(r_pos, 0.0);              // |obs - claim| == r_pos
+        for (int slot = 0; slot < 60; ++slot) {
+            l_act = trust_step_observed(l_act, false, true, true, obs, claim, 0.0, p);
+            if (smears)
+                l_rep = trust_step_observed(l_rep, false, false, true, obs, claim,
+                                            -p.clamp_step, p);
+            // Every other agent relays what it SAW of this peer, compared against this peer's own
+            // claim -- so the relayed residual is r_pos too, not the smear.
+            for (int src = 0; src < 4; ++src)
+                relay[src] = trust_step_relay(relay[src],
+                                              trust_llr(r_pos, p.sigma, p.d_lie, p.clamp_step,
+                                                        p.credit_ratio),
+                                              p.l_max, p);
+        }
+        *out_total = trust_total(l_act, relay, p);
+        *out_rep = l_rep;
+    };
+    double total = 0.0, rep = 0.0;
+
+    run(0.4243, false, &total, &rep);                       // a0/a1/a2 position-forgery arm
+    assert(total < p.l_evict && "a position liar must still be convicted after the split");
+    assert(std::abs(total - (-15.8)) < 1e-6 && "derivation predicted -15.800");
+
+    run(0.02, true, &total, &rep);                          // smear arm: honest position
+    assert(total > 0.0 && "a smearer honest about its own position must NOT be convicted");
+    assert(std::abs(total - 9.2) < 1e-6 && "derivation predicted +9.200");
+    assert(std::abs(rep - (p.l_evict - p.clamp_step)) < 1e-9
+           && "and its reporter reputation must sit on the floor, -11.200");
+    assert(std::abs(std::clamp(rep, 0.0, p.l_max)) < 1e-15
+           && "so its testimony is capped at exactly zero");
+}
+
 // --- evict_patience (Task 6, review finding 2): a belief conviction earns shorter patience,
 // but that must NOT leak to gate2 or the roster-exclusion path, which share the same transport-
 // level blocked() latch and never earned the accumulator's multi-slot debounce.
@@ -941,6 +1038,10 @@ int main() {
     test_trust_step_observed_fresh_claim_uses_the_residual();
     test_trust_step_observed_combines_extra_llr_in_one_step_not_two();
     test_trust_step_observed_extra_llr_applies_without_a_fresh_first_hand_check();
+    test_split_actor_ledger_ignores_the_smear_term();
+    test_split_reporter_ledger_ignores_the_position_residual();
+    test_split_a_floored_reporter_carries_exactly_zero_testimony();
+    test_split_end_to_end_matches_the_reviewed_derivation();
     test_evict_patience_belief_block_gets_the_short_patience();
     test_evict_patience_roster_exclusion_or_gate2_keeps_the_long_patience();
     test_evict_patience_unblocked_peer_gets_ordinary_silence_patience();
