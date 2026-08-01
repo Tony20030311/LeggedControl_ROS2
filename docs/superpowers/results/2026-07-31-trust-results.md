@@ -289,9 +289,48 @@ point regardless; what a non-converged run loses is only its return leg.
 
 ---
 
-## 4. smear / duty / forged_obs ⏳
+## 4. smear / duty / forged_obs
 
-*Pending.*
+### 4.1 smear — the target is protected, the smearer is not convicted, and the reason is §10
+
+First run (`d_0801_053552`), and it is a substantive result rather than a null one.
+
+**Acceptance criterion 5, first half: holds.** The smear target (robot1) was never blocked by
+anything. The observing survivor's belief about it bottomed at `l_self` 3.578 / `l_total` 3.416,
+nowhere near the −9.2 threshold. The relay term the smear tried to plant was capped by the
+smearer's own collapsing credibility, exactly as designed.
+
+**Second half: the smearer was not convicted — structurally, not by mis-tuning.**
+
+| observer | about | `l_self` min | `l_total` min |
+|---|---|---|---|
+| agent3 | robot2 (the smearer) | **−11.200** (the floor) | **−7.797** |
+| agent1 | robot2 | 2.375 | 6.558 |
+| agent3 | robot1 (the target) | 3.578 | 3.416 |
+
+agent3's smear check fired and charged the reporter at the full penalty every slot — its `l_self`
+reached the floor. But `l_total = l_self +` the clamped relay sum, and **agent1's relay about
+robot2 was positive**, pulling the total back to −7.797 and short of conviction.
+
+**Why only one observer could check it.** `SMEAR_TARGET` defaults to the first survivor, robot1,
+and `beliefStep` skips `j == self_id_` — an agent cannot run a smear check on a report about
+*itself*. At N = 3, with the target being one of only two possible observers, **exactly one agent
+can ever check the smear**, and its conviction is then diluted by the other agent's honest
+positive relay.
+
+That is spec §10 verbatim: *"symmetric 1v1: evidence symmetric, third party blind → no eviction;
+at N = 3 every close approach is this case."*
+
+**This is the strongest argument for the five-dog runs.** At N = 5 a smeared target still leaves
+three agents able to check the report, so the relay sum carries the conviction instead of
+cancelling it. **The N = 3 smear arm should be read as measuring the declared blind spot, not as
+a defence failure** — and a further N = 5 run should point `SMEAR_TARGET` at a *non-observer*,
+which is the case the mechanism was designed for and which N = 3 cannot construct.
+
+Incidental: one `REJECTED AgentState from robot2 — non-finite` (Gate 1) on each survivor, a
+single message out of thousands, unrelated to the smear path. Recorded, not explained.
+
+⏳ *Remaining smear reps, duty and forged_obs pending.*
 
 **Registered in advance for `duty`** (so that a surprise is recognisable as one): `dutyLying` is
 a fixed 50 % duty cycle — it lies for the first half of every `P`-slot window — so `P` changes
