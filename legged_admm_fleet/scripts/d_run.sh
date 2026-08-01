@@ -303,15 +303,14 @@ arm_trot
 read HX HY <<< "$(fleet_centroid "$ROBOTS")"
 GX=$(python3 -c "print(f'{$HX+$GOAL_X:.3f}')"); GY=$HY
 say "home=($HX,$HY) outbound formation goal = ($GX,$GY)"
-send_formation_goal "$GX" "$GY"
-# WHERE the victim dies decides what gets tested, so trigger on position, not a timer: a
-# fixed sleep depends on RTF and made the first run kill next to the goal, so nothing had to
-# route around anything. KILL_AT_X=0 falls back to the timer.
+# PRE-ARM BEFORE THE GOAL IS SENT, so the fleet is standing still through it. It used to run
+# after send_formation_goal, "while the fleet walks up to the trigger point" -- but the block
+# costs 10-30 s of `ros2 param set` round trips, and at 0.4 m/s the fleet covers that ground
+# before the KILL_AT_X wait loop even starts sampling: d_0801_040522 asked for x=3.0 and
+# triggered at x=5.766. Where the attack lands then depends on RTF, which is not comparable
+# across arms. Nothing here changes behaviour, so paying for it at a standstill costs only
+# wall-clock and makes KILL_AT_X mean what it says.
 KILL_AT_X=${KILL_AT_X:-0}
-# PRE-ARM, while the fleet is still walking up to the trigger point. Everything here is a slow
-# `ros2 param set` round trip that does NOT change behaviour until the lie fires, and doing it at
-# the trigger instead cost 20+ s — 8 m of walking — so the attack kept landing two peg rows past
-# where it was staged. After this block the trigger costs exactly one param set.
 if [ -n "${LIE:-}" ]; then
   ros2 daemon stop >/dev/null 2>&1; sleep 4
   PIDV=$(pgrep -f "admm_agent_$VICTIM" | head -1)
@@ -324,8 +323,9 @@ if [ -n "${LIE:-}" ]; then
       pset /admm_agent_$j detection_log_only true || die_infra "could not disarm Gate 2 on agent$j"
     done
   fi
-  say "pre-armed: the lie now costs one param set at the trigger"
+  say "pre-armed: the whole attack now costs one arm_attack.py dispatch at the trigger"
 fi
+send_formation_goal "$GX" "$GY"
 if [ "$(python3 -c "print(1 if $KILL_AT_X>0 else 0)")" = 1 ]; then
   say "waiting for fleet centroid to reach x=$KILL_AT_X before silencing robot$VICTIM"
   KX_OK=0
@@ -405,37 +405,80 @@ if [ -n "${LIE:-}" ]; then
   # smear channel dies before it ever accumulates anything -- the arm would report "no honest
   # peer was evicted" for entirely the wrong reason and prove nothing about acceptance criterion
   # 5. Skip the position lie for smear; every other arm still sends it.
-  if [ "$ARM" != smear ]; then
-    pset /admm_agent_$VICTIM inject_fake_offset "$LIE" \
-      || die_infra "inject_fake_offset failed (is the param declared?)"
-  fi
-  # Task 11 item 6: the arm's OWN attack knob, fired in the SAME burst as the position lie above
-  # -- design spec protocol item 2: switching two forgery channels at different times lets the
-  # detector catch the attacker on the first channel alone, minutes before the second is live,
-  # which makes any control-arm timing meaningless. Task 10's report on inject_forged_obs (used
-  # by forged_obs below) documents its "late impostor" case needs no launch-time support -- it is
-  # this same runtime param, fired here, after the real Gazebo publisher already exists.
+  # Spec §9 protocol item 2's other half: assert the detector has said NOTHING about the victim
+  # before the attack exists. A pre-trigger flag means the arm was never measured -- whatever
+  # blocked the attacker did so for a setup artefact, and both the time-to-evict and the A1-vs-A2
+  # comparison built on it are fiction. Cheaper to catch here than to discover in the results.
+  PRE_DET=$(count_agents "GATE2 would reject robot$VICTIM")
+  PRE_BLK=$(count_agents "REJECTED AgentState from robot$VICTIM")
+  [ "$((PRE_DET + PRE_BLK))" = 0 ] \
+    || die_infra "detector flagged robot$VICTIM $((PRE_DET + PRE_BLK)) time(s) BEFORE the attack was armed — nothing measured after this point is attributable to the attack"
+  # THE WHOLE ATTACK IN ONE DISPATCH. Every knob that defines this arm goes out from a single
+  # rclpy process (arm_attack.py) that waits for all the parameter services and then fires all
+  # the requests back to back, so the spread is service latency instead of process startup.
+  #
+  # Three separate `ros2 param set` calls do not work here even backgrounded: each pays its own
+  # graph discovery, and three contending measured 2.78 s apart (d_0801_035833). In that gap
+  # gate2() differences one forged channel against one honest one -- r = 0.424 m for LIE=0.30,
+  # since the offset goes into x AND y -- against a 0.30 m gate, and agent1 blocked the attacker
+  # 0.61 s in. Its "A1 caught the lie" was the harness, not the detector.
+  #
+  # --max-skew is a hard gate, not a report: past ~one slot the arm is measuring the race again,
+  # and a silently-skewed run is indistinguishable in the results table from a clean one.
+  SPECS=""
   case "$ARM" in
     smear)
+      # Spec §9 A2-smear: this attacker's OWN position stays honest (so no claim lie and no odom
+      # forgery -- sending them made a2 convict it on the first-hand residual in under a second,
+      # erasing the blocked reporter's relay entries before the smear channel accumulated
+      # anything). Target first, then the value: they are applied in array order and the value's
+      # own log line names the target.
       SMEAR_TARGET=${SMEAR_TARGET:-${SURVIVORS%% *}}
-      pset /admm_agent_$VICTIM inject_fake_evidence_target "$SMEAR_TARGET" \
-        || die_infra "inject_fake_evidence_target failed"
-      pset /admm_agent_$VICTIM inject_fake_evidence "$LIE" \
-        || die_infra "inject_fake_evidence failed"
+      SPECS="/admm_agent_$VICTIM:inject_fake_evidence_target:int:$SMEAR_TARGET"
+      SPECS="$SPECS /admm_agent_$VICTIM:inject_fake_evidence:double:$LIE"
       say "  smear: robot$VICTIM fabricates a ${LIE}m false sighting of robot$SMEAR_TARGET"
       ;;
+    *)
+      # DUAL-CHANNEL FORGERY (spec §9 protocol item 2). A real attacker owns its estimator as
+      # well as its planner, so the claim lie alone is not the threat model: gate2() differences
+      # the claim against /robotJ/controller/odom, which the same compromised process produces,
+      # and an attacker that makes both agree leaves NO residual. That is exactly the attack A1
+      # is structurally blind to and A2 has to catch, so every position-lying arm faces it.
+      # _peer names WHICH peer's odom copy each survivor forges and must precede the offset in
+      # the array: parameters are applied in order, and the offset's own log line names the peer.
+      SPECS="/admm_agent_$VICTIM:inject_fake_offset:double:$LIE"
+      for j in $SURVIVORS; do
+        SPECS="$SPECS /admm_agent_$j:inject_odom_fake_peer:int:$VICTIM"
+        SPECS="$SPECS /admm_agent_$j:inject_odom_fake:double:$LIE"
+      done
+      say "  dual-channel forgery: robot$VICTIM claims +${LIE}m AND every survivor's odom copy of it reads +${LIE}m"
+      ;;
+  esac
+  case "$ARM" in
     duty)
-      pset /admm_agent_$VICTIM inject_duty_cycle "${DUTY_PERIOD:-2}" \
-        || die_infra "inject_duty_cycle failed"
+      SPECS="$SPECS /admm_agent_$VICTIM:inject_duty_cycle:int:${DUTY_PERIOD:-2}"
       say "  duty: robot$VICTIM lies for the first half of every ${DUTY_PERIOD:-2}-slot window"
       ;;
     forged_obs)
       FORGED_TARGET=${FORGED_TARGET:-${SURVIVORS%% *}}
-      pset /admm_agent_$VICTIM inject_forged_obs "$FORGED_TARGET" \
-        || die_infra "inject_forged_obs failed"
+      SPECS="$SPECS /admm_agent_$VICTIM:inject_forged_obs:int:$FORGED_TARGET"
       say "  forged_obs: robot$VICTIM impersonates robot$FORGED_TARGET's observation channel"
       ;;
   esac
+  # DEAF as well as lying (LIE_DEAF=1, the default). A liar that still runs its own avoidance is
+  # a "cooperative liar": the separation that survives is then partly ITS doing, and the demo
+  # cannot claim the survivors kept themselves safe. Dropping all its incoming peer states makes
+  # it genuinely non-cooperative -- it times out, evicts everyone, and walks solo to its goal.
+  # In the same dispatch as everything else: staggering it re-opens the race that used to let the
+  # attacker evict both survivors and rebuild solo before any detector was armed.
+  [ "${LIE_DEAF:-1}" = 1 ] && SPECS="$SPECS /admm_agent_$VICTIM:inject_drop_p:double:1.0"
+  # Attacker speed: OFF by default. Running the hunter at 0.55 against survivors capped at 0.4
+  # meant they could not out-accelerate the closing rate -- the keep-out was violated faster than
+  # a step could answer it, so the film showed a hit and no dodge. Set CHASE_V to bring it back.
+  [ -n "${CHASE_V:-}" ] && SPECS="$SPECS /admm_agent_$VICTIM:v:double:$CHASE_V"
+  python3 "$SCRIPTS/arm_attack.py" --max-skew="${MAX_SKEW:-0.20}" $SPECS 2>&1 \
+    | tee -a "$LOGD/$TAG.log"
+  [ "${PIPESTATUS[0]}" = 0 ] || die_infra "could not arm the attack in one dispatch (see the skew line above) — a staggered arming measures the harness, not the detector"
   # CHARGE NOW, not after the eviction is logged. Waiting for that cost ~10 s, and at 0.4 m/s the
   # attacker walks 4 m in it — past the very peg it was supposed to round, which is why three
   # takes filmed a stroll instead of an attack. The eviction lands ~1 s after the lie regardless.
@@ -514,19 +557,9 @@ PY
       /robot$VICTIM/goal geometry_msgs/msg/PoseStamped \
       "{header: {frame_id: world}, pose: {position: {x: $CX, y: $CY, z: 0.5}}}" >/dev/null 2>&1
   fi
-  # Attacker speed: OFF by default. Running the hunter at 0.55 against survivors capped at 0.4
-  # meant they could not out-accelerate the closing rate — the keep-out was violated faster than
-  # a step could answer it, so the film showed a hit and no dodge. Same speed for everyone makes
-  # the evasion legible. Set CHASE_V explicitly to bring the speed advantage back.
-  [ -n "${CHASE_V:-}" ] && { pset /admm_agent_$VICTIM v "$CHASE_V" \
-    || say "  (v not settable — charging at the fleet speed)"; }
-  # DEAF as well as lying (LIE_DEAF=1, the default). A liar that still runs its own avoidance is
-  # a "cooperative liar": the separation that survives is then partly ITS doing, and the demo
-  # cannot claim the survivors kept themselves safe. Dropping all its incoming peer states makes
-  # it genuinely non-cooperative — it times out, evicts everyone, and walks solo to its goal.
-  if [ "${LIE_DEAF:-1}" = 1 ]; then
-    pset /admm_agent_$VICTIM inject_drop_p 1.0 || die_infra "could not deafen the liar"
-  fi
+  # (CHASE_V and the LIE_DEAF deafening used to be two more `ros2 param set` round trips here;
+  # they now ride in the single arm_attack.py dispatch above, so nothing about the attacker's
+  # configuration changes after the fleet has already reacted to part of it.)
 else
 say "phase 5: SIGSTOP admm_agent_$VICTIM (pid $PIDV)"
 kill -STOP "$PIDV" || die_infra "SIGSTOP failed"
