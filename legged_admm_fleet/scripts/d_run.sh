@@ -203,16 +203,33 @@ form_half_extent() {
   # resolves to 0, and the acceptance clause below can never fire -- every converged-but-not-
   # arrived run is then scored as a failure to reach. Measured live on d_0801_053826: 45 polls
   # sitting at 0.51 m against a 0.808 m half-extent that should have accepted it at poll 7.
-  timeout 6 ros2 topic echo /formation/plan --once --qos-durability transient_local 2>/dev/null | python3 -c "
+  #
+  # RETRIED, and the retry is not belt-and-braces either. Even with the right durability the read
+  # needs a fresh subscription to finish discovery, and after `ros2 daemon stop` that has been
+  # measured past the 6 s timeout. A single attempt therefore fails INTERMITTENTLY, by run state
+  # rather than by configuration -- which is worse than failing always, because it looks fixed.
+  # Measured live on d_0801_073719: the a2 soak sat 25 polls at 0.516 m against a half-extent that
+  # had accepted the IDENTICAL distance in the a1 run 15 minutes earlier, and would have run out
+  # of polls and been scored as "never reached the goal".
+  #
+  # Prints NOTHING when no plan is readable, and the caller aborts on that. It used to print 0,
+  # which silently disabled the acceptance clause and turned a failed measurement into a wrong
+  # verdict -- the failure mode that cost the run above.
+  local a out
+  for a in 1 2 3; do
+    out=$(timeout 6 ros2 topic echo /formation/plan --once --qos-durability transient_local 2>/dev/null | python3 -c "
 import re, sys, math
 t = sys.stdin.read()
 m = re.search(r'goals:\n((?:- [-\d.e]+\n)*)', t)
 v = [float(x) for x in re.findall(r'- ([-\d.e]+)', m.group(1))] if m else []
 p = list(zip(v[::2], v[1::2]))
 if not p:
-    print('0'); sys.exit()
+    sys.exit()
 cx, cy = sum(a for a, _ in p) / len(p), sum(b for _, b in p) / len(p)
-print('%.3f' % max(math.hypot(a - cx, b - cy) for a, b in p))" 2>/dev/null || echo 0
+print('%.3f' % max(math.hypot(a - cx, b - cy) for a, b in p))" 2>/dev/null)
+    [ -n "$out" ] && { echo "$out"; return 0; }
+  done
+  return 1
 }
 
 walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
@@ -220,7 +237,13 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
   # the return leg became "walk to where you already are" — a PASS that tested nothing.
   local wx wy D M i BEST=99 STALE=0
   # Read once, not per poll: it is a topic echo, and the shape does not change mid-leg.
-  local HALF=$(form_half_extent)
+  # A leg whose half-extent could not be read cannot be scored -- the acceptance clause below
+  # would be silently dead and a converged fleet would be reported as never having arrived. That
+  # is a broken MEASUREMENT, not a result, so abort as infra (exit 2) rather than produce a
+  # verdict this run has no way to justify.
+  local HALF
+  HALF=$(form_half_extent) \
+    || die_infra "/formation/plan unreadable after 3 attempts — cannot score arrival for this leg"
   for i in $(seq 1 "$4"); do
     read wx wy <<< "$(fleet_centroid "$3")"
     D=$(python3 -c "import math;print(f'{math.hypot($wx-$1, $wy-$2):.3f}')")
@@ -291,7 +314,7 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
         MISSION_DENIED=1
         return 0
       fi
-      if [ "$(python3 -c "print(1 if $D < ${HALF:-0} else 0)")" = 1 ]; then
+      if [ "$(python3 -c "print(1 if $D < $HALF else 0)")" = 1 ]; then
         say "  no progress for ${STALE} polls at dist=$D, within the formation's own half-extent"
         say "  ${HALF} m (from the published slots) — everyone is on station and the centroid"
         say "  cannot get closer. Accepting as arrived."
