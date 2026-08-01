@@ -109,6 +109,29 @@ count_distinct_agents() { grep_agents "$1" | grep -oE '\[admm_agent_[0-9]+\]' | 
 # produced this outcome" (1, ordinary die) without a human reading every log.
 die_infra() { say "FAIL(infra): $*"; exit 2; }
 
+# The upstream WBC activation/plan race (CLAUDE.md; lives in ocs2/legged_stack, which this project
+# does not modify) shows up as "Deactivating controllers" in gazebo.log, and gz_deactivated cannot
+# tell it from an attacker having genuinely rammed a robot hard enough to trip the whole-body
+# controller. So classify on the one property of the RUN that decides whether that ambiguity even
+# exists: was an adversary introduced at all?
+#
+#   adversary present -> cannot distinguish -> fail closed as an OUTCOME (exit 1).
+#   NO_KILL           -> phase 5 was skipped, there is no attacker, nothing in the experiment
+#                        could have destabilised anybody -> it is the upstream race, exit 2.
+#
+# One rule read off the run's own configuration rather than a list of arm names. Without it a
+# soak whose robots were felled by an upstream QP failure is reported as a defence result:
+# d_0801_074359 lost robots 2 and 3 to "Premature homotopy termination because QP is infeasible"
+# 17 ms apart, they held off the wire exactly as designed, robot1 evicted them for real silence --
+# entirely correct behaviour, scored as a failed no-attacker soak.
+wbc_guard() {
+  gz_deactivated || return 0
+  if [ "${NO_KILL:-0}" = 1 ]; then
+    die_infra "WBC deactivated $* with NO adversary in the run — upstream activation/plan race"
+  fi
+  die "WBC deactivated $*"
+}
+
 # Wait until $2 DISTINCT agents have logged pattern $1, or $3 seconds elapse. Echoes the count.
 wait_for_log() {
   local pat="$1" want="$2" secs="$3"
@@ -277,11 +300,7 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
         die "pairwise $M < $DMIN_ABORT (collision guard)"
       fi
     fi
-    # NOT die_infra: this fires on every poll of every walk_until call, most of which happen
-    # AFTER the lie/silence has landed. gz_deactivated only sees "Deactivating" in gazebo.log --
-    # it cannot tell the pre-existing upstream activation race from an attacker's ram genuinely
-    # destabilising a robot hard enough to trip the WBC. Cannot distinguish -> fail closed.
-    gz_deactivated && die "WBC deactivated mid-walk"
+    wbc_guard "mid-walk"
     [ "$(python3 -c "print(1 if $D<0.45 else 0)")" = 1 ] && return 0
     # A GOAL can be inside the corpse keep-out, and then the centroid can never reach it.
     # Measured (late kill at x=15.3): corpse at (16.16,-0.55), COL2 rear slot at (17.24,-0.02) is
@@ -929,6 +948,12 @@ fi   # end NO_KILL branch
 say "phase 8: new /formation/goal back HOME to ($HX,$HY) — must route around the corpse"
 send_formation_goal "$HX" "$HY"
 sleep 3
+# BEFORE the coverage assertion, not after. A robot the upstream WBC dropped stops publishing
+# odom, so the coordinator's live set legitimately shrinks and the plan legitimately covers fewer
+# robots -- the assertion below then fails the run for a correct plan describing a real fleet.
+# The guard has to be the thing that speaks first, or the diagnosis is written by whichever check
+# happens to sit earlier in the file.
+wbc_guard "before the phase 8 plan check"
 say "current /formation/plan:"
 timeout 6 ros2 topic echo /formation/plan --once --qos-durability transient_local 2>/dev/null | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
 N_PLAN=$(timeout 6 ros2 topic echo /formation/plan --once --qos-durability transient_local 2>/dev/null | python3 -c "
