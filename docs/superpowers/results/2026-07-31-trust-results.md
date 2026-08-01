@@ -961,7 +961,27 @@ N = 5 is a robot's x coordinate. It cannot fail loudly — a coordinate is a pla
 number — so the guard fires whenever any robot walks through x < 0.9. Fixed by locating the column
 by header name (§9 #7).
 
-⏳ *Re-run in progress.*
+**Second attempt `d_0801_080904` — PASS.** Same configuration, fixed guard.
+
+| | value |
+|---|---|
+| verdict | **`D PASS`** — out to 9 m and home, `arrive_dist` 0.382, `mission_denied` 0 |
+| coordinator | `shape=V5 -> plan for 5 dog(s)`; `plan covers 5 robot(s)` on **both** legs |
+| worst centre distance | 1.2718 (1195 logged rows) |
+| worst true body gap | **0.4432 m** (1059 rows) — contact is 0 |
+| `EVICT` / `REJECTED` over the whole run | **0 / 0** |
+
+Worst `min_h` is **−0.0726**, i.e. the pentagon dips just inside the `D_MIN` = 1.30 barrier while
+turning — the same thing the three-dog V does, and 0.443 m of real body clearance away from
+touching anything. Nothing here needed the collision guard's help.
+
+**What this establishes, and what it does not.** It establishes that N = 5 *runs*: the roster,
+the generated degraded columns, the pentagon, the coordinator's size guard, the observation range
+and both loggers all work at five, and the belief layer produces no false positive over a full
+out-and-back. It does **not** yet say anything about the N = 3 blind spot, which needs the smear
+arm.
+
+⏳ *`ARM=smear` at N = 5 in progress — that is the run this section exists for.*
 
 ---
 
