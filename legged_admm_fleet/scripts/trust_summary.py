@@ -101,6 +101,32 @@ vic_gap = min((g for p, g in gap_by_pair.items() if victim in p.split("-")),
 vic_gap_pair = min((p for p, g in gap_by_pair.items() if victim in p.split("-")),
                    key=lambda p: gap_by_pair[p], default="none")
 
+# ---- what the survivors actually fenced (the lie's second effect) ---------------------------
+# A lie does not only shrink clearance -- it MOVES the corpse keep-out, and a keep-out is a
+# no-go disc the fleet's own goal can end up inside. The EVICT line prints the anchor and the
+# radius corpse_keepout chose, so both come from the agents rather than being re-derived here.
+#
+# "ghost offset" is the CLOSEST the fenced disc's centre ever came to the victim's true body,
+# minimised over every dist.csv row. Deliberately a minimum over the whole run and not a value
+# at the eviction instant: that would need a wall-to-sim conversion, and a lower bound is the
+# stronger claim anyway -- if even the closest approach is large, the fence never covered the
+# body at any point. Conservative anchoring should drive this toward zero.
+ko = re.findall(r"EVICT robot%s .*?corpse CBF at predicted rest \(([-\d.]+),([-\d.]+)\) r=([\d.]+)"
+                % victim, alog)
+ROBOT_MARGIN = 0.60      # admm_agent_node.cpp's robot_margin, added on top of the keep-out radius
+ko_anchor = (float(ko[0][0]), float(ko[0][1])) if ko else None
+ko_r = float(ko[0][2]) + ROBOT_MARGIN if ko else float("nan")
+goal_m = re.search(r"outbound formation goal = \(([-\d.]+),([-\d.]+)\)", dlog)
+goal = (float(goal_m.group(1)), float(goal_m.group(2))) if goal_m else None
+goal_to_anchor = math.dist(goal, ko_anchor) if (goal and ko_anchor) else float("nan")
+ghost = float("nan")
+if ko_anchor and d and victim:
+    try:
+        ghost = min(math.hypot(fnum(r["x%s" % victim]) - ko_anchor[0],
+                               fnum(r["y%s" % victim]) - ko_anchor[1]) for r in d)
+    except KeyError:
+        pass
+
 # ---- consensus health, comm cost, belief telemetry -----------------------------------------
 # bytes_tx/bytes_rx are read-and-RESET by take_bytes() at every publishStats, so each row is
 # the traffic since the previous row: summing them and dividing by the sim span is the honest
@@ -233,6 +259,12 @@ print("blocked victim   gate2=%s belief=%s roster=%s   EVICT=%s" %
       (",".join(blk_gate2) or "-", ",".join(blk_belief) or "-",
        ",".join(blk_roster) or "-", ",".join(evicted) or "-"))
 print("FALSE POSITIVES  %s" % (", ".join("agent%s blocked robot%s" % x for x in false_pos) or "none"))
+if ko_anchor:
+    print("keep-out         anchored (%.2f,%.2f) r_eff=%s m; GHOST OFFSET %s m (closest the fenced"
+          " disc ever came to the real body)" % (ko_anchor[0], ko_anchor[1], f(ko_r, 2), f(ghost, 3)))
+    print("mission denial   goal is %s m from that anchor -> %s the keep-out" %
+          (f(goal_to_anchor, 3),
+           "INSIDE (goal unreachable by construction)" if goal_to_anchor < ko_r else "outside"))
 print("refutations      %d refuted / %d checked" % (refuted, checked))
 print("time-to-evict    %s   [sim seconds, both ends from CycleStats' own clock]" %
       (", ".join("agent%s %ss (%.0f slots)" % (o, f(v, 2), round(v / 0.1)) for o, v in sorted(tte.items()))
