@@ -329,6 +329,36 @@ int main() {
                   "-- requires a second pass to see");
         assert(!majority_excluded(two_pass, 3) && "never in majority");
     }
+    {
+        // NO FIXED POINT -> EXCLUDE NOBODY. Every robot has unilaterally dropped everyone else.
+        // This is not hypothetical: it is what a correlated communication stall produces with NO
+        // attacker present -- one missed exchange leaves each agent waiting on a different barrier
+        // phase, every peer looks silent to every other, and each silence counter evicts the rest
+        // (measured, d_0801_075028). The iteration then alternates forever between "all three
+        // excluded" and "none excluded", because dropping every ballot leaves nobody to vote.
+        //
+        // The old code ran out of passes and returned whichever parity it stopped on, which was
+        // "exclude all three" -- so the coordinator handed out no formation slots at all and the
+        // fleet wedged with no way back. Ask for each robot in turn: none of them may be excluded
+        // on evidence that contradicts itself.
+        const std::map<int, std::vector<int>> no_fixed_point{{1, {1}}, {2, {2}}, {3, {3}}};
+        for (int r = 1; r <= 3; ++r)
+            assert(!majority_excluded(no_fixed_point, r)
+                   && "self-contradictory ballots must exclude NOBODY, never everybody");
+        // Even sizes alternate on a different parity than odd ones, so the bound cannot be
+        // trusted to land anywhere in particular. Pin both.
+        const std::map<int, std::vector<int>> no_fixed_point4{
+            {1, {1}}, {2, {2}}, {3, {3}}, {4, {4}}};
+        for (int r = 1; r <= 4; ++r)
+            assert(!majority_excluded(no_fixed_point4, r)
+                   && "non-convergence must not depend on fleet size parity");
+        // The guard must not swallow the legitimate case that merely LOOKS similar: a genuine
+        // unanimous verdict still converges, and must still evict.
+        const std::map<int, std::vector<int>> unanimous{{1, {1}}, {2, {2, 3}}, {3, {2, 3}}};
+        assert(majority_excluded(unanimous, 1) && "a real 2-0 verdict must survive the guard");
+        assert(!majority_excluded(unanimous, 2) && "and must not spread to the honest dogs");
+        assert(!majority_excluded(unanimous, 3) && "and must not spread to the honest dogs");
+    }
     // 9. TASK 10: the fault-injection helpers themselves. Pure functions (agent_core.hpp), not
     //    exercised anywhere else in this suite, so their reachability/inertness has to be pinned
     //    here directly rather than assumed from the send_state wiring around them.

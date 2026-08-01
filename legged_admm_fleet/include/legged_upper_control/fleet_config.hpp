@@ -160,13 +160,30 @@ inline bool majority_excluded(const std::map<int, std::vector<int>>& views, int 
     };
 
     std::set<int> excluded;
+    bool converged = false;
     for (std::size_t pass = 0; pass <= views.size(); ++pass) {
         std::set<int> next;
         for (const auto& kv : views)
             if (excluded_by(kv.first, excluded)) next.insert(kv.first);
-        if (next == excluded) break;
+        if (next == excluded) { converged = true; break; }
         excluded = std::move(next);
     }
+    // NO FIXED POINT -> EXCLUDE NOBODY. Running out of passes does not mean the last state was
+    // the answer; it means the ballots are self-contradictory and there IS no answer. Returning
+    // the state the loop happened to stop on returned the maximally wrong one: on the fully
+    // symmetric input {1:[1], 2:[2], 3:[3]} -- every robot has unilaterally dropped everyone
+    // else, which is exactly what a correlated communication stall produces with no attacker at
+    // all -- the iteration alternates between {1,2,3} and {} forever, and whichever parity the
+    // bound landed on decided whether the coordinator excluded the entire fleet. It excluded all
+    // three, so nobody got a formation slot and the fleet wedged.
+    //
+    // Exclude nobody, because the two failure modes are not symmetric in cost. Keeping a robot
+    // that may be gone means the coordinator plans a slot for a dog that will not fill it: the
+    // formation is wrong until the next goal, and it recovers on its own the moment any ballot
+    // becomes decisive. Excluding everyone means no robot is ever handed a target again, and
+    // nothing in the system can undo it. A fleet holding a stale opinion is recoverable; a
+    // wedged fleet is not.
+    if (!converged) return false;
     return excluded_by(i, excluded);
 }
 
