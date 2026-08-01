@@ -6,6 +6,26 @@ Calibration this builds on: `2026-07-31-trust-calibration.md`.
 
 **Status: IN PROGRESS.** Sections marked ⏳ have no data yet and must not be cited.
 
+## Acceptance criteria at a glance
+
+Spec §9's eight criteria, each of which was required to be *able* to fail. Six have data.
+
+| # | criterion | outcome |
+|---|---|---|
+| 1 | A2 catches what A1 structurally cannot | ✅ a1: **0 detector-attributed blocks in 5 runs**; a2: convicted in 5 runs, **0.50 s / 5 slots** every time |
+| 2 | conservative anchoring keeps the body gap from shrinking | ⚠️ **does not cover the corpse anchor** (registered Task 13). A2's advantage comes from *winning a race*, and the harness under-models the attacker on that path, so its numbers are a **lower bound** |
+| 3 | NO_KILL soak, zero false positives | ⏳ soak pending — but **zero false positives across 18 attack runs** |
+| 4 | occlusion: abstention positively recorded, `L` unchanged, resumption | ✅ **and the criterion's wording is wrong** — see §5.1, it should read "suspicion does not decay" |
+| 5 | smear: honest peer never evicted, smearer caught | **half.** Target never blocked (3/3) ✅; smearer never convicted ❌ — spec §10's declared N = 3 blind spot, not a tuning failure |
+| 6 | asymmetric credit convicts an intermittent liar | ❌ **evades when the lying burst is shorter than the conviction depth** (P = 2: 0/3; P = 10: 1/3) |
+| 7 | the fixed-point correction stops the stale-vote deadlock | ❌ **it does not** — `majority_excluded` has no fixed point on the symmetric input and the loop bound returns the maximally wrong answer, wedging the fleet (§6) |
+| 8 | regression: 44 oracle + ctest + G1 bit-identical | ✅ 44 passed, 6/6, `worst max\|delta\| = 0` |
+
+**Three of the six settled criteria did not pass.** Each failure is mechanistically traced, and
+criteria 6 and 7 plus the caveat on 2 all reduce to **one structural problem**: the belief
+accumulator races against roster-exclusion, and whatever loses that race decides where the
+corpse keep-out gets anchored.
+
 ---
 
 ## 0. How to read this document
