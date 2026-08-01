@@ -371,6 +371,34 @@ the attacker to win by halving how fast evidence accumulates. The duty arm, the 
 the `corpseAnchor` decision are **one structural problem, not three**, and the useful fix is at
 the race rather than at `credit_ratio`.
 
+**Across all three P = 2 reps:**
+
+| rep | belief blocked? | ghost offset | verdict |
+|---|---|---|---|
+| 1 | ✗ (roster-exclusion only) | 0.419 | PASS |
+| 2 | ✗ | 0.422 | did not converge (0.529) |
+| 3 | ✗ | **0.003** | PASS |
+
+**The duty-cycled liar evaded the belief layer in 3 of 3.** Systematic, not probabilistic: the
+halved accumulation rate means the belief layer needs ~2.7× longer than the ~11-slot silence
+path, so it loses every time.
+
+**And rep 3's ghost offset is 3 mm despite the belief layer never convicting.** The mechanism is
+worth stating: `corpseAnchor` uses `latest_claim` — the *last* `AgentState` received — and
+`P = 2` alternates every slot, so whether the keep-out lands on the lie or on the truth depends
+entirely on which half of the duty cycle the attacker's final broadcast fell in. Two landed on a
+lying slot (0.419, 0.422 — the same value as a0/a1), one on an honest slot (0.003).
+
+That is an **independent confirmation that the keep-out follows the claim**, and it exposes
+something worse than the a0/a1 case: an intermittent liar can *choose* the phase of its last
+broadcast, i.e. choose whether to leave a 1.63 m exclusion disc in the wrong place. In a0/a1 the
+displacement was at least deterministic.
+
+It also sharpens the `corpseAnchor` question (§10, decision 2): keying on belief rather than on
+block reason would **not** fix the duty case on its own, because belief never convicts there. The
+duty arm argues the anchor question is about *which channel is trusted*, not merely about which
+verdict fired.
+
 ⏳ *duty P = 10, forged_obs, occl and the LIE_DEAF=0 control pending.*
 
 **Registered in advance for `duty`** (so that a surprise is recognisable as one): `dutyLying` is
