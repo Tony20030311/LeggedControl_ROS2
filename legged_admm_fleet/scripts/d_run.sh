@@ -238,9 +238,12 @@ form_half_extent() {
   # Prints NOTHING when no plan is readable, and the caller aborts on that. It used to print 0,
   # which silently disabled the acceptance clause and turned a failed measurement into a wrong
   # verdict -- the failure mode that cost the run above.
+  # 3x6s was still not enough -- it aborted a third run (d_0801_183953) after the measurement it
+  # existed to protect had already been taken. Discovery for a fresh subscription is the cost
+  # here, so more time per attempt beats more attempts.
   local a out
-  for a in 1 2 3; do
-    out=$(timeout 6 ros2 topic echo /formation/plan --once --qos-durability transient_local 2>/dev/null | python3 -c "
+  for a in 1 2 3 4 5; do
+    out=$(timeout 12 ros2 topic echo /formation/plan --once --qos-durability transient_local 2>/dev/null | python3 -c "
 import re, sys, math
 t = sys.stdin.read()
 m = re.search(r'goals:\n((?:- [-\d.e]+\n)*)', t)
