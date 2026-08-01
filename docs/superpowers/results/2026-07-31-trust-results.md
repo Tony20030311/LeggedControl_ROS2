@@ -574,6 +574,36 @@ steered, which is what the `occl` arm and `hide_spot.py` are for. `out_of_range`
 all, confirming the calibration finding that `obs_range = 4.0` does not bind at these fleet
 spacings.
 
+### 5.1 Result — criterion satisfied, and its wording needs correcting
+
+`d_0801_063709`. Longest window with **every** observer at abstain code 5: **0.60 s / 7 slots**
+(t = 109.90–110.50). Inside it:
+
+| observer | belief about the attacker | `l_self` across the window | \|Δ\| |
+|---|---|---|---|
+| agent3 | had convicted it (log-only, at the floor) | −11.2000 → −11.2000 | **0.000000** |
+| agent1 | still trusted it | 4.6000 → 3.4028 | 1.197 |
+
+**One window demonstrates both halves of the designed asymmetry.**
+
+- **Suspicion does not decay while unobservable** — exact zero over seven slots. This is
+  `trust.hpp`'s stated rule: *clearing suspicion requires evidence of honest behaviour, and
+  evidence requires visibility; being unobservable is not proof of innocence.* **An attacker
+  cannot launder suspicion by hiding.**
+- **Positive trust does decay**, at λ per slot (4.6 × 0.951⁶ = 3.40, matching to two decimals) —
+  *a peer honest all mission must not buy undetected approach time.*
+
+⚠️ **Wording correction for acceptance criterion 4.** The spec asks for "`L` numerically
+unchanged across the window". That is true only for a *suspected* peer; trust decaying is the
+intended complementary behaviour, not a violation. The criterion should read **"suspicion does
+not decay"**. The probe could show both at once only because the two observers happened to hold
+opposite beliefs about the same peer — log-only let agent3 convict while agent1 never did.
+
+Abstain histogram: `{evidence 1567, occluded 38, out_of_range 56, no_fresh_claim 6}`. **Both
+visibility codes are positively recorded** — the hide spot sometimes took the attacker past
+`obs_range` as well as behind cover, and the single `not_visible` code this project split in
+review round 2 would have concealed that distinction.
+
 Two further things established before running it:
 
 - **A doubly-occluded, in-range spot exists**: a search over the plum pile list found one for
