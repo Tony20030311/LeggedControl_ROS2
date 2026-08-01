@@ -14,7 +14,7 @@ Spec §9's eight criteria, each of which was required to be *able* to fail. Seve
 |---|---|---|
 | 1 | A2 catches what A1 structurally cannot | ✅ a1: **0 detector-attributed blocks in 5 runs**; a2: convicted in 5 runs, **0.50 s / 5 slots** every time |
 | 2 | conservative anchoring keeps the body gap from shrinking | ⚠️ **does not cover the corpse anchor** (registered Task 13). A2's advantage comes from *winning a race*, and the harness under-models the attacker on that path, so its numbers are a **lower bound** |
-| 3 | NO_KILL soak, zero false positives | ❌ **a2 partitioned the fleet with no attacker** — not the belief layer (`L` flat at 4.600 vs −9.20) but a correlated barrier stall the *silence* rule resolves by eviction (§6.2). a1's 675.3 s pass had **4 slots of margin** on the same mechanism |
+| 3 | NO_KILL soak, zero false positives | ❌ **a2 partitioned the fleet with no attacker** — not the belief layer (`L` flat at 4.600 vs −9.20) but a correlated barrier stall the *silence* rule resolves by eviction (§6.2). a1's 675.3 s pass had **4 slots of margin** on the same mechanism, and separately is **not** evidence the fleet held separation: all three soaks reached body gaps of 0.18–0.24 m (§6.1) |
 | 4 | occlusion: abstention positively recorded, `L` unchanged, resumption | ✅ **and the criterion's wording is wrong** — see §5.1, it should read "suspicion does not decay" |
 | 5 | smear: honest peer never evicted, smearer caught | **half, and the recorded reason was wrong.** Target never blocked (3/3 at N=3, 1/1 at N=5) ✅; smearer never convicted ❌ — **not** an N = 3 blind spot but an inequality between three constants, `floor + l_max = −6.6 > −9.2 = l_evict`, so a peer honest about *itself* is structurally unconvictable at **any** N. N = 5 is strictly **worse** (§8b.1) |
 | 6 | asymmetric credit convicts an intermittent liar | ❌ **evades when the lying burst is shorter than the conviction depth** (P = 2: 0/3; P = 10: 1/3) |
@@ -1128,5 +1128,7 @@ sees what it produced.
 | `d_0801_080532` | N=5 a2 `NO_KILL` | **REJECTED — harness** | Collision guard read `min_pair` from column 8 by position, which at N = 5 is `x4`. Aborted on `pairwise 0.8108 < 0.90` at the instant robot4 was at x = 0.8108; the run's worst real `min_pair` was 1.4468 and its worst body gap 0.6007 m. §9 #7. |
 | `d_0801_080904` | N=5 a2 `NO_KILL` | **PASS** | `shape=V5 -> plan for 5 dog(s)`, both legs, `arrive_dist` 0.382, worst body gap 0.4432 m, zero evictions, zero blocks. §8b. |
 | `d_0801_081301` | N=5 `smear` | **PASS (harness) / criterion 5(b) fails** | Smeared peer never blocked; smearer never convicted, and the telemetry shows why it never could be: `floor + l_max = −6.6 > −9.2`. §8b.1. |
+
+| `d_0801_082228` | a2 soak (repeat) | **FAIL — genuine separation breach, not a partition** | Aborted at sim 234.5 on `pairwise 0.8425 < 0.90`, and this one is real: worst `min_pair` 0.8415, worst true body gap **0.2421 m**. Zero evictions and zero blocks in those 234 s, so no false positive. Does **not** give n = 2 on §6.2's partition — it failed earlier, for a different reason. First soak on the post-rebuild binary; `shape_for(3,3)` is unchanged and COL2 bit-identity is asserted by test. |
 
 ⏳ *Matrix attempts appended as they complete.*
