@@ -462,7 +462,53 @@ off, which turns that 50 % into 100 %. **The apparent improvement in the duty gh
 artefact of an uncontrolled attacker, not a property of the defence**, and it would be a serious
 misreading to quote the 1–4 mm figures as duty-arm performance.
 
-⏳ *forged_obs, occl and the LIE_DEAF=0 control pending.*
+### 4.5 forged_obs, late impostor — the pin's coverage case, cleanly
+
+| rep | belief convicted | time-to-evict | ghost offset | impostor samples rejected | false positives |
+|---|---|---|---|---|---|
+| 1 | agent1 + agent3 | 5 slots | 0.003 | **42,961** | 0 |
+| 2 | agent1 + agent3 | 5 slots | 0.005 | **40,318** | 0 |
+| 3 | agent1 + agent3 | 5 slots | 0.005 | **39,902** | 0 |
+
+Detection is **indistinguishable from a clean a2 run**. The GID pin rejected every impersonating
+sample, the observation channel stayed honest, and the position lie was caught on the same
+5-slot schedule. One of the few acceptance criteria that comes out cleanly.
+
+**Quote the counter, never the log.** ~40,000 rejected samples against **88** throttled
+`second publisher` WARN lines — a factor of ~460. Task 10 added `n_obs_dropped` on the grounds
+that a dying observation channel must reach the run's verdict rather than a throttled line; this
+is the proof, and it is the same argument as §9 protocol item 6 arrived at from the opposite
+direction.
+
+### 4.6 forged_obs, first mover — ⚠️ NOT ACTUALLY EXECUTED
+
+`FORGED_FIRST=1` produced numbers indistinguishable from §4.5 (belief convicted on both in 5
+slots, ghost 0.007, 37,923 samples rejected, zero false positives). **That is not coverage — the
+arm did not run the case it was supposed to run.**
+
+Timing, from `d_0801_062505`:
+
+| event | time |
+|---|---|
+| Gazebo plugin starts publishing `/robot1/hardware/odom` (phase 1) | 06:25:08 |
+| impersonating publisher created at agent construction (phase 3) | 06:25:42 |
+
+**34 seconds late.** The observing agent's GID pin was already latched onto the genuine writer,
+so the impostor was rejected — the *late-impostor* path. Task 10 described this case as "given a
+nonzero value at construction (a launch parameter)", which is true of the *agent's* construction;
+but the agent is not the earliest publisher in this bring-up, the simulator's sensor is. **The
+launch parameter is necessary and not sufficient.**
+
+**What this does establish, stated positively:** in this system the TOFU pin's weak case requires
+an attacker publishing *before the sensor itself exists*. In a real deployment that maps to a
+robot compromised and broadcasting before the fleet powers up — a considerably stronger
+precondition than "one robot is compromised".
+
+**To run it properly:** start a standalone impostor publisher ahead of the Gazebo launch. Not
+done here, because it changes the bring-up order that every completed arm depends on. **Spec §9's
+second `forged_obs` case is recorded as NOT EXECUTED**, with the reason and the recipe.
+
+⏳ *occl and the LIE_DEAF=0 control pending.*
 
 **Registered in advance for `duty`** (so that a surprise is recognisable as one): `dutyLying` is
 a fixed 50 % duty cycle — it lies for the first half of every `P`-slot window — so `P` changes
