@@ -4,11 +4,14 @@ Plan: `docs/superpowers/plans/2026-07-31-observation-belief-trust-rev2.md`, Task
 Design: `docs/superpowers/specs/2026-07-31-observation-belief-trust-design.md`.
 Calibration this builds on: `2026-07-31-trust-calibration.md`.
 
-**Status: IN PROGRESS.** Sections marked ⏳ have no data yet and must not be cited.
+**Status: MATRIX COMPLETE.** Every section has data; nothing here is marked pending. Four
+decisions are open and are listed at the end of §11 — none of them is a missing measurement,
+all four are choices about what to change.
 
 ## Acceptance criteria at a glance
 
-Spec §9's eight criteria, each of which was required to be *able* to fail. Seven have data.
+Spec §9's eight criteria, each of which was required to be *able* to fail. **All eight now have
+data**; criterion 2's is a lower bound rather than a settled value, for the reason in its row.
 
 | # | criterion | outcome |
 |---|---|---|
@@ -1131,4 +1134,59 @@ sees what it produced.
 
 | `d_0801_082228` | a2 soak (repeat) | **FAIL — genuine separation breach, not a partition** | Aborted at sim 234.5 on `pairwise 0.8425 < 0.90`, and this one is real: worst `min_pair` 0.8415, worst true body gap **0.2421 m**. Zero evictions and zero blocks in those 234 s, so no false positive. Does **not** give n = 2 on §6.2's partition — it failed earlier, for a different reason. First soak on the post-rebuild binary; `shape_for(3,3)` is unchanged and COL2 bit-identity is asserted by test. |
 
-⏳ *Matrix attempts appended as they complete.*
+**10 attempts listed, which is all of them.** Six produced results, three were rejected on
+harness defects that are each in §9, and one is a hand reclassification flagged as such above.
+
+The blank rows above are table breaks where attempts were appended in separate batches; no attempt
+has been removed.
+
+---
+
+## 11. Four open decisions
+
+None of these is a missing measurement. Each is a change to the system under test, which this
+project's rules put behind a derivation with the owner, so each is registered rather than applied.
+
+### 11.1 `majority_excluded` has no fixed point on a symmetric input
+
+`{1:[1], 2:[2], 3:[3]}` — every agent has unilaterally dropped everyone else — makes the loop
+oscillate, and the iteration bound returns the *maximally wrong* answer: exclude everybody, which
+wedges the fleet. **Proposed:** non-convergence means the ballots are self-contradictory, and for
+liveness the conservative answer is to exclude **nobody**. A fleet still planning for a dog that
+may be gone is recoverable; a wedged fleet is not. **Verified against the existing suite:** 15
+assertions, 3 currently wrong, 0 wrong under the proposal, and no existing case changes. §6.
+
+### 11.2 `corpseAnchor` should read the observation channel
+
+It takes `latest_claim` when the peer is in `exited_` and `peer_odom_` otherwise. Neither is
+`peer_truth_`. Conservative anchoring therefore covers the live pairwise barrier and
+`set_peer_keepout` but **not** the corpse keep-out — which is exactly where the lie lands: nine
+runs translated the exclusion disc by 0.392–0.426 m against an injected 0.4243 m. Originally
+phrased as "key on belief"; the duty arm sharpened it, because there belief never convicts and
+keying on it would change nothing.
+
+### 11.3 A peer honest about *itself* is structurally unconvictable
+
+`floor + l_max = −11.2 + 4.6 = −6.6 > −9.2 = l_evict`. Measured exactly (§8b.1). Three options,
+and they are not equivalent:
+
+| option | cost |
+|---|---|
+| `l_max ≤ clamp_step` (4.6 → 2.0) | weakens the guarantee `l_max = 4.6` exists for — stopping N−1 hearsay accusers from crossing `l_evict` on pure hearsay at N ≥ 4 (`trust.hpp:289–294`) |
+| floor below −13.8 | changes how long *every* conviction takes, not just this one |
+| **split the relay cap by sign** | corroboration of a peer's own position stops offsetting first-hand evidence that it lied about someone *else*. The two are claims about different things, so this matches the design's own logic — and it is the largest change |
+
+### 11.4 Should the soak's separation check fail runs?
+
+All three soaks reached true body gaps of 0.18–0.24 m and dipped below the 0.90 abort; which ones
+tripped it is mostly which 5 s poll landed inside a ~1 s excursion (§6.1). `d_run.sh` now reports
+the per-soak worst over every logged row but does **not** enforce it. Enforcing it would re-score
+every earlier run in this matrix against a stricter rule than the one it was run under — so it is
+a decision about the whole matrix, not about one guard.
+
+### Registered, not a decision: the correlated-stall partition
+
+§6.2 belongs to the G4 consensus barrier rather than to this branch, and it is observed **once**
+(the repeat soak failed earlier, for a different reason). The eviction rule treats silence as a
+property of one peer; a correlated stall makes every peer look silent to everybody, and the first
+counter to trip evicts the rest. A fix is a change to the barrier itself.
