@@ -90,3 +90,44 @@ def test_col2_assignment_does_not_cross():
     slots = centroid_slot_targets((5.0, 0.0), COL2, 0.0)
     assign = min_cost_assignment([slots[0], slots[1]], slots)
     assert assign == (0, 1), assign
+
+
+def test_col2_is_byte_identical_to_the_hand_written_shape_it_replaced():
+    """COL2 used to be a literal in fleet_config.cpp; it is now the n=2 instance of a generated
+    column rule. That was justified as a SIMPLIFICATION -- the rule reproduces the old literal
+    exactly -- so the claim has to be checkable rather than asserted. Exact equality, not a
+    tolerance: a generator that drifts by 1e-9 has stopped being the same shape."""
+    assert [tuple(p) for p in COL2] == [(0.75, 0.0), (-0.75, 0.0)], COL2
+
+
+def test_degraded_columns_exist_for_every_size_a_fleet_can_shrink_to():
+    """shape_for() resolves a degraded fleet to "COL<n_live>". If any n has no entry,
+    set_formation() treats the missing name as a SILENT no-op, the coordinator's size guard then
+    rejects every goal ("no N-slot formation offsets"), and the survivors never get another
+    target -- a wedged fleet with one WARN line. The 4-slot case is the one a five-dog fleet
+    needs the moment it evicts a member."""
+    from admm_impl import constants
+    for n in range(2, 9):
+        col = FORMATIONS["COL%d" % n]
+        assert len(col) == n, (n, col)
+        pts = np.array(col)
+        assert np.allclose(pts.mean(axis=0), [0.0, 0.0], atol=1e-12), (n, pts.mean(axis=0))
+        assert np.allclose(pts[:, 1], 0.0), (n, "a column has no lateral offset")
+        gaps = np.abs(np.diff(np.sort(pts[:, 0])))
+        assert np.allclose(gaps, 1.5), (n, gaps)
+        assert gaps.min() >= constants.D_MIN, (n, gaps.min(), constants.D_MIN)
+
+
+def test_v5_is_a_regular_pentagon_every_pair_can_observe():
+    """The five-dog shape. Its min spacing must clear the geometry floor (or the slot targets
+    fight the inter-agent CBF) and its LONGEST diagonal must stay inside obs_range, because the
+    point of N=5 is that a symmetric two-way disagreement finally has third parties to break it
+    -- which requires those third parties to be able to see both of them."""
+    from admm_impl import constants
+    pts = np.array(FORMATIONS["V5"])
+    assert len(pts) == 5
+    assert np.allclose(pts.mean(axis=0), [0.0, 0.0], atol=1e-6), pts.mean(axis=0)
+    d = [np.linalg.norm(pts[i] - pts[j]) for i in range(5) for j in range(i + 1, 5)]
+    assert min(d) >= constants.D_MIN, (min(d), constants.D_MIN)
+    assert min(d) >= 1.4, min(d)          # the 2026-07-24 goal/formation geometry floor
+    assert max(d) <= 4.0, max(d)          # obs_range: every pair mutually observable

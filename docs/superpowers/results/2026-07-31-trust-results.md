@@ -74,7 +74,25 @@ What protects the fleet in the step case is not the detection budget but **conse
 anchoring** (spec §4.1), which does not depend on detection latency at all. That separation is
 the point of reporting both.
 
-⏳ *Measured `v_div` per arm: pending.*
+**Measured.** Two numbers, because the obvious one is unusable on its own:
+
+| | value | what it means |
+|---|---|---|
+| `v_div_max` on a **clean run with no attacker** | **0.726 m/s** | the estimator's **noise floor**. Consecutive residuals are independent Rayleigh(σ=0.02) draws one slot apart, so the largest difference quotient anywhere in a run is dominated by noise. |
+| §2 design envelope | 0.31 m/s | — |
+| `v_div_step` at the confirmed onset (a2 runs) | 4.2 / 4.6 m/s | the step itself |
+
+The first row is the important one: **`v_div_max` is 2.3× the design envelope on a run where
+nothing happened**. Any statement of the form "the measured `v_div` exceeded the envelope" is
+therefore vacuous — every honest run exceeds it. The envelope was derived for a claim drifting
+away from truth at a finite rate and cannot be evaluated against a step injection at all. This is
+reported rather than quietly omitted because the plan asks whether the measured `v_div` fell
+inside the envelope, and the honest answer is that the question does not apply to this injection.
+
+What does carry over: in the step case the fleet's protection cannot come from the detection
+budget, because there is no budget against an unbounded rate. It comes from the two mechanisms
+that do not depend on detection latency — conservative anchoring on the live barrier, and (where
+the belief layer wins the race) the corpse anchor falling through to an unforged channel.
 
 ---
 
@@ -266,7 +284,34 @@ defence costs on the wire.
 
 ---
 
-## 9. Every attempt, including the rejected ones
+## 9. What the harness got wrong, and when
+
+Every number above depends on the harness being right about what it was measuring. It was not,
+three times, and each correction changed which runs counted. Recording it here because a results
+table that hides its own instrument history is not checkable.
+
+| # | what was wrong | how it was found | effect |
+|---|---|---|---|
+| 1 | `inject_odom_fake` was **never set at all**. Task 10 built both halves of the dual-channel forgery; the arm selector wired only the claim half. | reading the arm selector against Task 10's report before the first run | every arm would have faced a single-channel attack — the one A1 catches trivially. Acceptance criterion 1 could neither have passed nor failed honestly. |
+| 2 | Three `ros2 param set` calls do not land together. Measured skew **2.78 s**. | pilot run `d_0801_035833`: agent1 blocked the attacker 0.61 s into its own single-channel window | "A1 caught the lie on 1/2 survivors" was measuring the harness. Fixed by `arm_attack.py` (one process, one discovery, all requests back to back → **93 µs**). |
+| 3 | `KILL_AT_X` was decorative — the attack fired 2.8–3.9 m past where it was staged, by an amount that depends on RTF. | comparing the requested and actual trigger positions across runs | where the attack lands decides what the run tests, so runs were not comparable. Two causes: a pre-arm block that ran while the fleet walked, and `fleet_centroid` costing ~15 s per call. Now fires at **x = 3.125** for a requested 3.0. |
+| 4 | The "keep-out blocked" acceptance test, **wrong in both directions**. | batch 1 run 4 wedged at 0.820 against a corrected bound of 0.815 (5 mm); batch 2 run 2 stalled 0.527 m from a 9 m goal with the corpse 4.9 m away | first it forgave any stall below 0.65 m — half a *static* corpse radius, when every lying arm produces a *mobile* one at 1.63 m. Then my replacement asked whether the **goal** was fenced, when the original comment said a **slot** can be. Now: stalled **and** (goal inside a keep-out → mission denied, counted) **or** (centroid inside the formation's published half-extent → arrived). Both read off the run's own geometry; the constant is gone. |
+
+Two measurement bugs in the analysis script were also found and fixed, both of which had produced
+plausible-looking numbers:
+
+- **`v_div` pooled both observers** into one time series, so it differenced observer A's residual
+  against observer B's a millisecond later — denominator the publish skew, numerator two
+  independent noise draws. A clean run with no attacker read **25.1 m/s** against a 0.31 m/s
+  design envelope. Per-observer it reads 0.726 m/s, which is the estimator's **noise floor** and
+  still 2.3× the envelope — so `v_div_max` can never be compared to §2 at all.
+- **A single-sample onset detector** fired on one isolated 0.1160 m residual 2.9 s before the
+  attack, turning agent3's true 0.5 s eviction latency into a reported 3.37 s and inventing a
+  6.7× spread between two observers of the same attack. Requiring three consecutive
+  over-threshold samples — the same shape of evidence the belief layer itself requires — gives
+  0.50 s for both.
+
+## 10. Every attempt, including the rejected ones
 
 | # | arm | result | why it is listed |
 |---|---|---|---|

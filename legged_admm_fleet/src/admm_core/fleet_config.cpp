@@ -88,24 +88,50 @@ const std::map<std::string, Arena>& arenas() {
 }
 
 const std::map<std::string, std::vector<Eigen::Vector2d>>& formations() {
-    static const std::map<std::string, std::vector<Eigen::Vector2d>> kFormations = {
-        // Slot spacings must exceed D_MIN=1.3 (Vision60 leg-reach FK, 2026-07-23). "V" is a
-        // centroid-centred equilateral triangle (side 1.40 m, apex forward): all three dogs
-        // equidistant/equivalent, so a moving goal translates the shape with minimal
-        // reassignment (spawn poses in fleet_robots.yaml match these offsets).
-        {"V", {{0.808, 0.0}, {-0.404, 0.7}, {-0.404, -0.7}}},
-        {"column", {{0.0, 0.0}, {-1.5, 0.0}, {-3.0, 0.0}}},
-        {"V_wide", {{0.0, 0.0}, {-1.0, 1.0}, {-1.0, -1.0}}},
-        // Two-dog degraded shape (one peer evicted). A COLUMN, not a line abreast:
-        // centroid_slot_targets rotates offsets by yaw = atan2(goal - centroid), so +x is the
-        // direction of travel -> the pair strings out along the path and its LATERAL footprint
-        // is one body wide, which is what fits through the plum-post gaps. Spacing 1.50 > D_MIN
-        // 1.30, else the slot targets would fight the inter-agent CBF forever.
-        // NOTE: with n=2 the normalized-Laplacian shape cost is identically zero (L_hat is
-        // [[1,-1],[-1,1]] regardless of distance), so this shape is held by the coordinator's
-        // slot targets alone, not by w_form. That is expected, not a bug.
-        {"COL2", {{0.75, 0.0}, {-0.75, 0.0}}},
-    };
+    static const std::map<std::string, std::vector<Eigen::Vector2d>> kFormations = [] {
+        std::map<std::string, std::vector<Eigen::Vector2d>> f = {
+            // Slot spacings must exceed D_MIN=1.3 (Vision60 leg-reach FK, 2026-07-23). "V" is a
+            // centroid-centred equilateral triangle (side 1.40 m, apex forward): all three dogs
+            // equidistant/equivalent, so a moving goal translates the shape with minimal
+            // reassignment (spawn poses in fleet_robots.yaml match these offsets).
+            {"V", {{0.808, 0.0}, {-0.404, 0.7}, {-0.404, -0.7}}},
+            {"column", {{0.0, 0.0}, {-1.5, 0.0}, {-3.0, 0.0}}},
+            {"V_wide", {{0.0, 0.0}, {-1.0, 1.0}, {-1.0, -1.0}}},
+            // Five-dog shape: a centroid-centred regular pentagon, circumradius 1.25 m. Side
+            // 1.4695 clears the 1.4 m geometry floor and the longest diagonal is 2.3776, so
+            // every pair is inside obs_range 4.0 and mutually observable -- which is the whole
+            // reason to run N=5 (design spec section 10: at N=3 every close approach has only
+            // two possible observers, so a symmetric disagreement has no third party to break
+            // it, and relayed evidence plus trust_total's sum clamp only become non-trivial at
+            // N >= 4). Spawn poses in fleet_robots_5.yaml match these offsets.
+            {"V5", {{1.250, 0.0}, {0.386271, 1.188821}, {-1.011271, 0.734732},
+                    {-1.011271, -0.734732}, {0.386271, -1.188821}}},
+        };
+        // DEGRADED SHAPES, GENERATED. A fleet that has lost members travels in COLUMN, spacing
+        // 1.50 (> D_MIN 1.30, else the slot targets fight the inter-agent CBF forever),
+        // centroid-centred, +x forward -- centroid_slot_targets rotates by yaw =
+        // atan2(goal - centroid), so the survivors string out ALONG the path and the lateral
+        // footprint is one body wide, which is what fits through the plum-post gaps.
+        //
+        // This REPLACES a hand-written {"COL2", {{0.75,0},{-0.75,0}}} rather than adding to it:
+        // that entry is exactly the n=2 instance of this rule, reproduced bit-identically here
+        // (see test_false_signal.cpp's COL2 case, which must keep passing unchanged). Writing
+        // it as a rule is what makes a 4-slot shape exist at all, without which shape_for(4,5)
+        // returns "" for a five-dog fleet that has evicted one member, set_formation treats that
+        // as a no-op, and the coordinator's size guard then rejects EVERY goal -- the survivors
+        // would never get a return-home target.
+        //
+        // NOTE (kept from the hand-written COL2): at n=2 the normalized-Laplacian shape cost is
+        // identically zero (L_hat is [[1,-1],[-1,1]] regardless of distance), so that shape is
+        // held by the coordinator's slot targets alone, not by w_form. Expected, not a bug.
+        for (int n = 2; n <= 8; ++n) {
+            std::vector<Eigen::Vector2d> col;
+            for (int i = 0; i < n; ++i)
+                col.emplace_back((n - 1) * 0.75 - i * 1.50, 0.0);
+            f["COL" + std::to_string(n)] = std::move(col);
+        }
+        return f;
+    }();
     return kFormations;
 }
 

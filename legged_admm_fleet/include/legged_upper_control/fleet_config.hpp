@@ -108,8 +108,15 @@ std::vector<Eigen::Vector2d> centroid_slot_targets(
 inline std::string shape_for(std::size_t n_live, std::size_t n_full,
                              const std::string& full_shape) {
     if (n_live == n_full) return full_shape;
-    if (n_live == 2) return "COL2";  // column: minimal lateral footprint for narrow gaps
-    return "";                       // 1 live robot has no shape; ditto anything unsupported
+    // A degraded fleet travels in COLUMN -- minimal lateral footprint, which is what fits
+    // through the plum-post gaps. This used to name "COL2" specifically; formations() now
+    // generates COL<n> for every n from the same rule (and reproduces COL2 bit-identically),
+    // so the two-dog case stops being special. Without that, a five-dog fleet that evicts one
+    // member resolves to "" here, set_formation treats "" as a silent no-op, and the
+    // coordinator's size guard rejects every subsequent goal -- the survivors never get a
+    // return-home target at all.
+    if (n_live >= 2) return "COL" + std::to_string(n_live);
+    return "";  // 1 live robot has no shape to hold; the coordinator sends it straight at the goal
 }
 
 // Has a MAJORITY of the OTHER agents dropped robot `i` from their roster? `views` maps each
