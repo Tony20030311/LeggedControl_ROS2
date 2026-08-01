@@ -535,8 +535,6 @@ precondition than "one robot is compromised".
 done here, because it changes the bring-up order that every completed arm depends on. **Spec §9's
 second `forged_obs` case is recorded as NOT EXECUTED**, with the reason and the recipe.
 
-⏳ *occl and the LIE_DEAF=0 control pending.*
-
 **Registered in advance for `duty`** (so that a surprise is recognisable as one): `dutyLying` is
 a fixed 50 % duty cycle — it lies for the first half of every `P`-slot window — so `P` changes
 burst length only. With λ = 0.951, a full penalty of −2.0 and a credit of +0.25 × 2.0 = +0.5, the
@@ -600,9 +598,7 @@ is the more honest figure. A deafened attacker stops responding, and its silence
 survivors' verdict; here it participates in consensus normally and the belief layer must convict
 purely on observation residual. **Quote 6 slots for the layer in isolation.**
 
-## 5. Occlusion ⏳
-
-*Pending.*
+## 5. Occlusion ✅
 
 Acceptance requires a **positive** record: abstain code 5 (`occluded`) from both observers, `L`
 numerically unchanged across the window, resumption afterwards. Silence does not count —
