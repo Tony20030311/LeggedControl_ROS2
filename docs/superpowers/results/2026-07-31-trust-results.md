@@ -399,7 +399,40 @@ block reason would **not** fix the duty case on its own, because belief never co
 duty arm argues the anchor question is about *which channel is trusted*, not merely about which
 verdict fired.
 
-⏳ *duty P = 10, forged_obs, occl and the LIE_DEAF=0 control pending.*
+### 4.3 duty P = 10 convicts, P = 2 does not — the condition is burst length
+
+`P = 10` (`d_0801_060520`), agent1 from onset:
+
+| t (s) | residual | `l_self` | `l_total` |
+|---|---|---|---|
+| 62.02 | 0.4095 | 2.375 | 4.769 |
+| 62.12 | 0.4221 | 0.258 | 0.555 |
+| 62.22 | 0.4084 | −1.754 | −3.452 |
+| 62.33 | 0.4445 | −3.754 | −7.349 |
+| 62.42 | 0.4235 | −5.754 | **−10.354** ← crosses −9.2 |
+
+Belief blocked on both survivors; **ghost offset 0.001 m**.
+
+`P = 10` means **five consecutive lying slots**, so accumulation runs at the full −2.0/slot —
+identical to a continuous liar — and conviction lands in exactly the 5 slots §3.3a measured.
+`P = 2` alternates every slot, so the lying burst is always **one** slot and the honest slot
+immediately claws back +0.5.
+
+> **The vulnerable condition is: lying burst shorter than the conviction depth (5 slots), i.e.
+> `P ≤ 8`.**
+
+**Assessment of the registered prediction, stated rather than quietly replaced.** The fixed points
+computed in advance (−14.67 for P = 2, −12.13 for P = 10) were **correct**, and both lie past
+`l_evict` — P = 2 *would* convict given unlimited time. They were nevertheless the **wrong
+quantity to predict**, because a fixed point assumes unlimited time and the run does not have it.
+The right predictor is whether the lying burst reaches the conviction depth before the competing
+~11-slot eviction path fires.
+
+This also means the fix sketched in the handoff — "add a parameter making release slower than
+rise" — is **not** the one the data asks for: `credit_ratio = 0.25` already makes the net
+negative (−1.5 per P = 2 period). The binding constraint is the race, for the third time.
+
+⏳ *forged_obs, occl and the LIE_DEAF=0 control pending.*
 
 **Registered in advance for `duty`** (so that a surprise is recognisable as one): `dutyLying` is
 a fixed 50 % duty cycle — it lies for the first half of every `P`-slot window — so `P` changes
