@@ -78,14 +78,116 @@ the point of reporting both.
 
 ---
 
-## 3. Arms a0 / a1 / a2 ⏳
+## 3. Arms a0 / a1 / a2
 
-*Pending — 9 runs in flight.*
+### 3.1 Batch 1 (`g2_logs/matrix_step1`, 9 attempts, all listed)
 
-Required per run: physical body gap (survivor–survivor and attacker–survivor, per pair),
-closest survivor pair over every `dist.csv` row, time-to-evict per survivor, measured `v_div`,
-arrival distance, `achieved_rounds`, WBC deactivations, `obs_noise_seed`, arming skew,
-communication cost.
+| # | arm | seed | outcome | body gap surv. | body gap attacker | **ghost offset** | detector blocks | time-to-evict | arrive |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | a0 | 21952 | complete | 0.441 | 0.551 | 0.422 | none (by design) | n/a | ✓ |
+| 2 | a0 | — | complete | — | — | — | none (by design) | n/a | ✓ |
+| 3 | a0 | 20299 | **aborted** | 0.328 | 0.583 | 0.426 | none (by design) | n/a | — |
+| 4 | a1 | 1228 | **aborted** | 0.168 | 0.526 | 0.420 | **gate2: none** | n/a | wedged 0.820 |
+| 5 | a1 | 25477 | complete | 0.393 | 0.591 | 0.392 | **gate2: none** | n/a | 0.336 |
+| 6 | a1 | 13143 | complete | — | — | — | **gate2: none** | n/a | ✓ |
+| 7 | a2 | 28112 | complete | 0.387 | 0.534 | **0.009** | belief: agent1, agent3 | **0.50 s (5 slots) both** | 0.097 |
+| 8 | a2 | 15866 | complete | 0.406 | 0.537 | **0.007** | belief: agent1, agent3 | **0.50 s (5 slots) both** | 0.280 |
+| 9 | a2 | 22610 | **FAILED** | 0.464 | 0.548 | 0.424 | **belief: none** | — | — |
+
+All distances in metres, every one a minimum over every logged row. **Zero false positives in
+all nine runs** — no survivor was ever blocked by any detector. Zero WBC deactivations, zero A*
+path failures, zero observation-channel drops, in all nine.
+
+**Ghost offset** is the closest the corpse keep-out's centre ever came to the attacker's real
+body. It is the number this experiment turns on, and it is not the clearance number.
+
+### 3.2 The lie translates the exclusion disc by exactly the lie
+
+Injected claim displacement: **0.4243 m** (0.30 m applied to x and y). Measured ghost offset in
+every run where the belief layer did not convict: **0.392, 0.420, 0.422, 0.424, 0.426 m.** The
+corpse keep-out is displaced by the lie to within 4 mm, run after run. This is not a marginal
+statistical effect; it is a one-to-one mechanical relationship.
+
+Its consequence is worse than reduced clearance. In run 4 the fleet's own outbound goal fell
+0.879 m from the anchor against a 1.63 m effective radius — **inside the exclusion disc, hence
+unreachable by construction**. The survivors' centroid was pushed from 0.75 m out to 0.91 m
+rather than converging. A lie does not only shrink the margin; it can deny the mission.
+
+In the two runs where the belief layer convicted, the ghost offset was **0.009 and 0.007 m** —
+the fence landed on the body instead of 42 cm away from it.
+
+### 3.3 Why — and the honest limit of the claim
+
+⚠️ **This is not conservative anchoring.** `corpseAnchor()` fences the peer's latest *claim* when
+that peer is in `exited_` (it announced a roster excluding us) and its `peer_odom_` otherwise.
+Conservative anchoring corrects the live pairwise barrier and `set_peer_keepout`; the corpse
+keep-out is a different mechanism and is not covered by it. That gap is this project's already
+registered **Task 13**, and these numbers are its measurement.
+
+Which branch fires is decided by a **race**. `LIE_DEAF=1` makes the attacker announce a roster
+excluding the survivors. If the belief layer convicts first, the peer is blocked for *lying*,
+never becomes `exited_`, and the anchor falls through to odom. If roster-exclusion arrives first,
+the anchor is the lie.
+
+⚠️ **The harness under-models the attacker on exactly this path.** `applyOdomFake` forges a local
+copy inside `gate2()` only, so the member `peer_odom_` stays honest and `corpseAnchor`'s fallback
+reads a channel the dual-channel threat model says is compromised. **Every a2 ghost-offset number
+here is a lower bound** on what a real dual-channel attacker could do to the corpse keep-out.
+
+### 3.4 A2 loses that race one run in three, and the mechanism is measurable
+
+Run 9 is not a flake and not a borderline residual. Tracing it:
+
+- agent1 got **four** evidence-bearing slots. `l_total` reached **−6.400** against a −9.2
+  threshold.
+- Roster-exclusion blocked the peer at **0.914 s** after the attack.
+- Once blocked, `trust_step_observed` returns `L` unchanged, so the accumulator **froze at
+  −4.499 permanently**.
+
+What stole the slots, from the post-onset abstain codes:
+
+| run | outcome | post-onset abstain codes (both survivors) |
+|---|---|---|
+| 7 | convicted | `{evidence 10, peer_blocked 2}` |
+| 8 | convicted | `{evidence 10, peer_blocked 2}` |
+| 9 | **froze** | `{evidence 7, no_fresh_claim 2, occluded 1, peer_blocked 4}` |
+
+The pre-attack `no_fresh_claim` rate is 1.0–1.1 % in all three runs, so losing two post-onset
+slots is a ~20× local elevation. The cause is the attacker's own deafness stalling the
+`AgentState` barrier that sets `claims_fresh` — the gate on collecting evidence at all.
+
+**Going deaf both starves the detector that would convict you and triggers the alternative
+eviction path that anchors the keep-out on your lie.**
+
+The belief layer needs 5 consecutive evidence-bearing slots; roster-exclusion lands at ~9 slots;
+two lost slots flip the outcome.
+
+⚠️ This race is tight **because this session made it tight, and that is the correct call**. The
+attack is now armed in a single dispatch (§1); the previous harness set the deafening several
+seconds after the lie, handing the detector a head start no real attacker would grant.
+`d_run.sh`'s standing comment that the lie "comfortably beats the deafness clock" is, measured,
+false.
+
+### 3.5 Batch 1's acceptance criterion was wrong, and batch 2 re-runs it
+
+Runs 3 and 4 aborted on criteria that did not measure what they claimed:
+
+- Run 3 aborted at a survivor **centre** distance of 0.8890 m against a 0.90 m guard, while the
+  true survivor–survivor **body gap** was **0.3284 m**. They did not touch. The guard is a proxy
+  this project has already recorded as reading ~0.68 m high.
+- Run 4 was scored "never reached the outbound goal" by a bound of 0.65 m derived as half of a
+  **1.30 m static** corpse radius. Every LIE arm produces a **mobile** corpse at 1.63 m, so the
+  bound should have been 0.815 — against a run that finished at 0.820, a 5 mm miss.
+
+Neither was changed mid-batch: that would have made batch 1's runs mutually incomparable. The
+criterion is now "is the goal inside a corpse keep-out", read from the anchor and radius the
+agents logged, with the constant deleted rather than re-derived. **Batch 2 re-runs all nine.**
+Post-hoc relabelling is not enough — an aborted run never executed its return leg, and that data
+does not exist to be recovered.
+
+### 3.6 Batch 2 ⏳
+
+*In flight.*
 
 ---
 
