@@ -21,7 +21,7 @@ data**; criterion 2's is a lower bound rather than a settled value, for the reas
 | 4 | occlusion: abstention positively recorded, `L` unchanged, resumption | ✅ **and the criterion's wording is wrong** — see §5.1, it should read "suspicion does not decay" |
 | 5 | smear: honest peer never evicted, smearer caught | **half, and the recorded reason was wrong.** Target never blocked (3/3 at N=3, 1/1 at N=5) ✅; smearer never convicted ❌ — **not** an N = 3 blind spot but an inequality between three constants, `floor + l_max = −6.6 > −9.2 = l_evict`, so a peer honest about *itself* is structurally unconvictable at **any** N. N = 5 is strictly **worse** (§8b.1) |
 | 6 | asymmetric credit convicts an intermittent liar | ❌ **evades when the lying burst is shorter than the conviction depth** (P = 2: 0/3; P = 10: 1/3) |
-| 7 | the fixed-point correction stops the stale-vote deadlock | ❌ **it does not** — `majority_excluded` has no fixed point on the symmetric input and the loop bound returns the maximally wrong answer, wedging the fleet (§6) |
+| 7 | the fixed-point correction stops the stale-vote deadlock | ❌ as measured — `majority_excluded` had no fixed point on the symmetric input and the loop bound returned the maximally wrong answer, wedging the fleet (§6). **Fixed in `c308787`** (exclude nobody on non-convergence); the matrix results above predate the fix |
 | 8 | regression: 44 oracle + ctest + G1 bit-identical | ✅ 44 passed, 6/6, `worst max\|delta\| = 0` |
 
 **Four of the seven settled criteria did not pass.** Each failure is mechanistically traced, and
@@ -712,11 +712,22 @@ attacker-plus-misjudgment case at n=4, and the two-pass case that motivated the 
 The intended behaviour is intact: `views = {1:[1,3], 2:[2], 3:[1,3]}` still excludes only
 robot2. The defect is confined to inputs with no fixed point.
 
-**Proposed fix (owner decision, not applied):** non-convergence means the ballots are
-self-contradictory, and for *liveness* the conservative answer is to exclude **nobody**. A fleet
-that keeps planning for a dog that may be gone is recoverable; a wedged fleet is not. One
-condition — if the loop exhausts its passes without `next == excluded`, return false — plus a
-test for `{1:[1], 2:[2], 3:[3]}`.
+**Fixed, `c308787`.** Non-convergence means the ballots are self-contradictory, and for
+*liveness* the conservative answer is to exclude **nobody**: a fleet that keeps planning for a dog
+that may be gone gets one wrong formation and recovers as soon as any ballot becomes decisive,
+while a fleet that has excluded everyone never hands out another target.
+
+Verified case by case against the old function over all 20 assertions in the suite: **old wrong on
+3, new wrong on 0, behaviour changed on exactly those 3.** Nothing else moved.
+
+One detail worth keeping, because it explains why this hid for so long: at **n = 4 the old code was
+accidentally right**. The alternation's parity decides what the loop bound stops on, and only the
+odd sizes stop on "exclude everyone". Both parities are now pinned, along with a genuine unanimous
+verdict, so the guard cannot swallow a real eviction.
+
+⚠️ **Every result in this document predates the fix** and was produced with the old function. None
+of them exercised the non-convergent input — the one run that partitioned produced
+`{1:[1,3], 2:[2], 3:[1,3]}`, which converges — so no result above changes.
 
 ### 6.1 No-attacker soak — a1 ✅
 
