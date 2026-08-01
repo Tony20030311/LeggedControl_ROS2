@@ -917,10 +917,58 @@ the quoted figure would have been an ADMM convergence difference of 0.05 rounds.
 
 ---
 
+## 8b. Five dogs ⏳
+
+Owner-approved, and the reason it is worth the runs is criterion 5. The smear arm half-failed at
+N = 3 — the target was never blocked (3/3) but the smearer was never convicted — and spec §10
+declares that a **blind spot of N = 3 rather than a tuning failure**: every close approach has
+only two possible observers, so a symmetric one-against-one disagreement has no third party to
+break it, and relayed evidence plus `trust_total`'s sum clamp only become non-trivial at N ≥ 4.
+N = 5 is the smallest fleet that can test whether that blind spot actually closes.
+
+**Shape.** `V5` is a centroid-centred regular pentagon, circumradius 1.25 m:
+
+| | value | why it is that value |
+|---|---|---|
+| side | **1.4695 m** | clears `D_MIN` = 1.30 and the 1.40 m geometry floor, so slot targets do not fight the inter-agent CBF |
+| longest diagonal | **2.3776 m** | inside `obs_range` = 4.0, so **every pair is mutually observable** — which is the entire point of running N = 5 |
+| centroid | exactly (0, 0) | `centroid_slot_targets` translates the shape without reassignment on the first goal |
+
+Run in the **empty world**: at 2.38 m across, the pentagon cannot pass a 2.20–2.30 m plum-post gap.
+
+**Regression gate before any of it** (the five-dog code had been written and deliberately left
+unbuilt until this point):
+
+| check | result |
+|---|---|
+| oracle tests | **47 passed** (44 + 3 for the generated columns and the pentagon) |
+| `ctest` | **6/6** |
+| G1 distributed-vs-centralized | **`worst max\|delta\| = 0`, mismatches = 0** |
+
+**First attempt `d_0801_080532` — aborted by a harness bug, and the fleet was blameless.** The
+coordinator resolved `shape=V5 -> plan for 5 dog(s)`, all five stood and trotted, and the pentagon
+held to within 3 mm of design. The collision guard aborted it anyway on `pairwise 0.8108 < 0.90`:
+
+| | value |
+|---|---|
+| guard's reading | 0.8108 |
+| `x4` at that instant | **0.8108** |
+| worst `min_pair` over the entire run | **1.4468** |
+| worst true body gap (`phys_gap`) | **0.6007 m** |
+
+`min_pair` is column 8 with three robots and column 12 with five; the reader hardcoded 8, which at
+N = 5 is a robot's x coordinate. It cannot fail loudly — a coordinate is a plausible-looking
+number — so the guard fires whenever any robot walks through x < 0.9. Fixed by locating the column
+by header name (§9 #7).
+
+⏳ *Re-run in progress.*
+
+---
+
 ## 9. What the harness got wrong, and when
 
 Every number above depends on the harness being right about what it was measuring. It was not,
-six times, and each correction changed which runs counted. Recording it here because a results
+seven times, and each correction changed which runs counted. Recording it here because a results
 table that hides its own instrument history is not checkable.
 
 | # | what was wrong | how it was found | effect |
@@ -929,6 +977,7 @@ table that hides its own instrument history is not checkable.
 | 2 | Three `ros2 param set` calls do not land together. Measured skew **2.78 s**. | pilot run `d_0801_035833`: agent1 blocked the attacker 0.61 s into its own single-channel window | "A1 caught the lie on 1/2 survivors" was measuring the harness. Fixed by `arm_attack.py` (one process, one discovery, all requests back to back → **93 µs**). |
 | 3 | `KILL_AT_X` was decorative — the attack fired 2.8–3.9 m past where it was staged, by an amount that depends on RTF. | comparing the requested and actual trigger positions across runs | where the attack lands decides what the run tests, so runs were not comparable. Two causes: a pre-arm block that ran while the fleet walked, and `fleet_centroid` costing ~15 s per call. Now fires at **x = 3.125** for a requested 3.0. |
 | 6 | `form_half_extent` read the latched `/formation/plan` **once**, with a 6 s timeout, and printed **`0`** when the read came up empty — which no distance is ever below, so `walk_until`'s acceptance clause was silently dead. | the a2 soak sat 25 polls at 0.516 m against a half-extent that had accepted an identical **0.517 m** in the a1 run fifteen minutes earlier | a converged fleet standing on station was scored **"never reached the outbound goal"**. The read fails by *run state* — a fresh subscription has to finish discovery, measured past the timeout after a daemon stop — so it looked fixed right up until it wasn't. Now: 3 attempts, print **nothing** on failure, and `walk_until` aborts as infra rather than evaluating a clause it cannot evaluate. |
+| 7 | `min_pair` was read from **column 8 of `dist.csv` by position**. That is correct for three robots and is a robot's **x coordinate** for five. | the five-dog run aborted on `pairwise 0.8108 < 0.90` at the instant `x4` was 0.8108, while the run's worst real `min_pair` was 1.4468 | the collision guard cannot fail loudly on this — a coordinate is a plausible-looking separation — so it fires whenever any robot walks through x < 0.9. A pentagon holding shape to 3 mm was failed for a coordinate. Now located by header name; verified unchanged on a three-robot log and correct on a five-robot one. |
 | 5 | The WBC-deactivation guard ran **after** phase 8's plan-coverage assertion, so whichever check sat earlier in the file wrote the diagnosis. | `d_0801_074359`: robots 2 and 3 deactivated 17 ms apart on `QP is infeasible`; the run reported `FleetPlan covers 1 robot(s), expected 3` | an **upstream** QP failure was reported as a defence result, exit 1, which the results protocol forbids re-running. Fixed by `wbc_guard()`: classify on whether the run contains an adversary at all (`NO_KILL` → infra; otherwise fail closed, because with an attacker present a felled robot could be the attacker's doing), and check it **first**. |
 | 4 | The "keep-out blocked" acceptance test, **wrong in both directions**. | batch 1 run 4 wedged at 0.820 against a corrected bound of 0.815 (5 mm); batch 2 run 2 stalled 0.527 m from a 9 m goal with the corpse 4.9 m away | first it forgave any stall below 0.65 m — half a *static* corpse radius, when every lying arm produces a *mobile* one at 1.63 m. Then my replacement asked whether the **goal** was fenced, when the original comment said a **slot** can be. Now: stalled **and** (goal inside a keep-out → mission denied, counted) **or** (centroid inside the formation's published half-extent → arrived). Both read off the run's own geometry; the constant is gone. |
 
