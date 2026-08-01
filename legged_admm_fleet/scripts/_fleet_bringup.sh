@@ -203,8 +203,16 @@ except Exception:
 PY
 }
 
-min_pair() {  # newest min pairwise centre distance from the dist logger (col 8 == 3 robots)
-  local M=$(tail -1 "$LOGD/dist.csv" 2>/dev/null | cut -d, -f8)
+# Newest min pairwise centre distance from the dist logger, located BY NAME in the header rather
+# than by position. The column index is 8 for three robots and 12 for five (t + 2 per robot +
+# min_pair + min_h), and the hardcoded 8 does not fail loudly at N=5 -- it silently returns x4, a
+# world coordinate, as if it were a separation. Measured on d_0801_080532: the collision guard
+# aborted a five-dog run on "pairwise 0.8108 < 0.90" while dist.csv's own worst min_pair for the
+# whole run was 1.4468 and the true body gap never came below 0.6007 m. A perfect pentagon, failed
+# for a robot's x coordinate.
+min_pair() {
+  local M=$(awk -F, 'NR==1{for(i=1;i<=NF;i++) if($i=="min_pair") c=i; next} {v=$c} END{print v}' \
+            "$LOGD/dist.csv" 2>/dev/null)
   case "$M" in ''|*[!0-9.-]*) M=99;; esac
   echo "$M"
 }
