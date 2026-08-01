@@ -262,7 +262,25 @@ Acceptance requires a **positive** record: abstain code 5 (`occluded`) from both
 numerically unchanged across the window, resumption afterwards. Silence does not count —
 throttling, a dead subscription, a freshness guard and an empty queue all look identical to it.
 
-Two things established before running it:
+**Baseline, from the three a2 runs of batch 1** (the only arms with belief telemetry) — 2160
+observer-slot rows about the attacker:
+
+| code | rows | share |
+|---|---|---|
+| 0 `evidence` | 2074 | 96.02 % |
+| 5 `occluded` | 54 | 2.50 % |
+| 2 `no_fresh_claim` | 24 | 1.11 % |
+| 1 `peer_blocked` | 8 | 0.37 % |
+| 3 `no_obs_buffer`, 4 `out_of_range` | 0 | — |
+
+**Slots where *both* observers were occluded at once: 0 of 1054.** Incidental occlusion is
+common (one observer loses the sightline 2.5 % of the time) but the acceptance condition — every
+observer blind simultaneously — **never happens by chance in the peg field.** It has to be
+steered, which is what the `occl` arm and `hide_spot.py` are for. `out_of_range` never fires at
+all, confirming the calibration finding that `obs_range = 4.0` does not bind at these fleet
+spacings.
+
+Two further things established before running it:
 
 - **A doubly-occluded, in-range spot exists**: a search over the plum pile list found one for
   19 of 22 sampled fleet positions inside the peg field. In-range matters, because abstain code 4
