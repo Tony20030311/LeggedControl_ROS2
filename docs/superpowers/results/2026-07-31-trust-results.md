@@ -228,9 +228,64 @@ agents logged, with the constant deleted rather than re-derived. **Batch 2 re-ru
 Post-hoc relabelling is not enough — an aborted run never executed its return leg, and that data
 does not exist to be recovered.
 
-### 3.6 Batch 2 ⏳
+### 3.6 Batch 2 — stopped after 2 attempts
 
-*In flight.*
+Stopped deliberately, not lost. Its first attempt hit the fleet-wedging defect (§6) and its
+second exposed that the replacement acceptance criterion was still wrong (§9, row 4). Continuing
+would have spent ~40 minutes producing runs that a third criterion would supersede. Both attempts
+stay in the record (§10).
+
+### 3.7 Batch 3 (`g2_logs/matrix_step1c`, 9 attempts, corrected criterion)
+
+| # | arm | seed | outcome | body gap surv. | **ghost offset** | detector blocks | time-to-evict | arrive |
+|---|---|---|---|---|---|---|---|---|
+| 1 | a0 | 25024 | complete | 0.350 | 0.418 | none (by design) | n/a | 0.367 |
+| 2 | a0 | 7480 | did not converge | 0.367 | 0.420 | none (by design) | n/a | 0.825 |
+| 3 | a0 | 16900 | complete | 0.364 | 0.423 | none (by design) | n/a | 0.109 |
+| 4 | a1 | 16032 | complete | 0.372 | 0.402 | **gate2: none** | n/a | 0.193 |
+| 5 | a1 | — | **infra** | — | — | — | — | WBC deactivated before the kill point |
+| 6 | a1 | 25431 | complete | 0.348 | 0.415 | **gate2: none** | n/a | 0.416 |
+| 7 | a2 | 29730 | complete | 0.344 | **0.007** | belief: agent1, agent3 | **0.50 s (5 slots) both** | 0.062 |
+| 8 | a2 | 7732 | complete | 0.344 | **0.003** | belief: agent1, agent3 | **0.50 s (5 slots) both** | 0.141 |
+| 9 | a2 | 3398 | did not converge | 0.404 | **0.008** | belief: agent1, agent3 | **0.50 s (5 slots) both** | 1.087 |
+
+Run 5 is the one pre-registered exclusion class — the known upstream activation race — recorded,
+not retried. Runs 2 and 9 did not converge on the outbound goal; **run 9's detection succeeded in
+full** (see below), so its failure is a fleet-convergence result, not a defence result.
+
+**Every a2 run in batch 3 convicted**, on both survivors, in exactly 5 slots, with ghost offsets
+of 3–8 mm. Zero false positives in all nine.
+
+### 3.8 Combined, and a correction
+
+| arm | n (runs with data) | ghost offset (m) |
+|---|---|---|
+| a0 | 5 | 0.418, 0.420, 0.422, 0.423, 0.426 |
+| a1 | 4 | 0.392, 0.402, 0.415, 0.420 |
+| **a2** | 6 | **0.003, 0.007, 0.007, 0.008, 0.009**, and 0.424 |
+
+Nine values from arms where the belief layer never convicted span **0.392–0.426 m**, a 34 mm
+spread around an injected displacement of 0.4243 m. Five values from a2 convictions span
+**3–9 mm**.
+
+⚠️ **Correction to an earlier reading of batch 1.** On batch 1 alone the belief layer lost the
+race to roster-exclusion in 1 of 3 runs, and that was written up as a rate. Batch 3 convicted 3
+of 3. The combined figure is **1 loss in 6**, and n = 6 does not support a rate at all — what it
+supports is that the failure *mode* is real and reproducible in mechanism (§3.4), not that it
+occurs one time in three. Stated as a frequency it would have been an overclaim from three runs.
+
+### 3.9 Non-convergence of the degraded 2-dog mode
+
+Three runs across batches 1 and 3 stopped short of the outbound goal (0.820, 0.825, 1.087 m) and
+it is **not** a keep-out effect: in the batch-3 case the corpse anchor was 3.3 m away and both
+survivors were clear of it and of every peg (nearest 1.21 m against a 0.90 m effective radius).
+What happens is that the two-dog `COL2` column settles **off its slots** — the pair sat 2.44 m
+apart against a 1.5 m shape, rear dog 1.9 m back and 1.0 m off-axis.
+
+This is a convergence weakness of the degraded mode, it appears in a0 and a2 alike, and it is
+reported rather than absorbed into a looser acceptance criterion. Everything the experiment turns
+on — body gap, ghost offset, detector attribution, time-to-evict — is collected up to the abort
+point regardless; what a non-converged run loses is only its return leg.
 
 ---
 
