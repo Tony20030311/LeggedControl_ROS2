@@ -225,7 +225,13 @@ walk_until() {  # $1 = goal x, $2 = goal y, $3 = robots to watch, $4 = max polls
       # driven into the fleet, the all-robot minimum measures how hard IT rammed, and failing the
       # run on it fails the experiment for the ATTACKER doing its job (measured 0.64 m, aborted a
       # complete take). The survivors hitting EACH OTHER is still a hard stop, below.
-      if [ "${LIE_LOGONLY:-0}" = 1 ] || [ "${LIE_CHASE:-0}" = 1 ]; then
+      # Exempt whenever NOTHING IS ACTING ON A DETECTOR VERDICT, which is one property rather
+      # than a list of arm names: detection_log_only=true (a0 and occl) says the verdict is
+      # computed and never acted on, LIE_LOGONLY says the same thing set at the trigger, and
+      # LIE_CHASE steers the attacker in deliberately. In every one of those the survivors are
+      # fencing a GHOST by design, so the real body closing on them is the measurement the arm
+      # exists to produce -- aborting would fail the run for the adversary doing its job.
+      if [ "$DETECT_LOG_ONLY" = true ] || [ "${LIE_LOGONLY:-0}" = 1 ] || [ "${LIE_CHASE:-0}" = 1 ]; then
         # THE COUNTERFACTUAL ARM IS SUPPOSED TO LOSE SEPARATION. Its survivors are fencing a
         # ghost 2.83 m from the compromised robot's real body, so that body closing on them is
         # the measurement this arm exists to produce (0.557 m, measured 2026-07-29) — aborting
@@ -1026,5 +1032,35 @@ if [ "${LIE_LOGONLY:-0}" = 1 ]; then
     say "COUNTERFACTUAL RESULT: the accepted lie cost $BREACH_FULL m of true separation"
     say "  (the survivors never breached D_MIN against the GHOST — only against the real body)"
   fi
+fi
+# ---------- 600 s WALKING soak (spec Task 12 step 4 / acceptance 3) ----------
+# A STATIONARY soak cannot show drift-driven false positives -- the residual only moves when the
+# dogs do -- so this keeps walking the same out-and-back legs the run already uses. Sim time comes
+# from dist.csv, the clock every other measurement here is on, not from wall clock divided by an
+# assumed RTF.
+if [ "${SOAK_S:-0}" != 0 ]; then
+  say "soak: walking for ${SOAK_S}s of sim time with no attacker, watching for spurious verdicts"
+  SOAK_T0=$(tail -1 "$LOGD/dist.csv" | cut -d, -f1)
+  LAP=0
+  while :; do
+    SOAK_E=$(python3 -c "print(f'{$(tail -1 "$LOGD/dist.csv" | cut -d, -f1)-$SOAK_T0:.1f}')")
+    [ "$(python3 -c "print(1 if $SOAK_E >= ${SOAK_S} else 0)")" = 1 ] && break
+    LAP=$((LAP + 1))
+    say "  soak lap $LAP (${SOAK_E}s / ${SOAK_S}s sim)"
+    send_formation_goal "$GX" "$GY"
+    walk_until "$GX" "$GY" "$WATCH" 60 || die "soak lap $LAP never reached the outbound goal"
+    send_formation_goal "$HX" "$HY"
+    walk_until "$HX" "$HY" "$WATCH" 60 || die "soak lap $LAP never got home"
+  done
+  # ACCEPTANCE 3: zero spurious verdicts. Asserted on BOTH the eviction and the block, because
+  # they are different paths -- a detector block that has not yet aged into an eviction is
+  # already a false positive, and counting only evictions would miss it.
+  N_EV=$(count_agents "EVICT robot"); N_BL=$(count_agents "REJECTED AgentState")
+  if [ "$((N_EV + N_BL))" != 0 ]; then
+    grep_agents "EVICT robot" | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
+    grep_agents "REJECTED AgentState" | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
+    die "soak produced $N_EV eviction(s) and $N_BL block(s) over ${SOAK_E}s with NO attacker present"
+  fi
+  say "soak: ${SOAK_E}s of sim walking over $LAP lap(s) — zero evictions, zero detector blocks"
 fi
 say "D PASS (rejoin=$REJOIN): victim=robot$VICTIM, evicted by $N_EVICT, home reached, arrive_dist=$ARRIVE_DIST, mission_denied=$MISSION_DENIED; logs $LOGD"
