@@ -78,9 +78,9 @@ ament_target_dependencies(fleet_coordinator_node
   rclcpp nav_msgs geometry_msgs admm_fleet_msgs)
 install(TARGETS fleet_coordinator_node RUNTIME DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY launch config worlds rviz DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY launch config worlds rviz urdf DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS scripts/start_gaits.sh
-        scripts/fleet_viz_markers.py scripts/gen_arena_world.py
+        scripts/fleet_viz_markers.py scripts/gen_arena_world.py scripts/check_xml.py
         DESTINATION lib/${PROJECT_NAME})
 
 # ── G1 parity gate: distributed AgentCore vs centralized coordinator (bit-identical) ──

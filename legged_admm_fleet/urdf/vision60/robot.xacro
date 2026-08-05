@@ -1,0 +1,79 @@
+<?xml version="1.0"?>
+
+<!-- Stock vision60 plus the lidar off vision60_perception. Reached only through a roster that
+     sets description_package: legged_admm_fleet (config/fleet_robots_lidar.yaml); the default
+     roster carries no such field and still gets upstream's camera-free vision60.
+
+     Why robot_type stays "vision60" instead of a new vision60_lidar type: the type name is a
+     contract with the controller stack, not a folder name. legged_robot_controller's
+     load_controller.launch.py has SUPPORTED_ROBOT_TYPES = ('vision60',) and silently skips
+     anything else, so a vision60_lidar roster spawns in Gazebo, stands up, and then hangs
+     forever in phase 2 with no controller and no error. Measured 2026-08-05.
+
+     Why not vision60_perception, which already ships this lidar: it also ships four D435 depth
+     cameras for terrain perception, which this fleet does not use (arena obstacles are a prior
+     map in fleet_config.cpp, ground is flat). They are not free: two dogs measured RTF 0.066
+     with cameras on versus 0.760 for three dogs with lidar only, because the sim has no GPU
+     (gazebo.log: "egl: failed to create dri2 screen") and every RGB+depth+cloud stream is
+     raytraced on the CPU for topics nobody subscribes to.
+
+     Everything except the two lidar lines is upstream's vision60/robot.xacro verbatim. -->
+
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="$(arg robot_name)">
+
+    <xacro:arg name="robot_type" default="vision60"/>
+    <xacro:arg name="robot_name" default="robot"/>
+    <xacro:arg name="ros_namespace" default="/"/>
+    <xacro:arg name="controller_config" default=""/>
+    <xacro:arg name="sensor_topic_prefix" default=""/>
+
+    <xacro:include filename="$(find vision60_description)/urdf/$(arg robot_type)/materials.xacro"/>
+    <xacro:include filename="$(find vision60_description)/urdf/$(arg robot_type)/leg.xacro"/>
+    <xacro:include filename="$(find vision60_description)/urdf/$(arg robot_type)/gazebo.xacro"/>
+    <xacro:include filename="$(find vision60_description)/urdf/$(arg robot_type)/imu.xacro"/>
+
+    <xacro:include filename="$(find vision60_description)/urdf/$(arg robot_type)/const.xacro"/>
+
+    <!-- The one addition. Ours, not vision60_perception's: same sensor re-specced from terrain
+         mapping down to peer spotting, which is 16x fewer rays. See that file's header. -->
+    <xacro:include filename="$(find legged_admm_fleet)/urdf/vision60/lidar.xacro"/>
+
+    <xacro:property name="mesh_path" value="package://vision60_description/meshes/$(arg robot_type)"/>
+
+    <link name="base">
+        <visual>
+            <origin rpy="0 0 0" xyz="0 0 0"/>
+            <geometry>
+                <mesh filename="${mesh_path}/base.stl" scale="1. 1. 1."/>
+            </geometry>
+            <material name="flatblack"/>
+        </visual>
+
+        <collision>
+            <origin rpy="0 0 0" xyz="0 0 0"/>
+            <geometry>
+                <box size="${base_length} ${base_width} ${base_height}"/>
+            </geometry>
+        </collision>
+
+        <inertial>
+            <origin rpy="0 0 0" xyz="${base_com_x} ${base_com_y} ${base_com_z}"/>
+            <mass value="${base_mass}"/>
+            <inertia
+                    ixx="${base_ixx}" ixy="${base_ixy}" ixz="${base_ixz}"
+                    iyy="${base_iyy}" iyz="${base_iyz}"
+                    izz="${base_izz}"/>
+        </inertial>
+    </link>
+
+    <xacro:IMU connected_to="base" imu_name="imu" xyz="0. 0. 0." rpy="0. 0. 0."/>
+
+    <xacro:leg prefix="LF" mesh_path="${mesh_path}" x_axis="1" y_axis="1" />
+    <xacro:leg prefix="LH" mesh_path="${mesh_path}" x_axis="-1" y_axis="1" />
+    <xacro:leg prefix="RF" mesh_path="${mesh_path}" x_axis="1" y_axis="-1" />
+    <xacro:leg prefix="RH" mesh_path="${mesh_path}" x_axis="-1" y_axis="-1" />
+
+    <!-- Same mount point vision60_perception uses. -->
+    <xacro:lidar connected_to="base" lidar_name="lidar" xyz="0.25 0 0.2" rpy="0 0 0"/>
+
+</robot>

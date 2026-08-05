@@ -10,6 +10,19 @@
         <collision_detector>bullet</collision_detector>
       </dart>
     </physics>
+    <!-- No <headless_rendering>. It was tried on 2026-08-05 and bought nothing, which is worth
+         recording because the obvious next idea is to try it again.
+
+         It is the SDF form of the gz sim headless-rendering flag (legged_gazebo's launch cannot
+         pass it on the command line), and it does work: with
+         __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json the mesa
+         "failed to create dri2 screen" warnings stop and the sensors render through NVIDIA EGL
+         on the container's RTX 5060 Ti instead of llvmpipe. G4 with three lidar dogs then
+         measured RTF 0.67, against 0.70 for the same gate on llvmpipe. That is noise.
+
+         So the lidar's cost is not rasterization; it is the per-update work around it, and the
+         GPU cannot reach that. Rendering headless without a GUI is also not an option here: gz
+         sim takes the server down when the GUI exits, and the GUI needs a real X server. -->
     <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors"><render_engine>ogre2</render_engine></plugin>
     <plugin filename="gz-sim-forcetorque-system" name="gz::sim::systems::ForceTorque"/>
     <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>

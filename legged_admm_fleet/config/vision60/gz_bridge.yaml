@@ -1,0 +1,26 @@
+# gz -> ROS bridge for the lidar carried by the fleet_robots_lidar.yaml roster.
+#
+# Looked up as <bridge_config_root>/<robot_type>/gz_bridge.yaml, and robot_type is "vision60" for
+# both rosters (see fleet_robots_lidar.yaml for why), so the lookup alone cannot tell them apart:
+# sim.launch.py decides on description_package instead and only reaches this file for the lidar
+# roster. legged_gazebo's own bridge pass never sees it at all, since it reads its own config
+# root, where vision60 has no gz_bridge.yaml.
+- ros_topic_name: /{topic_prefix}/lidar/points
+  gz_topic_name: /{topic_prefix}/lidar/points
+  ros_type_name: sensor_msgs/msg/PointCloud2
+  gz_type_name: gz.msgs.PointCloudPacked
+  direction: GZ_TO_ROS
+  qos_profile: SENSOR_DATA
+  publisher_queue: 10
+  subscriber_queue: 10
+  frame_id: '{topic_prefix}/lidar_optical_frame'
+
+- ros_topic_name: /{topic_prefix}/lidar/imu
+  gz_topic_name: /{topic_prefix}/lidar/imu
+  ros_type_name: sensor_msgs/msg/Imu
+  gz_type_name: gz.msgs.IMU
+  direction: GZ_TO_ROS
+  qos_profile: SENSOR_DATA
+  publisher_queue: 10
+  subscriber_queue: 10
+  frame_id: '{topic_prefix}/lidar_optical_frame'
