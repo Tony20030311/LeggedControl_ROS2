@@ -263,10 +263,22 @@ class LidarPeerTracker(Node):
             # returning a truncated clustering would look like a working sensor.
             self.get_logger().error(str(e), throttle_duration_sec=5.0)
             return
-        centres, sizes = blob_centres(pts, groups, self.min_points, (sx, sy), self.push,
-                                      (BODY_L, BODY_W) if self.body_fit else None)
-
+        body = (BODY_L, BODY_W) if self.body_fit else None
+        centres, sizes, kept = blob_centres(pts, groups, self.min_points, (sx, sy),
+                                            self.push, body)
         matched = associate(self.tracks, centres, self.gate)
+
+        # Second pass over the blobs that found a peer, now that each one has a prior. It
+        # only moves the axis a partial face leaves under-determined (see fit_box); a fully
+        # seen face is unchanged, and association has already been decided without it, so
+        # the prior cannot pull a blob onto the wrong peer.
+        if body and matched:
+            priors = [None] * len(kept)
+            for j, k in matched.items():
+                priors[k] = self.tracks[j]
+            refined, _, _ = blob_centres(pts, kept, 0, (sx, sy), self.push, body, priors)
+            if len(refined) == len(centres):
+                centres = refined
         if self.debug:
             self.get_logger().info(
                 f'sensor=({sx:.2f},{sy:.2f},{sensor_xyz[2]:.2f}) yaw={math.degrees(yaw):.0f} '

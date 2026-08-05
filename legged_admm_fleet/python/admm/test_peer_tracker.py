@@ -129,7 +129,7 @@ def test_cluster_refuses_a_failed_floor_filter_instead_of_stalling():
 def test_blob_centres_reports_centroid_and_size():
     pts = np.vstack([_box(0.0, 0.0, 0.45, seed=5), _box(1.4, 0.0, 0.45, seed=6)])[:, :2]
     groups = cluster_xy(pts, 0.3)
-    c, n = blob_centres(pts, groups, min_points=5, sensor_xy=(0.0, 0.0), push=0.0)
+    c, n, _ = blob_centres(pts, groups, min_points=5, sensor_xy=(0.0, 0.0), push=0.0)
     order = np.argsort(c[:, 0])
     np.testing.assert_allclose(c[order][:, 0], [0.0, 1.4], atol=0.1)
     assert list(n) == [40, 40]
@@ -137,7 +137,7 @@ def test_blob_centres_reports_centroid_and_size():
 
 def test_blob_centres_drops_specks():
     pts = np.array([[1.4, 0.0], [1.41, 0.0]])
-    c, _ = blob_centres(pts, cluster_xy(pts, 0.3), min_points=5,
+    c, _, _ = blob_centres(pts, cluster_xy(pts, 0.3), min_points=5,
                         sensor_xy=(0.0, 0.0), push=0.0)
     assert len(c) == 0
 
@@ -147,14 +147,14 @@ def test_push_moves_the_centre_directly_away_from_the_sensor():
     for bearing in (0.0, 0.7, 2.0, -2.5):
         cx, cy = 1.4 * np.cos(bearing), 1.4 * np.sin(bearing)
         pts = np.array([[cx, cy]])
-        c, _ = blob_centres(pts, [np.array([0])], 1, (0.0, 0.0), push=0.2)
+        c, _, _ = blob_centres(pts, [np.array([0])], 1, (0.0, 0.0), push=0.2)
         np.testing.assert_allclose(np.hypot(*c[0]), 1.6, atol=1e-9)
         assert abs(np.arctan2(c[0][1], c[0][0]) - bearing) < 1e-9
 
 
 def test_push_zero_leaves_the_centroid_alone():
     pts = np.array([[1.4, 0.3]])
-    c, _ = blob_centres(pts, [np.array([0])], 1, (0.0, 0.0), push=0.0)
+    c, _, _ = blob_centres(pts, [np.array([0])], 1, (0.0, 0.0), push=0.0)
     np.testing.assert_allclose(c[0], [1.4, 0.3])
 
 
@@ -228,7 +228,7 @@ def test_full_pipeline_recovers_the_v_formation():
     m = keep_bodies(to_world(rel, sensor_xyz, obs_yaw), 0.15, 1.2, obs_xy, 0.6, 4.0)
     pts_xy = to_world(rel, sensor_xyz, obs_yaw)[m][:, :2]
 
-    centres, _ = blob_centres(pts_xy, cluster_xy(pts_xy, 0.3), 5, obs_xy, push=0.0)
+    centres, _, _ = blob_centres(pts_xy, cluster_xy(pts_xy, 0.3), 5, obs_xy, push=0.0)
     assert len(centres) == 2
 
     got = associate({pid: tuple(p) for pid, p in truth.items()}, centres, gate=0.5)
@@ -342,8 +342,8 @@ def test_blob_centres_with_body_beats_plain_centroid():
     centre, sensor = np.array([1.40, 0.0]), np.zeros(2)
     pts = _visible_faces(centre, 0.0, sensor)
     groups = [np.arange(len(pts))]
-    plain, _ = blob_centres(pts, groups, 5, sensor, push=0.0)
-    fitted, _ = blob_centres(pts, groups, 5, sensor, body=(BODY_L, BODY_W))
+    plain, _, _ = blob_centres(pts, groups, 5, sensor, push=0.0)
+    fitted, _, _ = blob_centres(pts, groups, 5, sensor, body=(BODY_L, BODY_W))
     assert np.linalg.norm(fitted[0] - centre) < 0.02
     assert np.linalg.norm(plain[0] - centre) > np.linalg.norm(fitted[0] - centre)
 
@@ -351,5 +351,45 @@ def test_blob_centres_with_body_beats_plain_centroid():
 def test_blob_centres_falls_back_when_the_blob_is_too_thin_to_fit():
     # min_points lets it through, fit_box does not: the caller still gets a position.
     pts = np.array([[1.40, 0.0], [1.41, 0.0]])
-    got, n = blob_centres(pts, [np.array([0, 1])], 2, np.zeros(2), body=(BODY_L, BODY_W))
+    got, n, _ = blob_centres(pts, [np.array([0, 1])], 2, np.zeros(2), body=(BODY_L, BODY_W))
     assert len(got) == 1 and n[0] == 2
+
+
+def test_fit_box_uses_the_prior_only_where_the_face_is_partly_seen():
+    """The apex dog's case. Given a fragment of one face, the axis across it is pinned by
+    the returns and the axis along it is not; the prior must move the second and leave the
+    first alone, or the fit invents a position wherever the fragment happened to fall."""
+    centre, sensor = np.array([1.40, 0.0]), np.zeros(2)
+    full = _visible_faces(centre, np.pi / 2, sensor, n_per_face=40)
+    # Keep the third of the face nearest one end: what robot1 actually gets, 0.36 m of a
+    # 0.95 m side.
+    frag = full[full[:, 1] > centre[1] + 0.15]
+    assert len(frag) >= 5
+
+    blind, _, _ = fit_box(frag, sensor)
+    guided, _, _ = fit_box(frag, sensor, prior=centre)
+    # Across the face (x here, the line of sight) both are right: that axis IS observed.
+    assert abs(blind[0] - centre[0]) < 0.05 and abs(guided[0] - centre[0]) < 0.05
+    # Along it, the fragment midpoint is far off and the prior recovers it.
+    assert abs(blind[1] - centre[1]) > 0.15
+    assert abs(guided[1] - centre[1]) < 0.02
+
+
+def test_prior_cannot_override_a_fully_seen_face():
+    """A prior is a fallback for an unobserved axis, never a vote against the returns. Feed
+    a badly wrong one and a complete view must ignore it."""
+    centre, sensor = np.array([1.40, 0.0]), np.zeros(2)
+    pts = _visible_faces(centre, np.pi / 2, sensor, n_per_face=40)
+    liar = np.array([1.40, 0.60])
+    got, _, _ = fit_box(pts, sensor, prior=liar)
+    assert np.linalg.norm(got - centre) < 0.03
+
+
+def test_prior_is_clamped_into_the_feasible_interval():
+    # Even a prior far outside can only pull the centre to the edge of what keeps every
+    # return on the body, so one bad track cannot place a peer somewhere impossible.
+    centre, sensor = np.array([1.40, 0.0]), np.zeros(2)
+    frag = _visible_faces(centre, np.pi / 2, sensor, n_per_face=40)
+    frag = frag[frag[:, 1] > centre[1] + 0.15]
+    got, _, _ = fit_box(frag, sensor, prior=np.array([1.40, 9.0]))
+    assert np.all(np.abs(got[1] - frag[:, 1]) <= BODY_L / 2 + 1e-6)

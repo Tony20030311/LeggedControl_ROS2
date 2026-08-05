@@ -112,8 +112,14 @@ def cluster_xy(pts_xy, gap):
     return [np.array(v) for v in groups.values()]
 
 
-def blob_centres(pts_xy, groups, min_points, sensor_xy, push=0.0, body=None):
-    """Centre estimate per blob, as (centres (M,2), sizes (M,)).
+def blob_centres(pts_xy, groups, min_points, sensor_xy, push=0.0, body=None, priors=None):
+    """Centre estimate per blob, as (centres (M,2), sizes (M,), kept groups).
+
+    `priors` is an optional list, one per kept blob, passed straight to fit_box. The caller
+    only knows which prior belongs to which blob AFTER association, so the node runs this
+    twice: once without priors to get candidates to associate, then again for the matched
+    blobs with each peer's track as its prior. The kept groups come back so the second call
+    can address the same blobs.
 
     With `body=(length, width)` each blob is fitted with fit_box, which is the only way to
     get the CENTRE out of returns that all came off the near faces. Without it the centroid
@@ -124,12 +130,13 @@ def blob_centres(pts_xy, groups, min_points, sensor_xy, push=0.0, body=None):
     A blob that fit_box cannot fit (too few points) falls back to the centroid rather than
     disappearing: a rough position for a peer beats none.
     """
-    centres, sizes = [], []
+    centres, sizes, kept = [], [], []
     for g in groups:
         if len(g) < min_points:
             continue
         pts = pts_xy[g]
-        fit = fit_box(pts, sensor_xy, body[0], body[1]) if body else None
+        prior = priors[len(kept)] if priors is not None and len(kept) < len(priors) else None
+        fit = fit_box(pts, sensor_xy, body[0], body[1], prior=prior) if body else None
         if fit is not None:
             c = fit[0]
         else:
@@ -141,9 +148,10 @@ def blob_centres(pts_xy, groups, min_points, sensor_xy, push=0.0, body=None):
                     c = c + push * u / n
         centres.append(c)
         sizes.append(len(g))
+        kept.append(g)
     if not centres:
-        return np.zeros((0, 2)), np.zeros(0, dtype=int)
-    return np.array(centres), np.array(sizes, dtype=int)
+        return np.zeros((0, 2)), np.zeros(0, dtype=int), []
+    return np.array(centres), np.array(sizes, dtype=int), kept
 
 
 def associate(tracks, centres, gate):
@@ -222,7 +230,7 @@ def _boundary_gap(q, half):
 
 
 def fit_box(pts_xy, sensor_xy, length=BODY_L, width=BODY_W, n_angles=90,
-            outside_weight=5.0, coverage_weight=1.0):
+            outside_weight=5.0, coverage_weight=1.0, prior=None):
     """Recover a peer's CENTRE by fitting its known body box to the returns it produced.
 
     Averaging the returns cannot work. A lidar only ever sees the faces turned toward it,
@@ -236,6 +244,19 @@ def fit_box(pts_xy, sensor_xy, length=BODY_L, width=BODY_W, n_angles=90,
     near faces touch the returns (the sensor's side decides which face that is on each
     axis) and score how well the returns sit on the surface. The best yaw wins.
 
+    `prior` is where this peer was last seen, and it only matters when a face is partly
+    visible. Looking along a face the returns normally run its whole length, so their
+    midpoint is the centre. When they do not -- the apex dog sees 0.36 m of a body whose
+    side is 0.95 m, about a hundred returns against the four hundred the rear dogs get --
+    that midpoint is the midpoint of a FRAGMENT, and using it puts the centre wherever the
+    fragment happened to fall. It showed as error that was almost entirely lateral: 0.156 m
+    across the face against 0.032 m along the line of sight.
+
+    What a fragment actually says is that the centre lies somewhere in an interval, and
+    nothing more. So with a prior the estimate is projected into that interval: the observed
+    axis is untouched and the unobserved one stops inventing a number. The prior is our own
+    track history; no peer's broadcast position is involved.
+
     Returns (centre (2,), yaw, residual), or None if there is not enough to fit.
     """
     pts_xy = np.asarray(pts_xy, dtype=float)
@@ -245,26 +266,39 @@ def fit_box(pts_xy, sensor_xy, length=BODY_L, width=BODY_W, n_angles=90,
     half = (length / 2.0, width / 2.0)
 
     best = None
+    prior_xy = None if prior is None else np.asarray(prior, dtype=float)
     # The box is 180-degree symmetric, so half a turn covers every distinct orientation.
     for ang in np.linspace(0.0, np.pi, n_angles, endpoint=False):
         p = _rot(pts_xy, ang)
         s = _rot(sensor.reshape(1, 2), ang)[0]
+        pr = None if prior_xy is None else _rot(prior_xy.reshape(1, 2), ang)[0]
         c = np.empty(2)
         short = 0.0
         for k in (0, 1):
             lo, hi = p[:, k].min(), p[:, k].max()
-            if s[k] < lo:
-                # The sensor is past the low face, so that face is what it sees and every
-                # return on it shares one coordinate: anchoring there is exact.
-                c[k] = lo + half[k]
+            # Everything this axis knows is one interval: the centre has to sit where the
+            # box still contains every return, which is [hi - half, lo + half]. For a face
+            # seen end to end that interval collapses to a point and there is nothing to
+            # choose. For a fragment it is wide, and how wide is exactly how little the
+            # returns say -- the apex dog sees 0.36 m of a 0.95 m side, so a 0.59 m
+            # interval. One rule covers both, with no case for "is this a fragment".
+            lo_c, hi_c = hi - half[k], lo + half[k]
+            if lo_c > hi_c:
+                # The returns are wider than the face: this orientation is wrong, and the
+                # outside penalty below will say so. Centre them so the score is honest.
+                c[k] = 0.5 * (lo + hi)
+            elif pr is not None:
+                # Nearest feasible point to where this peer was last seen. On a full face
+                # the interval is a point, so the prior changes nothing and cannot outvote
+                # the returns; on a fragment it supplies the only information there is.
+                c[k] = min(max(pr[k], lo_c), hi_c)
+            elif s[k] < lo:
+                # No prior: fall back to putting the box's near face on the returns, which
+                # is right whenever the face really was seen end to end.
+                c[k] = hi_c
             elif s[k] > hi:
-                c[k] = hi - half[k]
+                c[k] = lo_c
             else:
-                # The sensor is level with this axis, so it is looking ALONG the face, not
-                # at it, and the returns run the face's whole length. Their midpoint is the
-                # centre; anchoring to an extreme here would inherit the sampling gap at
-                # the ends -- worth 0.05 m on a 25-point face, a third of the decision
-                # boundary, for no reason.
                 c[k] = 0.5 * (lo + hi)
                 # ...and if they do NOT run its whole length, this orientation is claiming
                 # the sensor sees a fragment of a face it is looking straight down. That is
