@@ -171,7 +171,29 @@ for r in $ROBOTS; do
   timeout 8 ros2 topic pub -r 2 /robot$r/cmd_gait std_msgs/msg/String "{data: trot}" >/dev/null 2>&1 &
 done
 sleep 9
-POSLINE=""; for r in $ROBOTS; do C=($(odom_field /robot$r/controller/odom)); POSLINE="$POSLINE ${C[0]:-99} ${C[1]:-99}"; done
+# Positions of every robot, or a hard failure. NEVER a placeholder.
+#
+# This used to substitute 99 for a read that timed out, and that number went straight into
+# the formation goal below (the mean of the fleet, plus GOAL_X). One missed read therefore
+# put the goal tens of metres away and the fleet walked off after it: measured 2026-08-05,
+# a run whose goal should have been x=2 had the dogs at x=19 and still going, with min_pair
+# down to 1.10 -- under D_MIN -- while every log line looked ordinary. Any measurement
+# taken during a run like that is worthless, and nothing said so.
+#
+# scripts/_fleet_bringup.sh fixed this on 2026-07-29 (see fleet_centroid there, which reads
+# the 20 Hz dist.csv instead). This gate is the duplicated copy the fix never reached; the
+# header at the top of this file asks for both to be changed together, and this is that.
+fleet_positions() {
+  local line="" r c
+  for r in $ROBOTS; do
+    c=($(odom_field /robot$r/controller/odom))
+    [ -n "${c[0]:-}" ] && [ -n "${c[1]:-}" ] || return 1
+    line="$line ${c[0]} ${c[1]}"
+  done
+  echo "$line"
+}
+
+POSLINE=$(fleet_positions) || die "could not read every dog's odometry when setting the formation goal; a partial read would aim the fleet at the wrong place"
 read GX GY <<< "$(python3 -c "
 v=[float(x) for x in '''$POSLINE'''.split()]; pts=list(zip(v[::2],v[1::2]))
 print(f'{sum(p[0] for p in pts)/len(pts)+$GOAL_X:.3f} {sum(p[1] for p in pts)/len(pts):.3f}')")"
@@ -185,7 +207,16 @@ timeout 8 ros2 topic pub -r 5 /formation/goal geometry_msgs/msg/PoseStamped \
 T_WALL0=$(date +%s); T_SIM0=$(timeout 4 ros2 topic echo /clock --once 2>/dev/null | grep -m1 sec: | awk '{print $2}')
 R=0
 for i in $(seq 1 120); do
-  POSLINE=""; for r in $ROBOTS; do C=($(odom_field /robot$r/controller/odom)); POSLINE="$POSLINE ${C[0]:-99} ${C[1]:-99}"; done
+  # A missed read here is not fatal -- the collision guard below reads dist.csv, not this --
+  # but centroid_dist would become nonsense, so skip the tick rather than print it. Bounded:
+  # when the machine is saturated every ros2 CLI round trip times out, and an unbounded skip
+  # would spin quietly for ten minutes and then report a timeout with no hint why.
+  if ! POSLINE=$(fleet_positions); then
+    SKIPS=$((${SKIPS:-0} + 1))
+    [ "$SKIPS" -le 6 ] || die "odometry unreadable for $SKIPS consecutive ticks -- the ros2 CLI is not getting answers, which usually means the machine is saturated (check load average) rather than the fleet being unwell"
+    say "  (odom read incomplete, skipping tick $SKIPS/6)"; sleep 5; continue
+  fi
+  SKIPS=0
   D=$(python3 -c "
 import math
 v=[float(x) for x in '''$POSLINE'''.split()]; pts=list(zip(v[::2],v[1::2]))

@@ -112,26 +112,33 @@ def cluster_xy(pts_xy, gap):
     return [np.array(v) for v in groups.values()]
 
 
-def blob_centres(pts_xy, groups, min_points, sensor_xy, push):
+def blob_centres(pts_xy, groups, min_points, sensor_xy, push=0.0, body=None):
     """Centre estimate per blob, as (centres (M,2), sizes (M,)).
 
-    A lidar only ever sees the near face, so the centroid of the returns sits short of the
-    body centre by roughly half a body depth. `push` moves each centroid directly away
-    from the sensor by that much. It defaults to 0.0 and is meant to be set from the
-    measured bias against ground truth (scripts/lidar_tracker_eval.py reports it) rather
-    than derived on paper, because the visible face is a box edge whose apparent depth
-    depends on the viewing angle.
+    With `body=(length, width)` each blob is fitted with fit_box, which is the only way to
+    get the CENTRE out of returns that all came off the near faces. Without it the centroid
+    is used, optionally nudged `push` metres directly away from the sensor -- a single
+    scalar that cannot track a bias which changes with viewing aspect, kept only so the
+    uncorrected behaviour stays reachable for comparison.
+
+    A blob that fit_box cannot fit (too few points) falls back to the centroid rather than
+    disappearing: a rough position for a peer beats none.
     """
     centres, sizes = [], []
     for g in groups:
         if len(g) < min_points:
             continue
-        c = pts_xy[g].mean(axis=0)
-        if push:
-            u = c - np.asarray(sensor_xy, dtype=float)
-            n = np.hypot(u[0], u[1])
-            if n > 1e-9:
-                c = c + push * u / n
+        pts = pts_xy[g]
+        fit = fit_box(pts, sensor_xy, body[0], body[1]) if body else None
+        if fit is not None:
+            c = fit[0]
+        else:
+            c = pts.mean(axis=0)
+            if push:
+                u = c - np.asarray(sensor_xy, dtype=float)
+                n = np.hypot(u[0], u[1])
+                if n > 1e-9:
+                    c = c + push * u / n
         centres.append(c)
         sizes.append(len(g))
     if not centres:
@@ -176,3 +183,105 @@ def associate(tracks, centres, gate):
         used_centres.add(k)
         out[i] = k
     return out
+
+# The peer's silhouette as a lidar actually sees it, at the torso height band.
+#
+# NOT const.xacro's base_length x base_width (0.83 x 0.25). Those are the COLLISION box;
+# the lidar sees base.stl, the visual mesh, and at torso height that includes the hip and
+# shoulder housings, which stand well proud of the collision box's sides. Measured
+# 2026-08-05 by putting 22753 returns from two peers into their own body frames:
+#
+#     along  u   -0.50 .. +0.46      (collision box assumed +-0.415)
+#     across v   -0.28 .. +0.26      (collision box assumed +-0.125)
+#
+# and the silhouette is centred on the base origin to within 0.03 m, so only the size is
+# wrong, not the offset. Fitting with the collision width left every side-on view 0.155 m
+# short, which matched the -0.169 m residual the evaluation was reporting.
+#
+# fit_box needs the size the RETURNS came off, not the one the physics uses.
+BODY_L = 0.95
+BODY_W = 0.55
+
+
+def _rot(pts, ang):
+    c, s = np.cos(ang), np.sin(ang)
+    return np.stack([c * pts[:, 0] + s * pts[:, 1],
+                     -s * pts[:, 0] + c * pts[:, 1]], axis=1)
+
+
+def _boundary_gap(q, half):
+    """Signed distance of each point to a centred axis-aligned box's SURFACE.
+
+    Returns (inside_depth, outside_dist), both non-negative. A return that came off the
+    body should have both near zero: it sits on the surface.
+    """
+    d = np.abs(q) - np.asarray(half)
+    outside = np.hypot(np.maximum(d[:, 0], 0.0), np.maximum(d[:, 1], 0.0))
+    inside = np.where((d[:, 0] <= 0) & (d[:, 1] <= 0), np.minimum(-d[:, 0], -d[:, 1]), 0.0)
+    return inside, outside
+
+
+def fit_box(pts_xy, sensor_xy, length=BODY_L, width=BODY_W, n_angles=90,
+            outside_weight=5.0, coverage_weight=1.0):
+    """Recover a peer's CENTRE by fitting its known body box to the returns it produced.
+
+    Averaging the returns cannot work. A lidar only ever sees the faces turned toward it,
+    so the centroid lands on the surface, short of the centre by half of whatever face is
+    visible -- 0.125 m across the width, 0.415 m along the length, and something in between
+    at a corner. Measured on the fleet 2026-08-05: -0.138 m for a peer seen side-on,
+    -0.26 at a rear quarter, -0.34 for the two the V apex sees at its scan edge. No single
+    offset cancels a bias that changes with aspect, which is what this replaces.
+
+    The size is known, so the fit is cheap: for each candidate yaw, slide the box until its
+    near faces touch the returns (the sensor's side decides which face that is on each
+    axis) and score how well the returns sit on the surface. The best yaw wins.
+
+    Returns (centre (2,), yaw, residual), or None if there is not enough to fit.
+    """
+    pts_xy = np.asarray(pts_xy, dtype=float)
+    if len(pts_xy) < 3:
+        return None
+    sensor = np.asarray(sensor_xy, dtype=float)
+    half = (length / 2.0, width / 2.0)
+
+    best = None
+    # The box is 180-degree symmetric, so half a turn covers every distinct orientation.
+    for ang in np.linspace(0.0, np.pi, n_angles, endpoint=False):
+        p = _rot(pts_xy, ang)
+        s = _rot(sensor.reshape(1, 2), ang)[0]
+        c = np.empty(2)
+        short = 0.0
+        for k in (0, 1):
+            lo, hi = p[:, k].min(), p[:, k].max()
+            if s[k] < lo:
+                # The sensor is past the low face, so that face is what it sees and every
+                # return on it shares one coordinate: anchoring there is exact.
+                c[k] = lo + half[k]
+            elif s[k] > hi:
+                c[k] = hi - half[k]
+            else:
+                # The sensor is level with this axis, so it is looking ALONG the face, not
+                # at it, and the returns run the face's whole length. Their midpoint is the
+                # centre; anchoring to an extreme here would inherit the sampling gap at
+                # the ends -- worth 0.05 m on a 25-point face, a third of the decision
+                # boundary, for no reason.
+                c[k] = 0.5 * (lo + hi)
+                # ...and if they do NOT run its whole length, this orientation is claiming
+                # the sensor sees a fragment of a face it is looking straight down. That is
+                # how a genuine ambiguity resolves: a flat 0.25 m return is equally
+                # consistent with the box's 0.25 m end (correct) and with the middle of its
+                # 0.83 m side, and both put every point exactly on a surface, so the fit
+                # residual alone cannot separate them. Coverage can.
+                short += max(2.0 * half[k] - (hi - lo), 0.0)
+        inside, outside = _boundary_gap(p - c, half)
+        # Outside is weighted up: a body contains all of its own returns, so a pose that
+        # leaves some out is wrong in a way that a slightly loose surface fit is not.
+        # Coverage is weighted below both, so real occlusion bends the answer rather than
+        # breaking it.
+        score = float(inside.mean() + outside_weight * outside.mean()
+                      + coverage_weight * short)
+        if best is None or score < best[0]:
+            best = (score, ang, c)
+
+    score, ang, c = best
+    return _rot(c.reshape(1, 2), -ang)[0], float(ang), score

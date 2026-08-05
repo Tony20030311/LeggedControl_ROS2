@@ -47,7 +47,7 @@ sys.path.insert(0, os.path.join(
 sys.path.insert(0, '/root/legged_ros2_ws/install/legged_admm_fleet/lib/'
                    'legged_admm_fleet/python/admm')
 from peer_tracker import (  # noqa: E402
-    associate, blob_centres, cluster_xy, keep_bodies, to_world)
+    BODY_L, BODY_W, associate, blob_centres, cluster_xy, keep_bodies, to_world)
 
 # Where the lidar sits on the base, from urdf/vision60/lidar.xacro: the joint puts it at
 # (0.25, 0, 0.2) and the optical frame another 0.036 up. Kept here rather than read from
@@ -119,8 +119,16 @@ class LidarPeerTracker(Node):
         # reference speed a dog moves 0.08 m; the rest is tracking slack. Too wide and a
         # neighbouring dog becomes a candidate, too tight and a turn drops the track.
         self.gate = self.declare_parameter('gate_m', 0.50).value
-        # Near-face bias correction, in metres along the line of sight. Left at zero until
-        # measured: scripts/lidar_tracker_eval.py reports the bias this should cancel.
+        # Fit the known body box to each blob instead of averaging its returns. A lidar
+        # only sees the faces turned toward it, so the centroid lands on the surface: short
+        # of the centre by 0.125 m across the width, 0.415 m along the length, and a mix at
+        # a corner. Measured on this fleet before the fit, radial bias per pair was -0.138
+        # side-on, -0.26 at a rear quarter, -0.34 at the scan edge -- a bias that changes
+        # with aspect, which no single offset can cancel.
+        #
+        # Set body_fit false to fall back to centroid + centre_push, which is the older,
+        # weaker correction; it exists so the two can be compared, not because it works.
+        self.body_fit = self.declare_parameter('body_fit', True).value
         self.push = self.declare_parameter('centre_push', 0.0).value
         # Per-sweep dump of every stage. Off by default: it is throttled but still
         # one line per two seconds per dog.
@@ -255,7 +263,8 @@ class LidarPeerTracker(Node):
             # returning a truncated clustering would look like a working sensor.
             self.get_logger().error(str(e), throttle_duration_sec=5.0)
             return
-        centres, sizes = blob_centres(pts, groups, self.min_points, (sx, sy), self.push)
+        centres, sizes = blob_centres(pts, groups, self.min_points, (sx, sy), self.push,
+                                      (BODY_L, BODY_W) if self.body_fit else None)
 
         matched = associate(self.tracks, centres, self.gate)
         if self.debug:

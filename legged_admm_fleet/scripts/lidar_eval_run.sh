@@ -25,7 +25,17 @@ say() { echo "[lidareval $(date +%H:%M:%S)] $*"; }
 die() { echo "[lidareval] FAIL: $*" >&2; cleanup; exit 1; }
 
 cleanup() {
-  pkill -x lidar_peer_tra 2>/dev/null      # comm is truncated at 15 chars
+  # A python script's comm is "python3", so `pkill -x lidar_peer_tra` matched NOTHING and
+  # every run left its three trackers alive. Twenty-four of them had piled up by
+  # 2026-08-05, all still subscribed to the 500 kB cloud topics, and the symptoms looked
+  # like anything but leaked processes: whichever tracker subscribed first got every sweep
+  # and the rest got none, the machine sat at load 10+, and the fleet intermittently failed
+  # to stand. Two wrong diagnoses (shared memory, duplicate node names) came out of that.
+  #
+  # -f is required to see a script name at all. The bracket keeps the pattern from matching
+  # this shell's own command line, the same trick _fleet_bringup.sh uses for "launch[.]py".
+  pkill -9 -f "lidar_peer_tracker_node[.]py" 2>/dev/null
+  pkill -9 -f "lidar_tracker_eval[.]py" 2>/dev/null
   pkill -x bridge_node 2>/dev/null
   pkill -x parameter_brid 2>/dev/null
   pkill -9 -x gz 2>/dev/null
@@ -85,11 +95,13 @@ say "fleet up -- attaching perception"
 # root, where vision60 has no gz_bridge.yaml. Ours is reached only from sim.launch.py, so
 # the bridges have to be started here by hand. (If the tracker ever moves onto the control
 # path, this belongs in the bring-up, not in an eval script.)
+# One bridge for the whole fleet: three processes all default to the node name
+# "ros_gz_bridge", and one node per topic buys nothing here.
+SPECS=""
 for r in $ROBOTS; do
-  ros2 run ros_gz_bridge parameter_bridge \
-    "/robot$r/lidar/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked" \
-    > "$LOGD/bridge_$r.log" 2>&1 &
+  SPECS="$SPECS /robot$r/lidar/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked"
 done
+ros2 run ros_gz_bridge parameter_bridge $SPECS > "$LOGD/bridge.log" 2>&1 &
 sleep 8
 # One message each is all that needs proving. Give discovery room: an 8 s budget was not
 # enough on 2026-08-05 and failed a run that was otherwise healthy. There is no longer any

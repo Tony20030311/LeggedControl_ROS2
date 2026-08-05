@@ -43,8 +43,18 @@
      gate had been loading legged_gazebo's 1 ms world all along and never picked up the
      2026-07-30 move to 2 ms that arena_run gets through gazebo_package. Both are now on ours.
 
-     So what is left is the honest pair. 5 Hz because this is peer observation, not a control
-     loop; 5 m because obs_range is 4.0 m and nothing past it is evidence.
+     So what is left is three changes from upstream, each with a reason:
+
+       5 Hz          this is peer observation, not a control loop
+       5 m range     obs_range is 4.0 m; nothing past it is evidence
+       360 deg       upstream scans +-150 deg, leaving a 60 deg blind cone astern, and the
+                     V formation puts the apex dog's two peers at exactly +-150 deg, on the
+                     boundary. It sees a sliver of each, too little for the body-box fit to
+                     work with, and it showed: with the same tracker and the same fit, the
+                     two rear dogs reported p95 error 0.046-0.069 m while the apex reported
+                     0.352 and 0.666. Rays are nearly free here (see the table above), a
+                     spinning lidar is 360 deg in reality, and a structural blind spot in
+                     the middle of a safety argument is not worth defending.
 
      So these values are for cleanliness and honesty about what the sensor needs to be, not for
      speed. -->
@@ -113,8 +123,8 @@
                         <horizontal>
                             <samples>1024</samples>
                             <resolution>1</resolution>
-                            <min_angle>-2.6180</min_angle>
-                            <max_angle> 2.6180</max_angle>
+                            <min_angle>-3.14159</min_angle>
+                            <max_angle> 3.14159</max_angle>
                         </horizontal>
                         <vertical>
                             <samples>32</samples>

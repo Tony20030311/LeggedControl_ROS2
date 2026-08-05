@@ -17,7 +17,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 from peer_tracker import (  # noqa: E402
-    MAX_CLUSTER_POINTS, associate, blob_centres, cluster_xy, keep_bodies, to_world)
+    BODY_L, BODY_W, MAX_CLUSTER_POINTS, associate, blob_centres, cluster_xy, fit_box,
+    keep_bodies, to_world)
 
 
 def _box(cx, cy, cz, n=40, w=0.6, l=0.9, h=0.3, seed=0):
@@ -234,3 +235,121 @@ def test_full_pipeline_recovers_the_v_formation():
     assert set(got) == {1, 3}
     for pid, k in got.items():
         assert np.linalg.norm(centres[k] - truth[pid]) < 0.15   # the decision boundary
+
+
+# --- fit_box ------------------------------------------------------------------------
+# The whole point of the fit is recovering a CENTRE from returns that only ever landed on
+# the faces turned toward the sensor. So the fixture has to be honest about that: sample
+# the visible faces only, never the far ones, or the test proves nothing.
+def _visible_faces(centre, yaw, sensor, n_per_face=25, length=None, width=None, noise=0.0,
+                   seed=0):
+    a = (length or BODY_L) / 2.0
+    b = (width or BODY_W) / 2.0
+    rng = np.random.default_rng(seed)
+    c, s = np.cos(yaw), np.sin(yaw)
+    to_box = np.array([[c, s], [-s, c]])          # world -> box
+    sb = to_box @ (np.asarray(sensor, float) - np.asarray(centre, float))
+
+    # Regular sampling, not random: a lidar sweeps at a fixed angular step, so returns are
+    # spread evenly across a face and reach close to its ends. Random samples leave a gap
+    # at the extremes that is pure fixture artefact -- 0.03 m on a 0.83 m face with 25
+    # points -- and it would land straight in the number under test.
+    lin_a, lin_b = np.linspace(-a, a, n_per_face), np.linspace(-b, b, n_per_face)
+    pts = []
+    if sb[0] > a:                                  # +u face
+        pts.append(np.stack([np.full(n_per_face, a), lin_b], 1))
+    if sb[0] < -a:
+        pts.append(np.stack([np.full(n_per_face, -a), lin_b], 1))
+    if sb[1] > b:                                  # +v face
+        pts.append(np.stack([lin_a, np.full(n_per_face, b)], 1))
+    if sb[1] < -b:
+        pts.append(np.stack([lin_a, np.full(n_per_face, -b)], 1))
+    if not pts:
+        return np.zeros((0, 2))
+    p = np.vstack(pts)
+    if noise:
+        p = p + rng.normal(0.0, noise, p.shape)
+    return (to_box.T @ p.T).T + np.asarray(centre, float)
+
+
+def test_fit_box_recovers_centre_seen_side_on():
+    # The bias this replaces: side-on, the centroid sits half a width short (-0.125 m).
+    centre, sensor = np.array([1.40, 0.0]), np.array([0.0, 0.0])
+    pts = _visible_faces(centre, np.pi / 2, sensor)          # long axis across the view
+    got, _, _ = fit_box(pts, sensor)
+    assert np.linalg.norm(got - centre) < 0.02
+    assert np.linalg.norm(pts.mean(axis=0) - centre) > 0.10  # centroid is the bad answer
+
+
+def test_fit_box_recovers_centre_seen_end_on():
+    # End-on is the worst case for a centroid: half a LENGTH short, 0.415 m.
+    centre, sensor = np.array([1.40, 0.0]), np.array([0.0, 0.0])
+    pts = _visible_faces(centre, 0.0, sensor)
+    got, _, _ = fit_box(pts, sensor)
+    assert np.linalg.norm(got - centre) < 0.02
+    assert np.linalg.norm(pts.mean(axis=0) - centre) > 0.35
+
+
+def test_fit_box_recovers_centre_at_a_corner():
+    # Two faces visible. This is the common case in the V formation and the one no single
+    # radial offset can correct, because the bias has a lateral component here.
+    centre, sensor = np.array([1.2, 0.7]), np.array([0.0, 0.0])
+    pts = _visible_faces(centre, 0.4, sensor)
+    got, _, _ = fit_box(pts, sensor)
+    assert np.linalg.norm(got - centre) < 0.03
+
+
+def test_fit_box_over_yaws_and_bearings():
+    """Sweep the configurations the fleet actually produces. The bound is the trust
+    layer's decision boundary; anything looser and the sensor is indistinguishable from
+    a small lie."""
+    worst = 0.0
+    for yaw in np.linspace(0, np.pi, 7):
+        for bearing in np.linspace(-np.pi, np.pi, 9):
+            centre = 1.4 * np.array([np.cos(bearing), np.sin(bearing)])
+            pts = _visible_faces(centre, yaw, np.zeros(2))
+            if len(pts) < 3:
+                continue
+            got, _, _ = fit_box(pts, np.zeros(2))
+            worst = max(worst, float(np.linalg.norm(got - centre)))
+    assert worst < 0.05, f'worst centre error {worst:.3f} m'
+
+
+def test_fit_box_survives_sensor_noise():
+    """With range noise on every return the fit degrades, and the bound that matters is
+    the trust layer's: an observation error at 0.15 m is indistinguishable from a lie."""
+    centre, sensor = np.array([1.40, 0.3]), np.zeros(2)
+    pts = _visible_faces(centre, 0.6, sensor, noise=0.02, seed=3)
+    got, _, _ = fit_box(pts, sensor)
+    err = np.linalg.norm(got - centre)
+    assert err < 0.10, f'{err:.3f} m leaves too little of the 0.15 m boundary'
+    assert err < np.linalg.norm(pts.mean(axis=0) - centre)
+
+
+def test_fit_box_refuses_too_few_points():
+    assert fit_box(np.array([[1.0, 0.0], [1.1, 0.0]]), np.zeros(2)) is None
+
+
+def test_fit_box_yaw_is_modulo_a_half_turn():
+    # A box looks the same rotated 180 deg, so only [0, pi) is searched and the reported
+    # yaw must land in it -- a caller comparing headings needs to know that.
+    centre = np.array([1.4, 0.0])
+    _, ang, _ = fit_box(_visible_faces(centre, 0.3, np.zeros(2)), np.zeros(2))
+    assert 0.0 <= ang < np.pi
+
+
+def test_blob_centres_with_body_beats_plain_centroid():
+    centre, sensor = np.array([1.40, 0.0]), np.zeros(2)
+    pts = _visible_faces(centre, 0.0, sensor)
+    groups = [np.arange(len(pts))]
+    plain, _ = blob_centres(pts, groups, 5, sensor, push=0.0)
+    fitted, _ = blob_centres(pts, groups, 5, sensor, body=(BODY_L, BODY_W))
+    assert np.linalg.norm(fitted[0] - centre) < 0.02
+    assert np.linalg.norm(plain[0] - centre) > np.linalg.norm(fitted[0] - centre)
+
+
+def test_blob_centres_falls_back_when_the_blob_is_too_thin_to_fit():
+    # min_points lets it through, fit_box does not: the caller still gets a position.
+    pts = np.array([[1.40, 0.0], [1.41, 0.0]])
+    got, n = blob_centres(pts, [np.array([0, 1])], 2, np.zeros(2), body=(BODY_L, BODY_W))
+    assert len(got) == 1 and n[0] == 2
