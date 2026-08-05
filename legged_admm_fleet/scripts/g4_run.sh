@@ -62,6 +62,11 @@ pkill -9 -x legged_common_g 2>/dev/null; pkill -9 -x legged_common_b 2>/dev/null
 pkill -9 -x parameter_bridg 2>/dev/null
 # leaked `ros2 launch` parents have comm=python3 — pkill -x ros2 misses them (see arena_run.sh)
 pkill -9 -f "launch[.]py" 2>/dev/null
+# A python script's comm is "python3", so no -x pattern can reach these. Leaving them
+# alive is not cosmetic: they stay subscribed to the 500 kB cloud topics, and twenty-four
+# of them had piled up on 2026-08-05 before anyone noticed, at which point whichever
+# tracker subscribed first got every sweep and the rest got none.
+pkill -9 -f "lidar_peer_tracker_node[.]py" 2>/dev/null
 sleep 2
 rm -rf /dev/shm/fastrtps* /dev/shm/fast_datasharing* /dev/shm/sem.fastrtps* 2>/dev/null
 
@@ -138,9 +143,12 @@ say "all controllers ACTIVE"
 GZMARK=$(wc -l < "$LOGD/gazebo.log")
 gz_deactivated() { tail -n +$((GZMARK + 1)) "$LOGD/gazebo.log" | grep -q "Deactivating"; }
 IDS="[${ROBOTS// /, }]"
-say "phase 3: distributed agents (ids=$IDS v=$V deadline=${DEADLINE}ms)"
+# OBSERVATION=lidar drives "I observe peer j" from each dog's own point cloud instead of
+# the Gazebo model pose. Default truth, so this gate stays what it was.
+OBSERVATION=${OBSERVATION:-truth}
+say "phase 3: distributed agents (ids=$IDS v=$V deadline=${DEADLINE}ms observation=$OBSERVATION)"
 setsid ros2 launch legged_admm_fleet admm_fleet.launch.py mode:=distributed \
-  robot_ids:="$IDS" v:=$V hop_deadline_ms:=$DEADLINE \
+  robot_ids:="$IDS" v:=$V hop_deadline_ms:=$DEADLINE observation:=$OBSERVATION \
   enable_peer_keepout:=$ENABLE_PEER_KEEPOUT > "$LOGD/admm.log" 2>&1 &
 setsid python3 $WS/src/legged_fleet/legged_admm_fleet/scripts/g3_dist_logger.py \
   "$ROBOTS" "$LOGD/dist.csv" 1.3 --ros-args -p use_sim_time:=true > "$LOGD/dist_logger.log" 2>&1 &  # 1.3 = admm::D_MIN
@@ -159,6 +167,41 @@ for i in $(seq 1 30); do
 done
 [ "$ALL" = 1 ] || die "robot$r did not stand (z=${C[2]:-?})"
 say "all STANDING (distributed)"
+
+# ---------- perception, when the observation channel is the lidar ----------
+# After standing, before the goal: the trackers seed peer tracks from the roster's spawn
+# poses and the fleet has not left them yet. (They recover from a late start by carrying
+# the seeds forward, but there is no reason to lean on that here.) The bridge is not part
+# of gazebo.launch.py's own pass -- that reads legged_gazebo's config root, where vision60
+# has no gz_bridge.yaml -- so it is started here.
+if [ "$OBSERVATION" = lidar ]; then
+  SPECS=""
+  for r in $ROBOTS; do
+    SPECS="$SPECS /robot$r/lidar/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked"
+  done
+  setsid ros2 run ros_gz_bridge parameter_bridge $SPECS > "$LOGD/bridge.log" 2>&1 &
+  sleep 6
+  for r in $ROBOTS; do
+    timeout 20 ros2 topic echo /robot$r/lidar/points --once --field width >/dev/null 2>&1 \
+      || die "no point cloud on /robot$r/lidar/points -- the fleet is running blind but would not say so"
+  done
+  for r in $ROBOTS; do
+    setsid python3 $WS/install/legged_admm_fleet/lib/legged_admm_fleet/lidar_peer_tracker_node.py \
+      --ros-args -r __node:=lidar_peer_tracker_$r -r points:=/robot$r/lidar/points \
+      -p use_sim_time:=true -p robot_id:=$r -p "robot_ids:=$IDS" -p roster_file:=$ROSTER \
+      > "$LOGD/tracker_$r.log" 2>&1 &
+  done
+  for i in $(seq 1 40); do
+    READY=0
+    for r in $ROBOTS; do grep -q 'tracking peers' "$LOGD/tracker_$r.log" 2>/dev/null && READY=$((READY+1)); done
+    [ "$READY" = "$(echo $ROBOTS | wc -w)" ] && break
+    sleep 0.5
+  done
+  for r in $ROBOTS; do
+    grep -q 'tracking peers' "$LOGD/tracker_$r.log" || die "tracker for robot$r did not start"
+  done
+  say "perception up: $(echo $ROBOTS | wc -w) trackers on their own lidars"
+fi
 
 # ---------- phase 4: trot + /formation/goal ----------
 say "phase 4: trot + /formation/goal centroid+$GOAL_X"

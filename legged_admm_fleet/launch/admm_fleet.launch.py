@@ -29,6 +29,9 @@ def _distributed_agents(context, *_a, **_k):
     # rather than a later `ros2 param set` (that is the "late impostor" case and needs no launch
     # support -- it fires the same parameter, just after bring-up). Default '0' on both -> every
     # agent gets inject_forged_obs=0 -> inert.
+    observation = LaunchConfiguration('observation').perform(context).strip().lower()
+    if observation not in ('truth', 'lidar'):
+        raise ValueError(f"observation must be 'truth' or 'lidar', got '{observation}'")
     forged_obs_attacker = int(LaunchConfiguration('forged_obs_attacker').perform(context))
     forged_obs_target = int(LaunchConfiguration('forged_obs_target').perform(context))
     # Task 11 item 6 (arm selector, scripts/d_run.sh): which detector is armed and whether it
@@ -82,17 +85,35 @@ def _distributed_agents(context, *_a, **_k):
                 'enable_peer_keepout': LaunchConfiguration('enable_peer_keepout').perform(
                     context).lower() in ('true', '1'),
                 'inject_forged_obs': forged_obs_target if int(i) == forged_obs_attacker else 0,
+                # A lidar sweep is 5 Hz and a peer is resolved on roughly half of them, so
+                # the observation history is ~2.7 Hz where the ground-truth stand-in was
+                # ~250 Hz. admm_agent_node windows that history by AGE, and interp_at
+                # refuses a query outside it -- the smear check reaches about two slots
+                # back, which 0.5 s of 2.7 Hz samples barely covers. Widen it rather than
+                # have the check silently find nothing to check.
+                'obs_window_s': 1.5 if observation == 'lidar' else 0.5,
                 'obs_gate2': obs_gate2,
                 'detection_log_only': detection_log_only,
                 'obs_noise_seed': obs_noise_seed,
             }],
             remappings=[
                 # The observation channel is the observer's own sensor, subscribed under a LOCAL
-                # name so a real perception source can be swapped in later without touching the
-                # node. The remap itself grants no security -- the resolved DDS topic is still one
+                # name so a real perception source can be swapped in without touching the node.
+                # The remap itself grants no security -- the resolved DDS topic is still one
                 # global name -- the publisher-GID pin in admm_agent_node.cpp is what actually
                 # rejects an impostor writer (see the subscription's comment).
-                (f'observed/robot{int(j)}', f'/robot{int(j)}/hardware/odom')
+                #
+                # observation:=lidar points it at scripts/lidar_peer_tracker_node.py, which
+                # derives peer positions from THIS dog's own point cloud and never reads what a
+                # peer broadcasts. The default stays on /robotJ/hardware/odom, the Gazebo model
+                # pose: ground truth wearing a sensor's clothes, and the thing this exists to
+                # retire. Measured 2026-08-05, three dogs walking, the tracker's error against
+                # that truth was p95 0.094 m with every sample associated to the right peer --
+                # inside the trust layer's 0.15 m decision boundary, which is what makes the
+                # swap arguable at all.
+                (f'observed/robot{int(j)}',
+                 f'/robot{int(i)}/perceived/robot{int(j)}' if observation == 'lidar'
+                 else f'/robot{int(j)}/hardware/odom')
                 for j in ids if int(j) != int(i)
             ],
         ))
@@ -127,6 +148,12 @@ def generate_launch_description():
         # the correct and default value; N (20) is the known-unsafe setting kept only so the
         # before/after can be measured with ONE binary. The node warns loudly if it is not 10.
         DeclareLaunchArgument('corpse_anchor_knot', default_value='10'),
+        DeclareLaunchArgument(
+            'observation', default_value='truth',
+            description="Where 'I observe peer j' comes from: 'truth' = the Gazebo model "
+                        "pose (the stand-in), 'lidar' = this dog's own lidar via "
+                        "lidar_peer_tracker_node.py. 'lidar' needs the trackers and the "
+                        "gz bridge running; nothing here starts them."),
         DeclareLaunchArgument('formation', default_value='V'),
         # task 4b spike: each agent's own local pairwise safety net against every peer it can
         # observe, bypassing edge_owner entirely (see AgentCore ctor in agent_core.hpp). Default
