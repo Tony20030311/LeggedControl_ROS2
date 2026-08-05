@@ -143,9 +143,10 @@ say "all controllers ACTIVE"
 GZMARK=$(wc -l < "$LOGD/gazebo.log")
 gz_deactivated() { tail -n +$((GZMARK + 1)) "$LOGD/gazebo.log" | grep -q "Deactivating"; }
 IDS="[${ROBOTS// /, }]"
-# OBSERVATION=lidar drives "I observe peer j" from each dog's own point cloud instead of
-# the Gazebo model pose. Default truth, so this gate stays what it was.
+# Where "I observe peer j" comes from; sources are in config/observation_sources.yaml.
+# Default truth, so this gate stays what it was.
 OBSERVATION=${OBSERVATION:-truth}
+. $WS/src/legged_fleet/legged_admm_fleet/scripts/_perception.sh
 say "phase 3: distributed agents (ids=$IDS v=$V deadline=${DEADLINE}ms observation=$OBSERVATION)"
 setsid ros2 launch legged_admm_fleet admm_fleet.launch.py mode:=distributed \
   robot_ids:="$IDS" v:=$V hop_deadline_ms:=$DEADLINE observation:=$OBSERVATION \
@@ -168,40 +169,9 @@ done
 [ "$ALL" = 1 ] || die "robot$r did not stand (z=${C[2]:-?})"
 say "all STANDING (distributed)"
 
-# ---------- perception, when the observation channel is the lidar ----------
-# After standing, before the goal: the trackers seed peer tracks from the roster's spawn
-# poses and the fleet has not left them yet. (They recover from a late start by carrying
-# the seeds forward, but there is no reason to lean on that here.) The bridge is not part
-# of gazebo.launch.py's own pass -- that reads legged_gazebo's config root, where vision60
-# has no gz_bridge.yaml -- so it is started here.
-if [ "$OBSERVATION" = lidar ]; then
-  SPECS=""
-  for r in $ROBOTS; do
-    SPECS="$SPECS /robot$r/lidar/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked"
-  done
-  setsid ros2 run ros_gz_bridge parameter_bridge $SPECS > "$LOGD/bridge.log" 2>&1 &
-  sleep 6
-  for r in $ROBOTS; do
-    timeout 20 ros2 topic echo /robot$r/lidar/points --once --field width >/dev/null 2>&1 \
-      || die "no point cloud on /robot$r/lidar/points -- the fleet is running blind but would not say so"
-  done
-  for r in $ROBOTS; do
-    setsid python3 $WS/install/legged_admm_fleet/lib/legged_admm_fleet/lidar_peer_tracker_node.py \
-      --ros-args -r __node:=lidar_peer_tracker_$r -r points:=/robot$r/lidar/points \
-      -p use_sim_time:=true -p robot_id:=$r -p "robot_ids:=$IDS" -p roster_file:=$ROSTER \
-      > "$LOGD/tracker_$r.log" 2>&1 &
-  done
-  for i in $(seq 1 40); do
-    READY=0
-    for r in $ROBOTS; do grep -q 'tracking peers' "$LOGD/tracker_$r.log" 2>/dev/null && READY=$((READY+1)); done
-    [ "$READY" = "$(echo $ROBOTS | wc -w)" ] && break
-    sleep 0.5
-  done
-  for r in $ROBOTS; do
-    grep -q 'tracking peers' "$LOGD/tracker_$r.log" || die "tracker for robot$r did not start"
-  done
-  say "perception up: $(echo $ROBOTS | wc -w) trackers on their own lidars"
-fi
+# Whatever the observation source needs, brought up here: after standing so peer tracks are
+# seeded where the roster put everyone, and before the goal so they are still valid.
+perception_bringup
 
 # ---------- phase 4: trot + /formation/goal ----------
 say "phase 4: trot + /formation/goal centroid+$GOAL_X"

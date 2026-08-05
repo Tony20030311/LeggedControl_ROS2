@@ -79,6 +79,9 @@ ament_target_dependencies(fleet_coordinator_node
 install(TARGETS fleet_coordinator_node RUNTIME DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch config worlds rviz urdf DESTINATION share/${PROJECT_NAME})
+# _perception.sh is sourced by the run scripts from the SOURCE tree (they all do), so it
+# needs no install rule; observation_sources.yaml ships with config/ above and IS read
+# from the install tree, by both the launch file and _perception.sh.
 install(PROGRAMS scripts/start_gaits.sh
         scripts/fleet_viz_markers.py scripts/gen_arena_world.py scripts/check_xml.py
         scripts/lidar_peer_tracker_node.py scripts/lidar_tracker_eval.py

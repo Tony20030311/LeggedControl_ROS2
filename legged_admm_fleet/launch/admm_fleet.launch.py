@@ -1,6 +1,9 @@
 # ADMM upper-control launch. mode:=distributed (default, P4/G4) runs one admm_agent_node
 # per robot; mode:=centralized (P2 baseline oracle) runs the single fleet_centralized_node.
 import ast
+import os
+
+import yaml
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -8,6 +11,20 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import LaunchConfigurationEquals
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+
+
+def _observation_sources():
+    """The observation sources, from config/observation_sources.yaml.
+
+    Data, not classes: the sources differ in a topic template, a history window and a flag,
+    and two implementations of an interface would share every line of behaviour. Being a
+    file also puts them within reach of scripts/_perception.sh, so the bring-up sequence is
+    written once instead of once per gate.
+    """
+    path = os.path.join(get_package_share_directory('legged_admm_fleet'),
+                        'config', 'observation_sources.yaml')
+    with open(path, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f) or {}
 
 
 def _reference_file():
@@ -29,9 +46,12 @@ def _distributed_agents(context, *_a, **_k):
     # rather than a later `ros2 param set` (that is the "late impostor" case and needs no launch
     # support -- it fires the same parameter, just after bring-up). Default '0' on both -> every
     # agent gets inject_forged_obs=0 -> inert.
-    observation = LaunchConfiguration('observation').perform(context).strip().lower()
-    if observation not in ('truth', 'lidar'):
-        raise ValueError(f"observation must be 'truth' or 'lidar', got '{observation}'")
+    obs_name = LaunchConfiguration('observation').perform(context).strip().lower()
+    obs = _observation_sources().get(obs_name)
+    if obs is None:
+        raise ValueError(f"unknown observation source '{obs_name}'; "
+                         f"config/observation_sources.yaml defines "
+                         f"{sorted(_observation_sources())}")
     forged_obs_attacker = int(LaunchConfiguration('forged_obs_attacker').perform(context))
     forged_obs_target = int(LaunchConfiguration('forged_obs_target').perform(context))
     # Task 11 item 6 (arm selector, scripts/d_run.sh): which detector is armed and whether it
@@ -85,13 +105,7 @@ def _distributed_agents(context, *_a, **_k):
                 'enable_peer_keepout': LaunchConfiguration('enable_peer_keepout').perform(
                     context).lower() in ('true', '1'),
                 'inject_forged_obs': forged_obs_target if int(i) == forged_obs_attacker else 0,
-                # A lidar sweep is 5 Hz and a peer is resolved on roughly half of them, so
-                # the observation history is ~2.7 Hz where the ground-truth stand-in was
-                # ~250 Hz. admm_agent_node windows that history by AGE, and interp_at
-                # refuses a query outside it -- the smear check reaches about two slots
-                # back, which 0.5 s of 2.7 Hz samples barely covers. Widen it rather than
-                # have the check silently find nothing to check.
-                'obs_window_s': 1.5 if observation == 'lidar' else 0.5,
+                'obs_window_s': float(obs['window_s']),
                 'obs_gate2': obs_gate2,
                 'detection_log_only': detection_log_only,
                 'obs_noise_seed': obs_noise_seed,
@@ -103,17 +117,11 @@ def _distributed_agents(context, *_a, **_k):
                 # global name -- the publisher-GID pin in admm_agent_node.cpp is what actually
                 # rejects an impostor writer (see the subscription's comment).
                 #
-                # observation:=lidar points it at scripts/lidar_peer_tracker_node.py, which
-                # derives peer positions from THIS dog's own point cloud and never reads what a
-                # peer broadcasts. The default stays on /robotJ/hardware/odom, the Gazebo model
-                # pose: ground truth wearing a sensor's clothes, and the thing this exists to
-                # retire. Measured 2026-08-05, three dogs walking, the tracker's error against
-                # that truth was p95 0.094 m with every sample associated to the right peer --
-                # inside the trust layer's 0.15 m decision boundary, which is what makes the
-                # swap arguable at all.
+                # Which topic that is comes from config/observation_sources.yaml, keyed by
+                # observation:=<name>. The sources and their trade-offs are documented there,
+                # next to the values, rather than here.
                 (f'observed/robot{int(j)}',
-                 f'/robot{int(i)}/perceived/robot{int(j)}' if observation == 'lidar'
-                 else f'/robot{int(j)}/hardware/odom')
+                 obs['topic'].format(self=int(i), peer=int(j)))
                 for j in ids if int(j) != int(i)
             ],
         ))

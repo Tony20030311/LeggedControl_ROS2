@@ -1,0 +1,37 @@
+# Where "I observe peer j" comes from. Selected by observation:=<name> on
+# admm_fleet.launch.py, or OBSERVATION=<name> for the run scripts.
+#
+# This is data rather than a pair of classes because the sources differ only in data: a
+# topic name, a history window, and whether a perception stack has to be brought up. Two
+# implementations of an interface would share every line of behaviour between them. Being
+# a file also puts it within reach of the shell scripts, which is what lets the bring-up
+# block live in one place instead of being copied into every gate.
+#
+# topic templates take {self} (the observing robot) and {peer} (the one being observed).
+
+truth:
+  # The Gazebo model pose: ground truth wearing a sensor's clothes. Noise, range and
+  # occlusion are then applied by the consumer (admm_agent_node), which is what makes it a
+  # stand-in rather than a sensor. Still the default, so every recorded result stays
+  # reproducible, but it is the thing the lidar source exists to retire: a reviewer is
+  # entitled to ask whether a defence that reads ground truth has proved anything.
+  topic: /robot{peer}/hardware/odom
+  window_s: 0.5
+  needs_perception: false
+
+lidar:
+  # Each dog's own point cloud through scripts/lidar_peer_tracker_node.py. Never reads what
+  # a peer broadcasts, so a liar cannot steer which returns are attributed to it.
+  #
+  # Measured 2026-08-05, three dogs walking: p95 error 0.094 m against the model pose with
+  # every sample associated to the right peer -- inside the trust layer's 0.15 m decision
+  # boundary. The same 0.30 m lie experiment scored a 0.578 m worst body gap on this source
+  # against 0.542 m on truth, a difference smaller than the spread between runs.
+  topic: /robot{self}/perceived/robot{peer}
+  # A sweep is 5 Hz and a peer resolves on about half of them, so history arrives at ~2.7 Hz
+  # where the stand-in delivered ~250. admm_agent_node windows that history by age and
+  # interp_at refuses a query outside it; the smear check reaches roughly two slots back,
+  # which 0.5 s of 2.7 Hz samples barely covers. A check that finds nothing to check reads
+  # exactly like a check that passed.
+  window_s: 1.5
+  needs_perception: true
