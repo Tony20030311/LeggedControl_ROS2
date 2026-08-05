@@ -17,7 +17,9 @@ source $WS/install/setup.bash
 set -u
 
 ROBOTS=${ROBOTS:-"1 2 3"}
-ROSTER=$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/fleet_robots.yaml
+# Overridable so the same gate can be run against fleet_robots_lidar.yaml (vision60_lidar), which
+# is identical except the dogs carry a lidar -- same spawn poses, so the numbers stay comparable.
+ROSTER=${ROSTER:-$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/fleet_robots.yaml}
 CTRL_YAML=$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/vision60_fleet_controller.yaml
 V=${V:-0.4}
 GOAL_X=${GOAL_X:-2.0}
@@ -57,8 +59,18 @@ xacro $WS/install/vision60_description/share/vision60_description/urdf/vision60/
   robot_type:=vision60 robot_name:=legged_robot > /tmp/legged_robot_ocs2/vision60.urdf || die "xacro"
 
 # ---------- phase 1: gazebo + SETTLE ----------
-say "phase 1: gazebo up"
+# WORLD_PKG selects which empty.sdf loads, and the two are NOT the same world. legged_gazebo's
+# is 1 ms / 1000 Hz physics; ours is 2 ms / 500 Hz, the 2026-07-30 change that arena_run got
+# through gazebo_package and this gate, launching without it, never did. Measured 2026-08-05,
+# three dogs, no lidar: RTF 0.80 on legged_gazebo's world, 1.00 on ours.
+#
+# Now defaults to ours, so every script in this directory runs one world. G4 numbers recorded
+# before 2026-08-05 were taken on the 1 ms world; reproduce them with WORLD_PKG=legged_gazebo,
+# and do not compare an RTF across that line without checking which world it came from.
+WORLD_PKG=${WORLD_PKG:-legged_admm_fleet}
+say "phase 1: gazebo up (world from $WORLD_PKG)"
 setsid ros2 launch legged_gazebo gazebo.launch.py robots_config_file:=$ROSTER \
+  gazebo_package:=$WORLD_PKG \
   > "$LOGD/gazebo.log" 2>&1 &
 for i in $(seq 1 90); do
   ALL=1

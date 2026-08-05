@@ -51,7 +51,10 @@ xacro $WS/install/vision60_description/share/vision60_description/urdf/vision60/
 
 # ---------- phase 1: gazebo, then SETTLE ----------
 say "phase 1: gazebo up"
+# gazebo_package:=legged_admm_fleet -- ours is 2 ms / 500 Hz physics, legged_gazebo's
+# empty.sdf (the old implicit default) is 1 ms / 1000 Hz. See g4_run.sh for the numbers.
 setsid ros2 launch legged_gazebo gazebo.launch.py robots_config_file:=$ROSTER \
+  gazebo_package:=legged_admm_fleet \
   > "$LOGD/gazebo.log" 2>&1 &
 GZPID=$!
 for i in $(seq 1 60); do

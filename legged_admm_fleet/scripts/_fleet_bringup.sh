@@ -63,8 +63,13 @@ fleet_bringup() {
 
   # ---------- phase 1: gazebo + SETTLE ----------
   say "phase 1: gazebo up"
-  local WORLD_ARG=""
-  [ -n "$ARENA" ] && WORLD_ARG="world:=$ARENA gazebo_package:=legged_admm_fleet"
+  # gazebo_package is now unconditional. It used to ride along only with ARENA, so an arena run
+  # got legged_admm_fleet/worlds/<arena>.sdf while a plain run silently got legged_gazebo's
+  # empty.sdf -- a DIFFERENT world: 1 ms / 1000 Hz physics against our 2 ms / 500 Hz. That is
+  # why the 2026-07-30 step-size change only ever showed up in arena numbers. Measured
+  # 2026-08-05: G4, three dogs, no lidar, RTF 0.80 on the 1 ms world and 1.00 on ours.
+  local WORLD_ARG="gazebo_package:=legged_admm_fleet"
+  [ -n "$ARENA" ] && WORLD_ARG="world:=$ARENA $WORLD_ARG"
   setsid ros2 launch legged_gazebo gazebo.launch.py robots_config_file:=$ROSTER $WORLD_ARG \
     > "$LOGD/gazebo.log" 2>&1 &
   for i in $(seq 1 90); do
