@@ -12,6 +12,17 @@
 WS=${WS:-/root/legged_ros2_ws}
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export ROS_DOMAIN_ID=42
+# Gazebo cannot resolve the model:// URIs in the robot visuals without this, and the way it
+# fails is silent and total: every mesh in the fleet drops out of the RENDER scene while
+# physics carries on from the collision boxes. The dogs still walk, the gate still passes,
+# and nothing in the log stands out -- but a lidar looks straight through them. Measured
+# 2026-08-05: 337 "Unable to find file with URI [model://vision60_description/...]" errors,
+# and a peer 1.4 m away returned 22 points (all off its lidar mast, the one part built from
+# primitives) against 2104 from the ground it should have been shadowing. With the path set:
+# 0 errors, 343 torso returns, and the mast is no longer what the fleet sees of itself.
+#
+# Only perception cares, which is why this went unnoticed for so long.
+export GZ_SIM_RESOURCE_PATH=$(ls -d $WS/install/*/share 2>/dev/null | tr '\n' ':')${GZ_SIM_RESOURCE_PATH:+:$GZ_SIM_RESOURCE_PATH}
 source /opt/ros/jazzy/setup.bash
 source /root/gridmap_ws/install/setup.bash
 source $WS/install/setup.bash
