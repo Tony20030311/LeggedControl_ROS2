@@ -107,6 +107,8 @@ def _distributed_agents(context, *_a, **_k):
                 'inject_forged_obs': forged_obs_target if int(i) == forged_obs_attacker else 0,
                 'obs_window_s': float(obs['window_s']),
                 'synthetic_sensor_model': bool(obs['synthetic_sensor']),
+                'enable_conservative_anchor': LaunchConfiguration(
+                    'enable_conservative_anchor').perform(context).lower() in ('true', '1'),
                 'obs_sigma': float(obs['obs_sigma']),
                 'obs_gate2': obs_gate2,
                 'detection_log_only': detection_log_only,
@@ -164,6 +166,10 @@ def generate_launch_description():
                         "pose (the stand-in), 'lidar' = this dog's own lidar via "
                         "lidar_peer_tracker_node.py. 'lidar' needs the trackers and the "
                         "gz bridge running; nothing here starts them."),
+        DeclareLaunchArgument(
+            'enable_conservative_anchor', default_value='true',
+            description='false = the control arm: peers are believed verbatim, so the '
+                        'headline defence can be measured by its absence. Not safe.'),
         DeclareLaunchArgument('formation', default_value='V'),
         # task 4b spike: each agent's own local pairwise safety net against every peer it can
         # observe, bypassing edge_owner entirely (see AgentCore ctor in agent_core.hpp). Default

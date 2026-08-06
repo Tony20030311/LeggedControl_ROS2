@@ -85,6 +85,7 @@ install(DIRECTORY launch config worlds rviz urdf DESTINATION share/${PROJECT_NAM
 install(PROGRAMS scripts/start_gaits.sh
         scripts/fleet_viz_markers.py scripts/gen_arena_world.py scripts/check_xml.py
         scripts/lidar_peer_tracker_node.py scripts/lidar_tracker_eval.py
+        scripts/read_plan.py
         DESTINATION lib/${PROJECT_NAME})
 
 # ── G1 parity gate: distributed AgentCore vs centralized coordinator (bit-identical) ──

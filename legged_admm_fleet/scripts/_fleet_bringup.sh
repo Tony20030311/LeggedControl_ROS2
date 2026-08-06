@@ -43,8 +43,10 @@ LAUNCH_EXTRA=${LAUNCH_EXTRA:-}
 # Where "I observe peer j" comes from; sources are in config/observation_sources.yaml.
 # A source with needs_perception wants config/fleet_robots_lidar.yaml as the roster.
 OBSERVATION=${OBSERVATION:-truth}
-. $SCRIPTS/_perception.sh
+# ANCHOR=false runs the control arm: conservative anchoring off (see the launch arg).
+ANCHOR=${ANCHOR:-true}
 SCRIPTS=$WS/src/legged_fleet/legged_admm_fleet/scripts
+. $SCRIPTS/_perception.sh
 
 say() { echo "[$TAG $(date +%H:%M:%S)] $*" | tee -a "$LOGD/$TAG.log"; }
 die() { say "FAIL: $*"; exit 1; }
@@ -141,6 +143,7 @@ fleet_bringup() {
   [ -n "$ARENA" ] && ARENA_ARGS="arena:=$ARENA use_astar:=true"
   setsid ros2 launch legged_admm_fleet admm_fleet.launch.py mode:=distributed \
     robot_ids:="$IDS" v:=$V hop_deadline_ms:=$DEADLINE observation:=$OBSERVATION \
+    enable_conservative_anchor:=$ANCHOR \
     $ARENA_ARGS $LAUNCH_EXTRA \
     > "$LOGD/admm.log" 2>&1 &
   setsid python3 $SCRIPTS/g3_dist_logger.py \

@@ -978,9 +978,22 @@ sleep 3
 # The guard has to be the thing that speaks first, or the diagnosis is written by whichever check
 # happens to sit earlier in the file.
 wbc_guard "before the phase 8 plan check"
+# Read ONCE, retried, and use the same text for both the display and the count. The old
+# version read twice with a single 6 s attempt each: two independent chances to fail, and
+# when they disagreed the log showed a different plan from the one being asserted on. A
+# fresh transient_local subscription has to finish discovery before it sees the latched
+# message, and 6 s has been measured as not enough more than once -- the same lesson
+# form_half_extent above already carries. The coordinator was publishing "plan for 3
+# dog(s)" throughout the run this was found on (2026-08-06); nothing was wrong but the read.
+# Read with rclpy, not `ros2 topic echo`. The CLI resolves the publisher through the ros2
+# daemon, which phase 0 kills; without it the echo prints a "not published yet" warning to
+# STDOUT and exits at once, so neither a longer timeout nor a retry helps -- five attempts
+# fail in fourteen seconds. It aborted three attack runs at phase 8 on 2026-08-06 while the
+# coordinator was logging "plan for 3 dog(s)" every 200 ms. See scripts/read_plan.py.
+PLAN_TXT=$(python3 $WS/install/legged_admm_fleet/lib/legged_admm_fleet/read_plan.py --timeout 20 2>/dev/null)
 say "current /formation/plan:"
-timeout 6 ros2 topic echo /formation/plan --once --qos-durability transient_local 2>/dev/null | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
-N_PLAN=$(timeout 6 ros2 topic echo /formation/plan --once --qos-durability transient_local 2>/dev/null | python3 -c "
+printf '%s\n' "$PLAN_TXT" | sed 's/^/    /' | tee -a "$LOGD/$TAG.log"
+N_PLAN=$(printf '%s\n' "$PLAN_TXT" | python3 -c "
 import sys,re
 t=sys.stdin.read()
 m=re.search(r'robot_ids:\n((?:- \d+\n)*)', t)

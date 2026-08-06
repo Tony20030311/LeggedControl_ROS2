@@ -146,10 +146,14 @@ IDS="[${ROBOTS// /, }]"
 # Where "I observe peer j" comes from; sources are in config/observation_sources.yaml.
 # Default truth, so this gate stays what it was.
 OBSERVATION=${OBSERVATION:-truth}
+# ANCHOR=false runs the control arm: conservative anchoring off, peers believed
+# verbatim. Default true -- this gate is not the place to discover it was off.
+ANCHOR=${ANCHOR:-true}
 . $WS/src/legged_fleet/legged_admm_fleet/scripts/_perception.sh
 say "phase 3: distributed agents (ids=$IDS v=$V deadline=${DEADLINE}ms observation=$OBSERVATION)"
 setsid ros2 launch legged_admm_fleet admm_fleet.launch.py mode:=distributed \
   robot_ids:="$IDS" v:=$V hop_deadline_ms:=$DEADLINE observation:=$OBSERVATION \
+  enable_conservative_anchor:=$ANCHOR \
   enable_peer_keepout:=$ENABLE_PEER_KEEPOUT > "$LOGD/admm.log" 2>&1 &
 setsid python3 $WS/src/legged_fleet/legged_admm_fleet/scripts/g3_dist_logger.py \
   "$ROBOTS" "$LOGD/dist.csv" 1.3 --ros-args -p use_sim_time:=true > "$LOGD/dist_logger.log" 2>&1 &  # 1.3 = admm::D_MIN

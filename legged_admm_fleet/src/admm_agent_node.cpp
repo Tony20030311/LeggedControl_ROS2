@@ -141,6 +141,22 @@ public:
         // config/observation_sources.yaml via the launch file; default true keeps every
         // recorded run reproducible.
         synthetic_sensor_ = declare_parameter<bool>("synthetic_sensor_model", true);
+        // Conservative anchoring: translate a peer's whole claimed trajectory onto where we
+        // observe it, but only when the observation puts it CLOSER. A liar can only ever
+        // place itself further away, and that direction is never believed, so the lie stops
+        // paying without anyone having to detect it.
+        //
+        // Off exists so the claim can be measured. Until now it could not be: the mechanism
+        // ran unconditionally, detection_log_only silences only the DETECTOR, and the 0.038 m
+        // figure this is compared against was taken on 2026-07-30, before anchoring was
+        // written (293cf06, 2026-07-31). Two numbers from two builds a day apart are not an
+        // A/B; this makes them one binary and one parameter, which is the standard the rest
+        // of this codebase already holds itself to.
+        enable_anchor_ = declare_parameter<bool>("enable_conservative_anchor", true);
+        if (!enable_anchor_)
+            RCLCPP_WARN(get_logger(),
+                        "[agent%d] CONSERVATIVE ANCHORING DISABLED -- peers' claimed positions are "
+                        "taken at face value. This is the control arm; it is not safe.", self_id_);
         // The decision boundary is d_lie/2, not d_lie: that is where the log-likelihood crosses
         // zero. It must stay well under the 0.433 m buffer AND well above the measured residual,
         // or the detector either misses damage or convicts honest robots.
@@ -790,8 +806,16 @@ private:
             // Guaranteed to already exist (seeded to Zero() above if this is j's first
             // iteration ever) -- operator[] here can never again value-init a fresh Eigen key.
             auto& prev = peer_offset_prev_[j];
-            off[j] = admm::conservative_offset(self_p, kv.second.head<2>(), noisy,
-                                               3.0 * trust_.sigma, admm::MAX_VX * ts_, prev);
+            // The A/B. With anchoring off the offset stays zero, so the barrier is built on
+            // the peer's claimed trajectory verbatim -- a fleet that believes whatever it is
+            // told. Everything else in this loop still runs: the observation is still taken,
+            // the keep-out still placed, the belief layer still fed. The arm therefore
+            // isolates THIS mechanism rather than "perception off", which is what makes the
+            // pair of numbers mean something.
+            off[j] = enable_anchor_
+                   ? admm::conservative_offset(self_p, kv.second.head<2>(), noisy,
+                                               3.0 * trust_.sigma, admm::MAX_VX * ts_, prev)
+                   : Eigen::Vector2d::Zero();
             prev = off[j];
             keepout_pos[j] = noisy;
         }
@@ -1820,6 +1844,7 @@ private:
     // geometric refutation of relayed reports (item 6).
     double obs_range_ = 4.0;
     bool synthetic_sensor_ = true;   // apply range/occlusion/noise to the observation ourselves
+    bool enable_anchor_ = true;      // false = believe the claim verbatim (control arm)
     // Review finding 4 telemetry: how often the smear check (beliefStep) actually had a
     // buffered self-observation to compare a relayed report against, vs how often it merely
     // abstained -- cumulative, logged throttled, so the smear experiment arm can prove the
