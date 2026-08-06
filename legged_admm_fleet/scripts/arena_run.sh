@@ -41,7 +41,15 @@ export DISPLAY=:99
 pgrep -f "Xvfb :99" >/dev/null || { Xvfb :99 -screen 0 1600x900x24 >/tmp/xvfb99.log 2>&1 & sleep 2; }
 
 ROBOTS=${ROBOTS:-"1 2 3"}
-ROSTER=$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/fleet_robots.yaml
+# Default roster has no lidar. OBSERVATION=lidar needs one that does, so it picks its own
+# unless the caller named one.
+OBSERVATION=${OBSERVATION:-truth}
+ANCHOR=${ANCHOR:-true}
+if [ "$OBSERVATION" = lidar ]; then
+  ROSTER=${ROSTER:-$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/fleet_robots_lidar.yaml}
+else
+  ROSTER=${ROSTER:-$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/fleet_robots.yaml}
+fi
 CTRL_YAML=$WS/install/legged_admm_fleet/share/legged_admm_fleet/config/vision60_fleet_controller.yaml
 V=${V:-0.4}
 DEADLINE=${DEADLINE:-20}
@@ -103,6 +111,7 @@ TOTSET=$([ "${FORMATION:-0}" = 1 ] && echo "$NFSET" || echo "$NSET")
 
 say() { echo "[arena $(date +%H:%M:%S)] $*" | tee -a "$LOGD/arena.log"; }
 die() { say "FAIL: $*"; exit 1; }
+. $WS/src/legged_fleet/legged_admm_fleet/scripts/_perception.sh
 
 odom_field() {
   timeout 5 ros2 topic echo "$1" --once 2>/dev/null | python3 -c "
@@ -123,6 +132,7 @@ pkill -9 -x rviz2 2>/dev/null; pkill -9 -x ffmpeg 2>/dev/null; pkill -9 -f fleet
 # (spawner "Could not contact service .../controller_manager"). Kill any leaked launch parent by cmdline
 # (bracket regex so this line never self-matches; the script's own cmdline is just its path).
 pkill -9 -f "launch[.]py" 2>/dev/null
+  pkill -9 -f "lidar_peer_tracker_node[.]py" 2>/dev/null
 sleep 2
 rm -rf /dev/shm/fastrtps* /dev/shm/fast_datasharing* /dev/shm/sem.fastrtps* 2>/dev/null
 
@@ -176,6 +186,7 @@ IDS="[${ROBOTS// /, }]"
 say "phase 3: distributed agents (arena=$ARENA use_astar=true)"
 setsid ros2 launch legged_admm_fleet admm_fleet.launch.py mode:=distributed \
   robot_ids:="$IDS" v:=$V hop_deadline_ms:=$DEADLINE arena:=$ARENA use_astar:=true \
+  observation:=$OBSERVATION enable_conservative_anchor:=$ANCHOR \
   hard_through:=${HARD_THROUGH:-1} \
   > "$LOGD/admm.log" 2>&1 &
 setsid python3 $WS/src/legged_fleet/legged_admm_fleet/scripts/g5_logger.py \
@@ -214,6 +225,12 @@ for i in $(seq 1 50); do
 done
 for r in $ROBOTS; do [ "${STOOD[$r]}" = 1 ] || die "robot$r did not stand"; done
 say "all STANDING"
+
+# Whatever the observation source needs (config/observation_sources.yaml). Here, as in
+# the other gates: the dogs are up and have not been given a goal, so the peer tracks
+# seed where the roster put everyone.
+IDS="[${ROBOTS// /, }]"
+perception_bringup
 
 # ---------- optional recording (RECORD=1): clean overhead arena_cam sensor -> cv2 mp4 ----------
 # The world's arena_cam camera sensor renders the scene (no GUI clutter); ros_gz_bridge exposes it
