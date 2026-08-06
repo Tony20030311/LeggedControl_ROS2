@@ -107,6 +107,7 @@ guess. That path had never run on real measurements.
 | clean, observation=truth | 19% (16.3 s) | 1.042 | — | **0** |
 | clean, observation=lidar | 20% (14.9 s) | 1.032 | — | **0** |
 | **lie -0.30, observation=lidar** | 23% (22.6 s) | 1.081 | **0.351 m** | **0** |
+| lie -0.30, observation=lidar, recorded | 40% (26.4 s) | 1.131 | **0.396 m** | **0** |
 
 **Time under D_MIN is a property of the arena, not of the observation source.** The two
 clean runs agree to within a percentage point on a number that is 0% in the empty arena:
@@ -121,6 +122,12 @@ The attacked run is the one worth keeping: **D PASS with the lie, in an arena wi
 occlusion, on peer positions each dog computed from its own lidar.** Survivors reached the
 goal and came home, worst body gap 0.351 m against a 0.87 m contact line. The gap is
 tighter than the empty arena's 0.42 m, which is what a denser arena should do.
+
+It was run twice, the second time with the screen capture on, and both passed with nothing
+touching. The two differ in how long they spent under D_MIN -- 23% against 40% -- which is
+a reminder that this figure is a property of the path the fleet happened to take through
+the posts, not a stable per-configuration number. Body gap moved much less, 0.351 to 0.396,
+and that is the one that says whether anything was in danger.
 
 `plum/` has the three run logs and the 20 Hz gap series from the attacked run.
 
