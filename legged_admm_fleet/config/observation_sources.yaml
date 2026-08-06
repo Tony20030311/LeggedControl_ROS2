@@ -22,6 +22,8 @@ truth:
   # obs_sigma, plus a range-and-occlusion test against the arena geometry. That is what makes
   # the model pose a stand-in rather than a feed of answers.
   synthetic_sensor: true
+  # Publishes faster than the query rate, so a query always lands between two samples.
+  obs_tol_s: 0.0
   # Assumed measurement noise. Also the noise actually injected, so on this source the
   # assumption is true by construction -- which is the one thing a real sensor cannot offer.
   obs_sigma: 0.02
@@ -47,6 +49,11 @@ lidar:
   # error. Adding the stand-in's noise and occlusion here would double-count both, and the
   # trust layer would then be reasoning about a peer it had blinded itself to twice.
   synthetic_sensor: false
+  # A peer resolves on some sweeps and not others, so the query routinely lands just past
+  # the newest sample. 0.05 s is 0.02 m at the fleet's reference speed, an eighth of the
+  # 0.15 m decision boundary. Without it the belief layer abstained on 93% of its
+  # evaluations of the liar and convicted nobody (2026-08-06).
+  obs_tol_s: 0.05
   # Measured, not assumed: the tracker's error against the model pose was mean 0.033 m and
   # p95 0.094 m over 696 samples of three dogs walking (2026-08-05). 3*sigma is the dead
   # band below which conservative anchoring treats a discrepancy as noise, so sigma here is

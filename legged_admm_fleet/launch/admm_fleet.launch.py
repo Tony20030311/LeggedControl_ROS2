@@ -110,6 +110,7 @@ def _distributed_agents(context, *_a, **_k):
                 'enable_conservative_anchor': LaunchConfiguration(
                     'enable_conservative_anchor').perform(context).lower() in ('true', '1'),
                 'obs_sigma': float(obs['obs_sigma']),
+                'obs_tol_s': float(obs['obs_tol_s']),
                 'obs_gate2': obs_gate2,
                 'detection_log_only': detection_log_only,
                 'obs_noise_seed': obs_noise_seed,

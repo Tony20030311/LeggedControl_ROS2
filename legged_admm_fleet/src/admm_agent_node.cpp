@@ -141,6 +141,12 @@ public:
         // config/observation_sources.yaml via the launch file; default true keeps every
         // recorded run reproducible.
         synthetic_sensor_ = declare_parameter<bool>("synthetic_sensor_model", true);
+        // How far off the requested instant an observation may be and still count. Zero is
+        // right for a stand-in publishing faster than the query rate; a real sensor needs
+        // slack or the query lands past its newest sample and the check abstains. Bounded by
+        // what a peer can do inside it: 0.05 s at 0.4 m/s is 0.02 m, an eighth of the 0.15 m
+        // decision boundary. Set per source in config/observation_sources.yaml.
+        obs_tol_s_ = declare_parameter<double>("obs_tol_s", 0.0);
         // Conservative anchoring: translate a peer's whole claimed trajectory onto where we
         // observe it, but only when the observation puts it CLOSER. A liar can only ever
         // place itself further away, and that direction is never believed, so the lie stops
@@ -791,7 +797,7 @@ private:
             if (tb == truth.end()) continue;   // no observation channel heard from j at all
             const auto sit = seen.find(j);
             if (sit == seen.end()) continue;   // no claim to anchor
-            const auto obs = admm::interp_at(tb->second, static_cast<double>(sit->second) * ts_);
+            const auto obs = admm::interp_at(tb->second, static_cast<double>(sit->second) * ts_, obs_tol_s_);
             if (!obs) continue;   // stream stalled or hasn't started yet: hold, no fresh evidence
             // TASK 7 REVIEW FINDING 6: the same range/occlusion gate beliefStep uses for
             // first-hand evidence, applied here too. Without it, a peer hiding behind a pillar
@@ -1379,7 +1385,7 @@ private:
                     // updatePeerOffsets and gate2 already use: comparing two different instants
                     // manufactures a discrepancy nobody's claim produced.
                     if (const auto obs =
-                            admm::interp_at(tb->second, static_cast<double>(sit->second) * ts_)) {
+                            admm::interp_at(tb->second, static_cast<double>(sit->second) * ts_, obs_tol_s_)) {
                         // TASK 7 ITEM 1: visibility on the RAW ground-truth position, before
                         // noise -- occlusion/range are properties of where the body actually is.
                         // Not visible -> no evidence at all, and nothing to share either: the
@@ -1844,6 +1850,7 @@ private:
     // geometric refutation of relayed reports (item 6).
     double obs_range_ = 4.0;
     bool synthetic_sensor_ = true;   // apply range/occlusion/noise to the observation ourselves
+    double obs_tol_s_ = 0.0;         // how stale an observation may be and still answer a query
     bool enable_anchor_ = true;      // false = believe the claim verbatim (control arm)
     // Review finding 4 telemetry: how often the smear check (beliefStep) actually had a
     // buffered self-observation to compare a relayed report against, vs how often it merely
