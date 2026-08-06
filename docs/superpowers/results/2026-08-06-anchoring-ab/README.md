@@ -92,3 +92,36 @@ direction the defence is designed to ignore.
 One repeat (`rep_2_true`) is absent: its harness refused the run because the detector had
 flagged the victim twice *before* the attack was armed, so nothing after that point was
 attributable. The machine was at load 10 at the time. That is the guard working.
+
+---
+
+# The plum arena, same day (`plum/`)
+
+Three runs in `plum_dense` (the gap 2.20 sweet spot, 17 posts), which matters for
+perception in a way the empty arena does not: the posts occlude peers, so the tracker
+publishes nothing for a dog it cannot see and the belief layer has to abstain rather than
+guess. That path had never run on real measurements.
+
+| run | below D_MIN 1.30 | min centre | body gap | contact |
+|---|---|---|---|---|
+| clean, observation=truth | 19% (16.3 s) | 1.042 | — | **0** |
+| clean, observation=lidar | 20% (14.9 s) | 1.032 | — | **0** |
+| **lie -0.30, observation=lidar** | 23% (22.6 s) | 1.081 | **0.351 m** | **0** |
+
+**Time under D_MIN is a property of the arena, not of the observation source.** The two
+clean runs agree to within a percentage point on a number that is 0% in the empty arena:
+the CBF genuinely lets centre distance compress in the gaps between posts, and no body
+touched in any run. Anyone reading 20% as a perception regression would be reading the
+arena.
+
+(The RTF difference between those two runs -- 0.88 against 0.15 -- is the screen recording
+on the lidar run, not the sensor.)
+
+The attacked run is the one worth keeping: **D PASS with the lie, in an arena with
+occlusion, on peer positions each dog computed from its own lidar.** Survivors reached the
+goal and came home, worst body gap 0.351 m against a 0.87 m contact line. The gap is
+tighter than the empty arena's 0.42 m, which is what a denser arena should do.
+
+`plum/` has the three run logs and the 20 Hz gap series from the attacked run. The 6.7 MB
+screen capture stays in `g2_logs/arena_lidar_demo_0806_055532/demo.mp4` -- too large for
+the repository, and reproducible from the logged configuration.
