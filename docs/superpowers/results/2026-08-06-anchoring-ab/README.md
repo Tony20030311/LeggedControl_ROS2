@@ -122,6 +122,8 @@ occlusion, on peer positions each dog computed from its own lidar.** Survivors r
 goal and came home, worst body gap 0.351 m against a 0.87 m contact line. The gap is
 tighter than the empty arena's 0.42 m, which is what a denser arena should do.
 
-`plum/` has the three run logs and the 20 Hz gap series from the attacked run. The 6.7 MB
-screen capture stays in `g2_logs/arena_lidar_demo_0806_055532/demo.mp4` -- too large for
-the repository, and reproducible from the logged configuration.
+`plum/` has the three run logs and the 20 Hz gap series from the attacked run.
+
+The screen capture and a copy of the figure are outside the repository, in
+`~/legged_ros2_ws/demos/2026-08-06-lidar-observation/` -- 6.7 MB of video does not belong
+in git history, and it is reproducible from the configuration logged here.
