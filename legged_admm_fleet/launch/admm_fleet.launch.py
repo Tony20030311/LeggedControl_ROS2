@@ -106,6 +106,8 @@ def _distributed_agents(context, *_a, **_k):
                     context).lower() in ('true', '1'),
                 'inject_forged_obs': forged_obs_target if int(i) == forged_obs_attacker else 0,
                 'obs_window_s': float(obs['window_s']),
+                'synthetic_sensor_model': bool(obs['synthetic_sensor']),
+                'obs_sigma': float(obs['obs_sigma']),
                 'obs_gate2': obs_gate2,
                 'detection_log_only': detection_log_only,
                 'obs_noise_seed': obs_noise_seed,

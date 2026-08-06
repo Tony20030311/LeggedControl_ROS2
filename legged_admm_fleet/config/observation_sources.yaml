@@ -18,6 +18,13 @@ truth:
   topic: /robot{peer}/hardware/odom
   window_s: 0.5
   needs_perception: false
+  # The consumer applies the sensor model, because this topic has none of its own: noise at
+  # obs_sigma, plus a range-and-occlusion test against the arena geometry. That is what makes
+  # the model pose a stand-in rather than a feed of answers.
+  synthetic_sensor: true
+  # Assumed measurement noise. Also the noise actually injected, so on this source the
+  # assumption is true by construction -- which is the one thing a real sensor cannot offer.
+  obs_sigma: 0.02
 
 lidar:
   # Each dog's own point cloud through scripts/lidar_peer_tracker_node.py. Never reads what
@@ -35,3 +42,15 @@ lidar:
   # exactly like a check that passed.
   window_s: 1.5
   needs_perception: true
+  # No synthetic model on top. The tracker publishes only what it resolved, so the presence
+  # of a sample IS the visibility test, and the sample already carries the sensor's own
+  # error. Adding the stand-in's noise and occlusion here would double-count both, and the
+  # trust layer would then be reasoning about a peer it had blinded itself to twice.
+  synthetic_sensor: false
+  # Measured, not assumed: the tracker's error against the model pose was mean 0.033 m and
+  # p95 0.094 m over 696 samples of three dogs walking (2026-08-05). 3*sigma is the dead
+  # band below which conservative anchoring treats a discrepancy as noise, so sigma here is
+  # p95/3 -- the band then covers 95% of honest observations. The old 0.02 was the stand-in's
+  # injected value and would have put the band at 0.06 m, under this sensor's own p95: honest
+  # peers would trip anchoring on noise alone, and only ever in the tightening direction.
+  obs_sigma: 0.031

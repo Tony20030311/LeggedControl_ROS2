@@ -136,6 +136,11 @@ public:
         // scale (plum piles 2.2-2.3 m apart); 4.0 clears the fleet's own follow_range (1.5) and
         // evade_range (0.5) with room for an honest reporter to actually see its neighbour.
         obs_range_ = declare_parameter<double>("obs_range", 4.0);
+        // Does the observation topic need a sensor model applied to it? True for the Gazebo
+        // model pose, false for anything that measured something. Set from
+        // config/observation_sources.yaml via the launch file; default true keeps every
+        // recorded run reproducible.
+        synthetic_sensor_ = declare_parameter<bool>("synthetic_sensor_model", true);
         // The decision boundary is d_lie/2, not d_lie: that is where the log-likelihood crosses
         // zero. It must stay well under the 0.433 m buffer AND well above the measured residual,
         // or the detector either misses damage or convicts honest robots.
@@ -718,6 +723,26 @@ private:
     // seen) -- a SEPARATE timer here would duplicate that mechanism for the one case (persistent
     // occlusion of a peer still very much in the consensus) where holding is already bounded-safe
     // by the reasoning above, matching set_peer_keepout's own no-expiry precedent.
+    // ONE definition of "what do I observe of peer j at this instant", for both the anchoring
+    // path and the belief layer. They must not diverge: an earlier version had anchoring
+    // correcting the barrier toward a peer the belief layer had just declared unobservable
+    // (task 7 review finding 6), which is safety-positive by accident and indefensible on
+    // paper. Sharing the function makes that structural rather than a thing to remember.
+    //
+    // With a synthetic source the sensor model lives HERE, because the topic carries none:
+    // the model pose is a feed of answers until range, occlusion and noise are applied to it.
+    // With a real one none of that belongs here. The tracker publishes only the peers it
+    // actually resolved, so having a sample IS the visibility test, and the sample already
+    // carries the sensor's own error -- adding the stand-in's would count both twice, and the
+    // occlusion test would blind the fleet a second time to peers it can plainly see.
+    std::optional<Eigen::Vector2d> observedPeer(std::uint64_t slot, int j,
+                                                const Eigen::Vector2d& self_p,
+                                                const Eigen::Vector2d& raw) const {
+        if (!synthetic_sensor_) return raw;
+        if (!admm::visible(self_p, raw, arena_obs_, obs_range_)) return std::nullopt;
+        return raw + admm::obs_noise(slot, self_id_, j, trust_.sigma, obs_noise_seed_);
+    }
+
     void updatePeerOffsets(std::uint64_t slot, const Eigen::Vector2d& self_p) {
         std::map<int, std::deque<admm::ObsSample>> truth;
         { std::lock_guard<std::mutex> l(mu_); truth = peer_truth_; }
@@ -759,9 +784,9 @@ private:
             // position it had just declared un-sensed -- safety-positive by accident, but a
             // stand-in sensor model that the paper's own safety mechanism ignores is not
             // defensible. Not visible -> hold (see the function comment for why hold, not drop).
-            if (!admm::visible(self_p, *obs, arena_obs_, obs_range_)) continue;
-            const Eigen::Vector2d noisy =
-                *obs + admm::obs_noise(slot, self_id_, j, trust_.sigma, obs_noise_seed_);
+            const auto seen_now = observedPeer(slot, j, self_p, *obs);
+            if (!seen_now) continue;   // not observable this cycle -> hold (see the comment above)
+            const Eigen::Vector2d noisy = *seen_now;
             // Guaranteed to already exist (seeded to Zero() above if this is j's first
             // iteration ever) -- operator[] here can never again value-init a fresh Eigen key.
             auto& prev = peer_offset_prev_[j];
@@ -1335,17 +1360,23 @@ private:
                         // noise -- occlusion/range are properties of where the body actually is.
                         // Not visible -> no evidence at all, and nothing to share either: the
                         // attacker hiding behind a pillar must not appear in ev_peer/ev_pos.
-                        vis = admm::visible(self_p, *obs, arena_obs_, obs_range_);
+                        const auto seen_now = observedPeer(slot, j, self_p, *obs);
+                        vis = seen_now.has_value();
                         // Review round 2: admm::visible() is both a range gate and an occlusion
                         // test, checked in that order (range first) -- mirrored here rather than
                         // plumbing a reason code through trust.hpp, since this is telemetry only
                         // and visible() itself must stay a single yes/no safety predicate. NaN
                         // (non-finite obs/self_p) falls into out_of_range here too, matching
                         // visible()'s own earliest-exit priority.
-                        abstain = ((*obs - self_p).norm() <= obs_range_) ? kAbstainOccluded
-                                                                          : kAbstainOutOfRange;
+                        // Only the synthetic model can name WHY it abstained, because only it
+                        // knows the geometry it used. A real sensor that returned nothing has
+                        // not told us whether the peer was occluded or out of range, and
+                        // kAbstainNoObsBuffer (already set above) says exactly that much.
+                        if (synthetic_sensor_)
+                            abstain = ((*obs - self_p).norm() <= obs_range_) ? kAbstainOccluded
+                                                                            : kAbstainOutOfRange;
                         if (vis) {
-                            observed = *obs + admm::obs_noise(slot, self_id_, j, trust_.sigma, obs_noise_seed_);
+                            observed = *seen_now;
                             fresh = true;
                             abstain = kAbstainNone;
                             ev_out_peer_.push_back(j);
@@ -1788,6 +1819,7 @@ private:
     // Task 7 item 1: sensing range visible() gates first-hand evidence on, and (widened) the
     // geometric refutation of relayed reports (item 6).
     double obs_range_ = 4.0;
+    bool synthetic_sensor_ = true;   // apply range/occlusion/noise to the observation ourselves
     // Review finding 4 telemetry: how often the smear check (beliefStep) actually had a
     // buffered self-observation to compare a relayed report against, vs how often it merely
     // abstained -- cumulative, logged throttled, so the smear experiment arm can prove the
