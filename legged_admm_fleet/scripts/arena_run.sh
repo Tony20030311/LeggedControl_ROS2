@@ -133,6 +133,7 @@ pkill -9 -x rviz2 2>/dev/null; pkill -9 -x ffmpeg 2>/dev/null; pkill -9 -f fleet
 # (bracket regex so this line never self-matches; the script's own cmdline is just its path).
 pkill -9 -f "launch[.]py" 2>/dev/null
   pkill -9 -f "lidar_peer_tracker_node[.]py" 2>/dev/null
+  pkill -9 -f "perception_viz[.]py" 2>/dev/null
 sleep 2
 rm -rf /dev/shm/fastrtps* /dev/shm/fast_datasharing* /dev/shm/sem.fastrtps* 2>/dev/null
 

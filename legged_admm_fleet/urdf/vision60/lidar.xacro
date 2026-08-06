@@ -45,7 +45,25 @@
 
      So what is left is three changes from upstream, each with a reason:
 
-       5 Hz          this is peer observation, not a control loop
+       20 Hz         NOT a control-loop rate, and not chosen for comfort: it is what the
+                     trust layer needs to see anything at all. That layer compares "what you
+                     claimed at slot S" against "what I observed at slot S", and the claim
+                     arrives about two slots (0.2 s) late, so the query asks for a moment
+                     0.2 s in the past. interp_at refuses to extrapolate past the newest
+                     sample. At 5 Hz, with a peer resolved on about half the sweeps,
+                     observations land every ~0.37 s, so the newest is routinely OLDER
+                     than the query, and the check abstains. Measured 2026-08-06 with
+                     ARM=a2 on lidar: 563 of 639 evaluations abstained with
+                     kAbstainNoObsBuffer and every residual read nan, so no survivor's
+                     belief layer ever convicted the liar.
+
+                     Widening obs_window_s does not help and the attempt would waste a run:
+                     the window prunes the OLD end, while the failure is at the new end.
+                     20 Hz puts the newest sample at most 0.05 s old, inside the query.
+
+                     Conservative anchoring was never affected; it uses the latest
+                     observation, not a historical one, which is why the 2026-08-05 A/B
+                     stands.
        5 m range     obs_range is 4.0 m; nothing past it is evidence
        360 deg       upstream scans +-150 deg, leaving a 60 deg blind cone astern, and the
                      V formation puts the apex dog's two peers at exactly +-150 deg, on the
@@ -116,7 +134,7 @@
         <gazebo reference="${lidar_name}_optical_frame">
             <sensor name="lidar" type="gpu_lidar">
                 <always_on>1</always_on>
-                <update_rate>5</update_rate>
+                <update_rate>20</update_rate>
                 <topic>$(arg sensor_topic_prefix)${lidar_name}</topic>
                 <ray>
                     <scan>

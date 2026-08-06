@@ -74,6 +74,7 @@ fleet_bringup() {
   # comm is "python3" for these, so no -x pattern reaches them; left alive they keep
   # subscribing to the 500 kB cloud topics and starve the next run's trackers.
   pkill -9 -f "lidar_peer_tracker_node[.]py" 2>/dev/null
+  pkill -9 -f "perception_viz[.]py" 2>/dev/null
   sleep 2
   rm -rf /dev/shm/fastrtps* /dev/shm/fast_datasharing* /dev/shm/sem.fastrtps* 2>/dev/null
 

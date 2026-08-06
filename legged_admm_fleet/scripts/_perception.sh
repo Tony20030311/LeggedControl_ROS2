@@ -69,5 +69,20 @@ perception_bringup() {
     grep -q 'tracking peers' "$LOGD/tracker_$r.log" \
       || die "tracker for robot$r did not start: $(tail -3 "$LOGD/tracker_$r.log" 2>/dev/null)"
   done
+
+  # RViz only. Repeats the tracker's geometry to publish the returns that landed on a peer
+  # and a ray to each peer it resolved -- a raw cloud is 11264 ground points burying the
+  # dog-shaped part, and it would not show WHICH peer a blob was attributed to, which is
+  # the whole story. Off unless something is going to display it; nothing reads these
+  # topics but RViz.
+  if [ "${RVIZ:-0}" = 1 ]; then
+    for r in $ROBOTS; do
+      setsid python3 $WS/install/legged_admm_fleet/lib/legged_admm_fleet/perception_viz.py \
+        --ros-args -r __node:=perception_viz_$r -r points:=/robot$r/lidar/points \
+        -p use_sim_time:=true -p robot_id:=$r -p "robot_ids:=$IDS" -p roster_file:=$ROSTER \
+        > "$LOGD/percviz_$r.log" 2>&1 &
+    done
+    say "perception viz up (RViz: hits + attribution rays)"
+  fi
   say "perception up: $(echo $ROBOTS | wc -w) trackers on their own lidars (observation=$OBSERVATION)"
 }

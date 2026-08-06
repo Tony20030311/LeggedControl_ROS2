@@ -35,6 +35,7 @@ cleanup() {
   # -f is required to see a script name at all. The bracket keeps the pattern from matching
   # this shell's own command line, the same trick _fleet_bringup.sh uses for "launch[.]py".
   pkill -9 -f "lidar_peer_tracker_node[.]py" 2>/dev/null
+pkill -9 -f "perception_viz[.]py" 2>/dev/null
   pkill -9 -f "lidar_tracker_eval[.]py" 2>/dev/null
   pkill -x bridge_node 2>/dev/null
   pkill -x parameter_brid 2>/dev/null
@@ -46,13 +47,16 @@ cleanup() {
 trap cleanup EXIT
 
 cleanup; sleep 2
-# Let the machine go quiet before starting. A fleet brought up while the previous run is
-# still winding down does not stand: three attempts failed that way on 2026-08-05 with
-# load average still near 10, and the same gate passed at 3.
+# Wait until OUR OWN container is quiet. NOT /proc/loadavg: that is the whole machine, and
+# this box runs a second research container whose load never falls below the old threshold,
+# so the wait always ran out its attempts and started anyway -- a gate that never gated.
+# Since 2026-08-06 the two containers hold disjoint cpusets (legged_stack 0-13,
+# navigation_ws 14-27), so what the other one is doing is no longer our business; what
+# matters is that no simulator of OURS survived a previous run. A fleet brought up while one
+# is still winding down does not stand -- three attempts failed that way on 2026-08-05.
 for i in $(seq 1 60); do
-  L=$(awk '{print int($1)}' /proc/loadavg)
-  [ "$L" -le 4 ] && break
-  [ "$i" = 1 ] && say "waiting for load average $L to fall below 5"
+  [ "$(pgrep -x ruby | wc -l)" = 0 ] && [ "$(pgrep -x admm_agent_node | wc -l)" = 0 ] && break
+  [ "$i" = 1 ] && say "waiting for a previous run's simulator to exit"
   sleep 5
 done
 rm -f /tmp/.X99-lock
